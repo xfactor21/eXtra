@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#07151d">
+    <title>Pinboard — a place for your thoughts</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Main navigation">
+        <a class="brand" href="#" aria-label="Pinboard home">
+          <span class="brand-mark" aria-hidden="true"><span></span></span>
+          <span>pinboard<span class="brand-period">.</span></span>
+        </a>
+        <button class="new-note-button" id="new-note" type="button"><span aria-hidden="true">＋</span> New note <kbd>N</kbd></button>
+        <div class="nav-label">YOUR SPACE</div>
+        <nav class="primary-nav">
+          <button class="nav-item is-active" data-filter="all" type="button"><span class="nav-icon" aria-hidden="true">▤</span><span>All notes</span><span class="nav-count" id="all-count">0</span></button>
+          <button class="nav-item" data-filter="pinned" type="button"><span class="nav-icon pin-nav-icon" aria-hidden="true">◆</span><span>Pinned</span><span class="nav-count" id="pinned-count">0</span></button>
+          <button class="nav-item" data-filter="recent" type="button"><span class="nav-icon" aria-hidden="true">◷</span><span>Recently edited</span></button>
+          <button class="nav-item" id="canvas-nav" data-view="canvas" type="button"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="sync-card"><span class="sync-indicator" aria-hidden="true"></span><span><strong>Just you and your notes</strong><small>Saved on this device</small></span></div>
+          <div class="profile"><div class="avatar" aria-hidden="true">Y</div><span><strong>Your workspace</strong><small>Personal space</small></span></div>
+        </div>
+      </aside>
+      <main class="workspace">
+        <header class="topbar">
+          <div class="breadcrumb"><span>YOUR SPACE</span><span class="crumb-separator">/</span><strong id="current-view-label">All notes</strong></div>
+          <div class="topbar-actions"><button class="topbar-tool" id="open-commands" type="button" aria-expanded="false" aria-controls="commands-modal"><span aria-hidden="true">⌘</span> Commands <kbd id="palette-shortcut">Ctrl P</kbd></button><button class="topbar-tool" id="open-plugins" type="button" aria-expanded="false" aria-controls="plugins-modal"><span aria-hidden="true">◇</span> Plugins</button><span class="keyboard-hint"><kbd id="command-key">Ctrl</kbd><kbd>K</kbd> to search</span><span class="avatar avatar-small" aria-hidden="true">Y</span></div>
+        </header>
+        <section class="content">
+          <div class="page-heading" id="notes-heading">
+            <div><div class="eyebrow"><span class="eyebrow-dot"></span> A LITTLE SPACE TO THINK</div><h1 id="page-title">Your notes<span class="title-period">.</span></h1><p class="page-subtitle">A home for the thoughts worth keeping.</p></div>
+            <button class="create-folder-button" id="new-folder" type="button"><span aria-hidden="true">▱</span> New folder</button>
+          </div>
+          <div class="notes-toolbar" id="notes-toolbar">
+            <label class="search-box"><span class="search-icon" aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Find a note..." autocomplete="off" aria-label="Search notes"><kbd>/</kbd></label>
+            <label class="sort-control"><span class="sort-label">SORT BY</span><select id="sort-select" aria-label="Sort notes"><option value="modified-desc">Last edited</option><option value="created-desc">Date created</option><option value="title-asc">Title A–Z</option><option value="title-desc">Title Z–A</option><option value="modified-asc">Oldest edited</option><option value="created-asc">Oldest created</option></select><span class="select-chevron" aria-hidden="true">⌄</span></label>
+          </div>
+          <div class="notes-layout" id="notes-layout">
+            <section class="notes-panel" aria-label="Notes list">
+              <div class="list-heading"><span id="list-heading-label">ALL NOTES</span><button class="icon-button" id="list-menu" type="button" aria-label="Create a folder">＋</button></div>
+              <div id="note-list" class="note-list"></div>
+              <div id="empty-state" class="empty-state" hidden><span class="empty-sparkle" aria-hidden="true">✳</span><strong id="empty-title">No notes yet</strong><p id="empty-description">Start with one small thought.</p><button id="empty-create" type="button">Write your first note <span aria-hidden="true">↗</span></button></div>
+              <div class="list-footer"><span id="list-count">0 notes</span><span>Folders always come first</span></div>
+            </section>
+            <section class="editor-panel" aria-label="Note editor">
+              <div class="editor-topline">
+                <div class="editor-location"><span class="folder-crumb" id="editor-folder">NOTES</span><span class="crumb-separator">/</span><span id="editor-date">NEW NOTE</span></div>
+                <div class="editor-actions"><span class="save-state" id="save-state" role="status"><span class="save-dot"></span><span id="save-label">All changes saved</span></span><button class="icon-button pin-button" id="pin-note" type="button" aria-label="Pin note" title="Pin note">◆</button><button class="icon-button delete-button" id="delete-note" type="button" aria-label="Delete note" title="Delete note">⌫</button></div>
+              </div>
+              <div id="editor-empty" class="editor-empty" hidden><div class="editor-empty-mark">✳</div><h2>A blank page is a good place to start.</h2><p>Pick a note, or pin down a new thought.</p><button class="new-note-inline" id="editor-create" type="button">＋ Create a note</button></div>
+              <div id="editor-fields" class="editor-fields">
+                <label class="sr-only" for="note-title">Note title</label><input id="note-title" class="note-title" type="text" placeholder="Untitled note" maxlength="120" spellcheck="false">
+                <div class="note-meta"><span class="meta-glyph" aria-hidden="true">◷</span><span id="note-meta-date">Created just now</span><span class="meta-divider">·</span><label for="note-folder">IN</label><select id="note-folder" aria-label="Move note to folder"></select></div>
+                <div class="editor-rule"></div>
+                <div class="editor-tools" aria-label="Editor tools">
+                  <label class="code-language-control">CODE LANGUAGE
+                    <select id="code-language" aria-label="Code block language">
+                      <option value="javascript">JavaScript</option><option value="typescript">TypeScript</option><option value="python">Python</option><option value="json">JSON</option><option value="css">CSS</option><option value="html">HTML</option><option value="bash">Bash</option><option value="text">Plain text</option>
+                    </select>
+                  </label>
+                  <button class="editor-tool-button" id="insert-code-block" type="button">＋ Code block</button>
+                  <button class="editor-tool-button" id="toggle-preview" type="button" aria-pressed="false">Preview</button>
+                </div>
+                <label class="sr-only" for="note-body">Note content</label><textarea id="note-body" class="note-body" placeholder="Every good idea starts somewhere..."></textarea>
+                <article id="markdown-preview" class="markdown-preview" aria-label="Markdown preview" hidden></article>
+                <div class="editor-bottom"><span>MARKDOWN FRIENDLY <span class="editor-bottom-dot">·</span> JUST START TYPING</span><span id="editor-status"></span></div>
+              </div>
+              <div id="plugin-panels" class="plugin-panels"></div>
+            </section>
+          </div>
+          <section class="canvas-view" id="canvas-view" aria-label="Canvas workspace" hidden>
+            <div class="canvas-toolbar">
+              <label class="canvas-picker">BOARD
+                <select id="canvas-select" aria-label="Choose canvas"></select>
+              </label>
+              <button class="canvas-tool-button" id="new-canvas" type="button">＋ New board</button>
+              <span class="canvas-toolbar-divider" aria-hidden="true"></span>
+              <button class="canvas-tool-button" id="add-text-node" type="button">＋ Text</button>
+              <button class="canvas-tool-button" id="add-note-node" type="button">＋ Current note</button>
+              <button class="canvas-tool-button" id="add-link-node" type="button">＋ Link</button>
+              <button class="canvas-tool-button" id="add-group-node" type="button">＋ Group</button>
+              <button class="canvas-tool-button" id="connect-nodes" type="button" aria-pressed="false">Connect</button>
+              <span class="canvas-toolbar-spacer"></span>
+              <button class="canvas-tool-button" id="zoom-out" type="button" aria-label="Zoom out">−</button>
+              <output class="canvas-zoom" id="canvas-zoom">100%</output>
+              <button class="canvas-tool-button" id="zoom-in" type="button" aria-label="Zoom in">＋</button>
+              <button class="canvas-tool-button" id="export-canvas" type="button">Export</button>
+              <button class="canvas-tool-button" id="import-canvas" type="button">Import</button>
+              <input id="canvas-file-input" type="file" accept=".canvas,application/json" hidden>
+            </div>
+            <div class="canvas-viewport" id="canvas-viewport" tabindex="0" aria-label="Canvas board. Drag the background to pan. Focus a card and use arrow keys to move it, Shift plus arrow keys for larger steps, or Alt plus arrow keys to resize.">
+              <div class="canvas-stage" id="canvas-stage">
+                <svg class="canvas-edges" id="canvas-edges" aria-hidden="true"></svg>
+                <div class="canvas-nodes" id="canvas-nodes"></div>
+              </div>
+              <div class="canvas-empty" id="canvas-empty" hidden><strong>A board for ideas that connect.</strong><p>Add a text card, a note, or a link to start mapping things out.</p><button id="canvas-empty-add" type="button">＋ Add a text card</button></div>
+            </div>
+            <div class="canvas-footer"><span id="canvas-status" role="status">JSON Canvas compatible · saved on this device</span><span>Drag cards or focus one and use arrows to move, Shift + arrows for larger steps, Alt + arrows to resize · select two cards to connect</span></div>
+          </section>
+        </section>
+      </main>
+      <div class="modal-backdrop" id="plugins-modal" hidden>
+        <section class="dialog plugin-dialog" role="dialog" aria-modal="true" aria-labelledby="plugins-title">
+          <header class="dialog-header"><div><div class="dialog-kicker">MAKE IT YOURS</div><h2 id="plugins-title">Plugins<span class="title-period">.</span></h2></div><button class="icon-button dialog-close" data-close-dialog type="button" aria-label="Close plugins">×</button></header>
+          <p class="dialog-description">Small, focused features that work together. Your settings stay on this device.</p>
+          <div class="plugin-safety"><span aria-hidden="true">◇</span><span>Built-ins are reviewed. Imported plugins run in an isolated, network-restricted worker and receive only the permissions you grant.</span></div>
+          <div class="plugin-upload">
+            <div><strong>Add a plugin package</strong><small>Import a local JSON manifest and JavaScript bundle. Nothing is fetched from the web.</small></div>
+            <button class="editor-tool-button" id="import-plugin" type="button">Choose package</button>
+            <input id="plugin-file-input" type="file" accept=".json,application/json" hidden>
+          </div>
+          <div class="plugin-discovery">
+            <label class="sr-only" for="plugin-search">Search features</label>
+            <input id="plugin-search" type="search" placeholder="Search features..." autocomplete="off">
+            <label class="sr-only" for="plugin-category">Filter by category</label>
+            <select id="plugin-category">
+              <option value="all">All categories</option>
+              <option value="Writing">Writing</option>
+              <option value="Navigation">Navigation</option>
+              <option value="Organization">Organization</option>
+              <option value="Reference">Reference</option>
+              <option value="Imported">Imported</option>
+            </select>
+          </div>
+          <div id="plugin-list" class="plugin-list"></div>
+          <footer class="dialog-footer"><span id="plugin-count">0 features enabled</span><button class="dialog-done" data-close-dialog type="button">Done</button></footer>
+        </section>
+      </div>
+      <div class="modal-backdrop" id="plugin-consent-modal" hidden>
+        <section class="dialog consent-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-consent-title">
+          <header class="dialog-header"><div><div class="dialog-kicker">REVIEW BEFORE RUNNING</div><h2 id="plugin-consent-title">Plugin access</h2></div><button class="icon-button dialog-close" id="cancel-plugin-consent" type="button" aria-label="Cancel plugin review">×</button></header>
+          <p class="dialog-description" id="plugin-consent-provenance"></p>
+          <details class="plugin-source-details"><summary>Inspect uploaded source</summary><pre id="plugin-source-view"></pre></details>
+          <div class="consent-permissions" id="plugin-permissions"></div>
+          <label class="consent-trust"><input id="plugin-trust-checkbox" type="checkbox"><span>I reviewed this local package and consent to running its code in Pinboard's restricted sandbox.</span></label>
+          <footer class="dialog-footer"><span id="plugin-consent-status">Unselected permissions stay unavailable.</span><div><button class="dialog-cancel" id="cancel-plugin-consent-footer" type="button">Cancel</button><button class="dialog-done" id="allow-plugin" type="button" disabled>Allow and run</button></div></footer>
+        </section>
+      </div>
+      <div class="modal-backdrop palette-backdrop" id="commands-modal" hidden>
+        <section class="dialog command-dialog" role="dialog" aria-modal="true" aria-labelledby="commands-title">
+          <h2 class="sr-only" id="commands-title">Command palette</h2>
+          <label class="command-search"><span aria-hidden="true">⌕</span><input id="command-search" type="search" placeholder="Find an action..." autocomplete="off" aria-label="Find a command"><kbd>ESC</kbd></label>
+          <div id="command-list" class="command-list" role="listbox" aria-label="Available commands"></div>
+          <div class="command-footer"><span>↑↓ to move</span><span>↵ to run</span></div>
+        </section>
+      </div>
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </div>
+    <script src="plugin-sandbox.js"></script>
+    <script src="plugin-system.js"></script>
+    <script src="plugins.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
