@@ -1,6 +1,6 @@
 # Pinboard
 
-Pinboard is a local-first notes experiment with sortable notes, autosaving, folder management, Markdown-oriented editing, JSON Canvas boards, and a searchable built-in feature catalogue. It is an original prototype; it does not include a remote plugin marketplace or synchronize data between devices.
+Pinboard is a local-first notes experiment with sortable notes, autosaving, nested pages, Markdown editing, JSON Canvas boards, a notes graph, shared text blocks, safe embeds, and relational databases with multiple views. Workspace tools include constrained note queries, theme tokens, static HTML export, and passphrase-encrypted backup import/export. It is an original prototype, not a clone of another notes product.
 
 ## Run locally
 
@@ -32,9 +32,20 @@ The debug APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`.
 
 ## Data and backups
 
-Notes, folders, boards, plugin preferences, and imported plugin packages are stored in the browser's `localStorage` under `pinboard.workspace.v1`. Data is local to the browser profile and origin; clearing site data or changing the origin can make it unavailable. Export Canvas boards individually from the Canvas toolbar. There is no workspace-wide backup or sync feature yet.
+Notes, folders, boards, database records, shared blocks, plugin preferences, and imported plugin packages are stored in the browser's `localStorage` under `pinboard.workspace.v1`. Data is local to the browser profile and origin; clearing site data or changing the origin can make it unavailable. Use **Workspace tools → Export encrypted backup** for a portable AES-GCM encrypted workspace file. The passphrase is not stored and cannot be recovered. Import replaces the current local workspace after confirmation.
 
 Autosave is debounced while editing. Browser `localStorage` writes are synchronous, so very large workspaces may affect responsiveness or exceed the browser quota. If storage reports an error, the editor displays a save failure; keep independent backups of important content.
+
+## Workspace tools
+
+- **Nested pages and graph:** Choose a parent page in the editor or create a sub-page. The graph derives links from `[[exact note titles]]` and parent relationships.
+- **Synced blocks:** Create or edit shared text in Workspace tools and insert `{{sync:block-id}}` references into notes. Preview resolves references and stops recursive loops.
+- **Databases:** Projects and Tasks are local tables. Relations may point to another database or a note; rollup fields count incoming database relations. Table, board, calendar, gallery, list, and timeline views use the same records.
+- **Note queries:** The database view includes a read-only query grammar such as `LIST FROM notes WHERE tag = #ideas` and `TABLE title,folder,pinned FROM notes`. Supported fields/operators are intentionally limited; queries never execute code.
+- **Embeds:** Markdown preview accepts `@[youtube](https://...)`, `@[figma](https://...)`, `@[drive](https://...)`, `@[typeform](https://...)`, and explicit HTTPS image/audio/video URLs with matching media extensions. Each embed requires a click to load; raw HTML and ordinary Markdown images are still not rendered.
+- **Static page export:** Workspace tools can download the selected note as a standalone HTML file. The user must host it; Pinboard does not publish to a public service or provide custom domains or SEO.
+- **Themes:** Select from validated accent and density tokens. Arbitrary CSS snippets are not enabled.
+- **Backup versus sync:** The encrypted backup is a manual file handoff, not live cross-device synchronization. No account, server, merge/conflict resolution, or encryption-key recovery service is included.
 
 ## Plugins
 
@@ -42,7 +53,7 @@ First-party features are registered in `plugins.js` through `plugin-system.js`; 
 
 Folders can be renamed, collapsed, and deleted; deleting a folder moves its notes to Uncategorized rather than deleting them. Markdown preview supports headings, paragraphs, inline emphasis/code/links, lists and task lists, blockquotes, tables, horizontal rules, and fenced code. Preview does not render raw HTML or remote images; only HTTP(S) links become clickable.
 
-See [PLUGIN_GUIDE.md](PLUGIN_GUIDE.md) for the package schema, capability list, and Canvas/code feature notes.
+See [PLUGIN_GUIDE.md](PLUGIN_GUIDE.md) for the package schema, capability list, and Canvas/code feature notes. See [FEATURE_STUDY.md](FEATURE_STUDY.md) for the evidence log, references, implementation choices, and boundaries of the Notion/Obsidian feature study.
 
 ## Checks
 
@@ -53,4 +64,5 @@ node --check app.js
 node --check plugin-sandbox.js
 node --check plugin-system.js
 node --check plugins.js
+node --check feature-suite.js
 ```

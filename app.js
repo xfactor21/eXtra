@@ -15,6 +15,7 @@
     collapsed: [],
     plugins: { enabled: {}, settings: {} },
     extensions: [],
+    features: window.PinboardFeatures.initialState(),
     selectedCanvasId: "canvas-main",
     canvases: [{ id: "canvas-main", name: "Thinking board", nodes: [], edges: [] }],
     folders: [
@@ -71,6 +72,7 @@
     noteTitle: byId("note-title"),
     noteBody: byId("note-body"),
     noteFolder: byId("note-folder"),
+    noteParent: byId("note-parent"),
     editorFields: byId("editor-fields"),
     editorEmpty: byId("editor-empty"),
     editorFolder: byId("editor-folder"),
@@ -124,6 +126,7 @@
   let saveTimer = null;
   let toastTimer = null;
   let pluginManager = null;
+  let featureSuite = null;
   let activeCommandIndex = 0;
   let canvasViewportState = { x: 0, y: 0, zoom: 1 };
   let canvasSaveTimer = null;
@@ -263,12 +266,26 @@
           body: typeof note.body === "string" ? note.body : "",
           folderId: typeof note.folderId === "string" && folderIds.has(note.folderId) ? note.folderId : null,
           pinned: note.pinned === true,
+          parentNoteId: typeof note.parentNoteId === "string" ? note.parentNoteId : null,
           createdAt: validDate(note.createdAt),
           updatedAt: validDate(note.updatedAt),
           metadata: note.metadata && typeof note.metadata === "object" && !Array.isArray(note.metadata)
             ? note.metadata
             : {}
         }];
+      });
+      notes.forEach((note) => {
+        if (!noteIds.has(note.parentNoteId) || note.parentNoteId === note.id) note.parentNoteId = null;
+        const visited = new Set([note.id]);
+        let parent = note.parentNoteId;
+        while (parent) {
+          if (visited.has(parent)) {
+            note.parentNoteId = null;
+            break;
+          }
+          visited.add(parent);
+          parent = notes.find((item) => item.id === parent)?.parentNoteId ?? null;
+        }
       });
       return {
         notes,
@@ -281,6 +298,7 @@
         selectedCanvasId: typeof parsed.selectedCanvasId === "string" ? parsed.selectedCanvasId : "canvas-main",
         canvases: sanitizeCanvases(parsed.canvases),
         extensions: sanitizeExtensions(parsed.extensions),
+        features: window.PinboardFeatures.sanitizeState(parsed.features, notes),
         plugins: parsed.plugins && typeof parsed.plugins === "object"
           ? {
             enabled: parsed.plugins.enabled && typeof parsed.plugins.enabled === "object" ? parsed.plugins.enabled : {},
@@ -724,6 +742,7 @@
   }
 
   function switchView(view) {
+    featureSuite?.deactivate();
     state.view = view === "canvas" ? "canvas" : "notes";
     const isCanvas = state.view === "canvas";
     ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : "Recently edited");
@@ -1033,7 +1052,7 @@
   }
 
   function appendInlineMarkdown(element, source) {
-    const pattern = /(!\[[^\]]*\]\([^)]+\)|`[^`]+`|\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)|\*\*(.+?)\*\*|__(.+?)__|~~(.+?)~~|\*(?!\s)(.+?)\*|_(?!\s)(.+?)_)/g;
+    const pattern = /(!\[[^\]]*\]\([^)]+\)|\[\[[^\]]+\]\]|`[^`]+`|\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)|\*\*(.+?)\*\*|__(.+?)__|~~(.+?)~~|\*(?!\s)(.+?)\*|_(?!\s)(.+?)_)/g;
     let previous = 0;
     for (const match of source.matchAll(pattern)) {
       element.append(document.createTextNode(source.slice(previous, match.index)));
@@ -1041,6 +1060,21 @@
       let rendered;
       if (token.startsWith("![")) {
         rendered = document.createTextNode(token);
+      } else if (token.startsWith("[[")) {
+        const [target, alias] = token.slice(2, -2).split("|", 2);
+        const cleanTarget = target.trim();
+        const note = state.notes.find((item) =>
+          item.id === cleanTarget || item.title.trim().toLocaleLowerCase() === cleanTarget.toLocaleLowerCase()
+        );
+        if (note) {
+          rendered = document.createElement("button");
+          rendered.type = "button";
+          rendered.className = "wiki-link";
+          rendered.textContent = alias?.trim() || note.title || "Untitled note";
+          rendered.addEventListener("click", () => selectNote(note.id));
+        } else {
+          rendered = document.createTextNode(token);
+        }
       } else if (token.startsWith("`")) {
         rendered = document.createElement("code");
         rendered.textContent = token.slice(1, -1);
@@ -1078,7 +1112,92 @@
       (index + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[index + 1]) && line.includes("|"));
   }
 
-  function appendMarkdownBlocks(container, source) {
+  function resolveEmbed(provider, source) {
+    let url;
+    try {
+      url = new URL(source);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "https:") return null;
+    const host = url.hostname.toLocaleLowerCase();
+    if (provider === "youtube" && ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be", "youtube-nocookie.com"].includes(host)) {
+      const id = host.includes("youtu.be") ? url.pathname.slice(1).split("/")[0]
+        : url.pathname === "/watch" ? url.searchParams.get("v")
+          : url.pathname.match(/^\/embed\/([A-Za-z0-9_-]{6,20})$/)?.[1];
+      return id && /^[A-Za-z0-9_-]{6,20}$/.test(id)
+        ? { kind: "frame", url: `https://www.youtube-nocookie.com/embed/${id}`, label: "YouTube video" }
+        : null;
+    }
+    if (provider === "figma" && ["figma.com", "www.figma.com"].includes(host) && /^\/(file|design|board)\/[A-Za-z0-9]+/.test(url.pathname)) {
+      return { kind: "frame", url: `https://www.figma.com/embed?embed_host=pinboard&url=${encodeURIComponent(url.href)}`, label: "Figma file" };
+    }
+    if (provider === "drive" && ["drive.google.com", "docs.google.com"].includes(host)) {
+      const fileId = url.pathname.match(/\/(?:file\/d|document\/d|spreadsheets\/d|presentation\/d)\/([A-Za-z0-9_-]{8,})/)?.[1];
+      return fileId && host === "drive.google.com"
+        ? { kind: "frame", url: `https://drive.google.com/file/d/${fileId}/preview`, label: "Google Drive file" }
+        : null;
+    }
+    if (provider === "typeform" && ["typeform.com", "www.typeform.com", "form.typeform.com"].includes(host)) {
+      const formId = url.pathname.match(/\/to\/([A-Za-z0-9]+)/)?.[1];
+      return formId ? { kind: "frame", url: `https://form.typeform.com/to/${formId}`, label: "Typeform" } : null;
+    }
+    if (["image", "audio", "video"].includes(provider)) {
+      const extension = url.pathname.toLocaleLowerCase().split(".").pop();
+      const allowed = {
+        image: ["png", "jpg", "jpeg", "gif", "webp"],
+        audio: ["mp3", "m4a", "ogg", "wav", "aac"],
+        video: ["mp4", "webm", "ogv", "mov"]
+      };
+      return allowed[provider].includes(extension) ? { kind: provider, url: url.href, label: `${provider} media` } : null;
+    }
+    return null;
+  }
+
+  function appendEmbed(container, provider, source) {
+    const embed = resolveEmbed(provider, source);
+    const section = document.createElement("section");
+    section.className = "preview-embed";
+    if (!embed) {
+      section.textContent = `This ${provider} embed is unsupported or the URL is not allowed.`;
+      container.append(section);
+      return;
+    }
+    const load = document.createElement("button");
+    load.type = "button";
+    load.className = "preview-embed-load";
+    load.textContent = `Load ${embed.label} from ${new URL(embed.url).hostname}`;
+    load.addEventListener("click", () => {
+      if (embed.kind === "frame") {
+        const frame = document.createElement("iframe");
+        frame.src = embed.url;
+        frame.title = embed.label;
+        frame.loading = "lazy";
+        frame.referrerPolicy = "no-referrer";
+        frame.sandbox = "allow-scripts allow-same-origin allow-forms allow-popups";
+        frame.allow = "fullscreen; picture-in-picture";
+        section.replaceChildren(frame);
+      } else if (embed.kind === "image") {
+        const image = document.createElement("img");
+        image.src = embed.url;
+        image.alt = "Embedded image";
+        image.loading = "lazy";
+        image.referrerPolicy = "no-referrer";
+        section.replaceChildren(image);
+      } else {
+        const media = document.createElement(embed.kind);
+        media.src = embed.url;
+        media.controls = true;
+        media.preload = "none";
+        media.referrerPolicy = "no-referrer";
+        section.replaceChildren(media);
+      }
+    }, { once: true });
+    section.append(load);
+    container.append(section);
+  }
+
+  function appendMarkdownBlocks(container, source, sharedPath = new Set()) {
     const lines = source.split("\n");
     let index = 0;
     while (index < lines.length) {
@@ -1118,6 +1237,34 @@
         container.append(block);
         continue;
       }
+      const embed = line.match(/^ {0,3}@([a-z]+)\((https:\/\/[^)\s]+)\)\s*$/i);
+      if (embed) {
+        appendEmbed(container, embed[1].toLocaleLowerCase(), embed[2]);
+        index += 1;
+        continue;
+      }
+      const synced = line.match(/^ {0,3}\{\{sync:([A-Za-z0-9_-]{1,100})\}\}\s*$/);
+      if (synced) {
+        const block = state.features.syncedBlocks.find((item) => item.id === synced[1]);
+        const wrapper = document.createElement("section");
+        wrapper.className = "synced-block-preview";
+        if (!block) {
+          wrapper.textContent = "This shared block is missing.";
+        } else if (sharedPath.has(block.id) || sharedPath.size >= 8) {
+          wrapper.textContent = "A shared-block reference loop was stopped.";
+        } else {
+          const heading = document.createElement("strong");
+          heading.textContent = block.title;
+          const content = document.createElement("div");
+          const nextPath = new Set(sharedPath);
+          nextPath.add(block.id);
+          appendMarkdownBlocks(content, block.content, nextPath);
+          wrapper.append(heading, content);
+        }
+        container.append(wrapper);
+        index += 1;
+        continue;
+      }
       const heading = line.match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
       if (heading) {
         const element = document.createElement(`h${heading[1].length}`);
@@ -1138,7 +1285,7 @@
           index += 1;
         }
         const blockquote = document.createElement("blockquote");
-        appendMarkdownBlocks(blockquote, quote.join("\n"));
+        appendMarkdownBlocks(blockquote, quote.join("\n"), sharedPath);
         container.append(blockquote);
         continue;
       }
@@ -1243,6 +1390,8 @@
     ui.editorEmpty.hidden = Boolean(note);
     ui.pinButton.disabled = !note;
     ui.deleteButton.disabled = !note;
+    byId("create-child-page").disabled = !note;
+    byId("insert-synced-block").disabled = !note && state.notes.length === 0;
     ui.pinButton.classList.toggle("is-pinned", Boolean(note?.pinned));
     ui.pinButton.setAttribute("aria-label", note?.pinned ? "Unpin note" : "Pin note");
     ui.pinButton.title = note?.pinned ? "Unpin note" : "Pin note";
@@ -1274,6 +1423,28 @@
       ui.noteFolder.append(option);
     });
     ui.noteFolder.value = note.folderId ?? "";
+    ui.noteParent.replaceChildren();
+    const rootPage = document.createElement("option");
+    rootPage.value = "";
+    rootPage.textContent = "No parent";
+    ui.noteParent.append(rootPage);
+    const descendants = new Set();
+    const collectDescendants = (parentId) => {
+      state.notes.filter((item) => item.parentNoteId === parentId).forEach((child) => {
+        descendants.add(child.id);
+        collectDescendants(child.id);
+      });
+    };
+    collectDescendants(note.id);
+    state.notes.filter((item) => item.id !== note.id && !descendants.has(item.id))
+      .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" }))
+      .forEach((item) => {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = item.title.trim() || "Untitled note";
+        ui.noteParent.append(option);
+      });
+    ui.noteParent.value = note.parentNoteId ?? "";
   }
 
   function renderPluginPanels() {
@@ -1788,6 +1959,7 @@
     renderPluginPanels();
     renderEditorStatus();
     if (state.view === "canvas") renderCanvas();
+    featureSuite?.render();
   }
 
   function selectNote(id) {
@@ -1819,12 +1991,15 @@
     });
   }
 
-  function createNote({ title = "", body = "", folderId = null, metadata = {} } = {}) {
+  function createNote({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
     if (typeof title !== "string" || typeof body !== "string") {
       throw new TypeError("New note title and body must be text.");
     }
     if (folderId !== null && !state.folders.some((folder) => folder.id === folderId)) {
       throw new Error(`Unknown Pinboard folder: ${folderId}`);
+    }
+    if (parentNoteId !== null && !state.notes.some((note) => note.id === parentNoteId)) {
+      throw new Error(`Unknown Pinboard parent page: ${parentNoteId}`);
     }
     if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
       throw new TypeError("New note metadata must be an object.");
@@ -1832,7 +2007,7 @@
     if (state.view !== "notes") switchView("notes");
     flushSave();
     const now = new Date().toISOString();
-    const note = { id: makeId("note"), title, body, folderId, pinned: false, createdAt: now, updatedAt: now, metadata: { ...metadata } };
+    const note = { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: { ...metadata } };
     state.notes.push(note);
     setActiveFilter("all");
     ui.search.value = "";
@@ -1919,6 +2094,15 @@
     if (!note) return;
     if (!window.confirm(`Delete “${note.title.trim() || "Untitled note"}”? This cannot be undone.`)) return;
     state.notes = state.notes.filter((item) => item.id !== note.id);
+    state.notes.forEach((item) => {
+      if (item.parentNoteId === note.id) item.parentNoteId = note.parentNoteId ?? null;
+    });
+    state.features.tables.forEach((table) => {
+      table.columns.filter((column) => column.type === "relation" && column.targetTableId === "notes")
+        .forEach((column) => table.rows.forEach((row) => {
+          if (row.values[column.id] === note.id) delete row.values[column.id];
+        }));
+    });
     selectedNoteId = state.notes[0]?.id ?? null;
     pluginManager?.emit("note:deleted", { ...note });
     render();
@@ -2173,6 +2357,28 @@
       updateSelectedNote({ folderId: ui.noteFolder.value || null });
       renderEditor();
     });
+    ui.noteParent.addEventListener("change", () => {
+      const note = currentNote();
+      if (!note) return;
+      const parentId = ui.noteParent.value || null;
+      if (parentId === note.id) {
+        showToast("A page cannot be its own parent.");
+        renderEditor();
+        return;
+      }
+      const descendants = new Set();
+      const collect = (id) => state.notes.filter((item) => item.parentNoteId === id).forEach((item) => {
+        descendants.add(item.id);
+        collect(item.id);
+      });
+      collect(note.id);
+      if (parentId && descendants.has(parentId)) {
+        showToast("A page cannot be moved inside one of its own sub-pages.");
+        renderEditor();
+        return;
+      }
+      updateSelectedNote({ parentNoteId: parentId });
+    });
     ui.pinButton.addEventListener("click", () => {
       const note = currentNote();
       if (!note) return;
@@ -2277,8 +2483,31 @@
     });
     setupCanvasEvents();
     setupPluginEvents();
+    featureSuite.setup();
   }
 
+  const restoredFeatureView = state.features.activeView;
+  state.features.activeView = null;
+  featureSuite = window.PinboardFeatures.create({
+    getState: () => state,
+    currentNote,
+    createNote,
+    selectNote,
+    persist: persistWorkspace,
+    flushSave,
+    notify: showToast,
+    render,
+    extractTags,
+    storageKey: STORAGE_KEY,
+    insertText(text) {
+      if (!currentNote()) createNote();
+      const start = ui.noteBody.selectionStart;
+      const end = ui.noteBody.selectionEnd;
+      ui.noteBody.setRangeText(text, start, end, "end");
+      ui.noteBody.dispatchEvent(new Event("input", { bubbles: true }));
+      ui.noteBody.focus();
+    }
+  });
   setActiveFilter(state.filter);
   pluginManager = window.PinboardPluginSystem.create({
     definitions: window.PinboardPlugins,
@@ -2295,6 +2524,7 @@
   setupEvents();
   render();
   switchView(state.view);
+  if (restoredFeatureView) featureSuite.open(restoredFeatureView);
   pluginManager.start().then(() => {
     state.plugins = pluginManager.serialize();
     persistWorkspace();

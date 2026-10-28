@@ -25,6 +25,9 @@
           <button class="nav-item" data-filter="pinned" type="button"><span class="nav-icon pin-nav-icon" aria-hidden="true">◆</span><span>Pinned</span><span class="nav-count" id="pinned-count">0</span></button>
           <button class="nav-item" data-filter="recent" type="button"><span class="nav-icon" aria-hidden="true">◷</span><span>Recently edited</span></button>
           <button class="nav-item" id="canvas-nav" data-view="canvas" type="button"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
+          <button class="nav-item" data-feature-view="database" type="button"><span class="nav-icon" aria-hidden="true">▦</span><span>Databases</span></button>
+          <button class="nav-item" data-feature-view="graph" type="button"><span class="nav-icon" aria-hidden="true">◎</span><span>Graph</span></button>
+          <button class="nav-item" data-feature-view="settings" type="button"><span class="nav-icon" aria-hidden="true">⚙</span><span>Workspace tools</span></button>
         </nav>
         <div class="sidebar-bottom">
           <div class="sync-card"><span class="sync-indicator" aria-hidden="true"></span><span><strong>Just you and your notes</strong><small>Saved on this device</small></span></div>
@@ -60,8 +63,12 @@
               <div id="editor-empty" class="editor-empty" hidden><div class="editor-empty-mark">✳</div><h2>A blank page is a good place to start.</h2><p>Pick a note, or pin down a new thought.</p><button class="new-note-inline" id="editor-create" type="button">＋ Create a note</button></div>
               <div id="editor-fields" class="editor-fields">
                 <label class="sr-only" for="note-title">Note title</label><input id="note-title" class="note-title" type="text" placeholder="Untitled note" maxlength="120" spellcheck="false">
-                <div class="note-meta"><span class="meta-glyph" aria-hidden="true">◷</span><span id="note-meta-date">Created just now</span><span class="meta-divider">·</span><label for="note-folder">IN</label><select id="note-folder" aria-label="Move note to folder"></select></div>
+                <div class="note-meta"><span class="meta-glyph" aria-hidden="true">◷</span><span id="note-meta-date">Created just now</span><span class="meta-divider">·</span><label for="note-folder">IN</label><select id="note-folder" aria-label="Move note to folder"></select><label for="note-parent">PARENT</label><select id="note-parent" aria-label="Set parent page"></select></div>
                 <div class="editor-rule"></div>
+                <div class="editor-page-tools">
+                  <button class="editor-tool-button" id="create-child-page" type="button">＋ Sub-page</button>
+                  <button class="editor-tool-button" id="insert-synced-block" type="button">＋ Synced block</button>
+                </div>
                 <div class="editor-tools" aria-label="Editor tools">
                   <label class="code-language-control">CODE LANGUAGE
                     <select id="code-language" aria-label="Code block language">
@@ -106,6 +113,14 @@
               <div class="canvas-empty" id="canvas-empty" hidden><strong>A board for ideas that connect.</strong><p>Add a text card, a note, or a link to start mapping things out.</p><button id="canvas-empty-add" type="button">＋ Add a text card</button></div>
             </div>
             <div class="canvas-footer"><span id="canvas-status" role="status">JSON Canvas compatible · saved on this device</span><span>Drag cards or focus one and use arrows to move, Shift + arrows for larger steps, Alt + arrows to resize · select two cards to connect</span></div>
+          </section>
+          <section class="feature-view" id="feature-view" aria-label="Workspace tools" hidden>
+            <nav class="feature-tabs" aria-label="Workspace tool views">
+              <button type="button" class="feature-tab" data-feature-view="database">Databases</button>
+              <button type="button" class="feature-tab" data-feature-view="graph">Graph</button>
+              <button type="button" class="feature-tab" data-feature-view="settings">Publish, themes & backup</button>
+            </nav>
+            <div class="feature-content" id="feature-content"></div>
           </section>
         </section>
       </main>
@@ -159,6 +174,7 @@
     <script src="plugin-sandbox.js"></script>
     <script src="plugin-system.js"></script>
     <script src="plugins.js"></script>
+    <script src="feature-suite.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
