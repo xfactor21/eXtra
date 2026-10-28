@@ -1,0 +1,18 @@
+{
+  "name": "pinboard-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Android wrapper for the Pinboard local-first notes app",
+  "scripts": {
+    "build:web": "node scripts/prepare-web.mjs",
+    "android:sync": "npm run build:web && cap sync android",
+    "android:debug": "npm run android:sync && cd android && gradlew.bat assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/core": "^8.6.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.0"
+  }
+}

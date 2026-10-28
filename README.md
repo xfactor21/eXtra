@@ -10,7 +10,25 @@ Serve this directory over HTTP from the project root, then open the printed loca
 python -m http.server 4173 --bind 127.0.0.1
 ```
 
-The page can also be opened directly as a file, but browser clipboard and sandbox behavior may differ. The app has no package manifest or build step. Its interface requests fonts from Google Fonts when online and falls back to system fonts if those requests are unavailable.
+The page can also be opened directly as a file, but browser clipboard and sandbox behavior may differ. Running the web app itself requires no package installation or build step. Its interface requests fonts from Google Fonts when online and falls back to system fonts if those requests are unavailable.
+
+## Build the Android APK
+
+The Android wrapper uses Capacitor and packages the same local web app; it does not require a hosted server. Install Node.js 20 or newer, Android Studio with Android SDK Platform 36 and platform tools, and JDK 21 (set Android Studio's Gradle JDK to JDK 21 if its bundled JDK is newer). In PowerShell, set the SDK path if it is not already configured:
+
+```powershell
+$env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
+$env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
+```
+
+From the repository root, build the debug APK:
+
+```powershell
+npm install
+npm run android:debug
+```
+
+The debug APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`. Gradle signs it with a debug key for local installation/testing. For a Play Store or public release, configure a private release signing key and build a signed release APK or Android App Bundle; never commit signing keys. The Android app keeps notes in its own WebView storage, separate from the desktop browser, so export/backup support should be used before uninstalling.
 
 ## Data and backups
 
