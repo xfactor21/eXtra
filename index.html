@@ -4,7 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#07151d">
-    <title>Pinboard — a place for your thoughts</title>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self'; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+    <title>xPin — a place for your thoughts</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -14,20 +15,20 @@
   <body>
     <div class="app-shell">
       <aside class="sidebar" aria-label="Main navigation">
-        <a class="brand" href="#" aria-label="Pinboard home">
+        <a class="brand" href="#" aria-label="xPin home">
           <span class="brand-mark" aria-hidden="true"><span></span></span>
-          <span>pinboard<span class="brand-period">.</span></span>
+          <span>xPin<span class="brand-period">.</span></span>
         </a>
-        <button class="new-note-button" id="new-note" type="button"><span aria-hidden="true">＋</span> New note <kbd>N</kbd></button>
+        <button class="new-note-button" id="new-note" type="button" aria-label="New note"><span aria-hidden="true">＋</span> New note <kbd>N</kbd></button>
         <div class="nav-label">YOUR SPACE</div>
         <nav class="primary-nav">
-          <button class="nav-item is-active" data-filter="all" type="button"><span class="nav-icon" aria-hidden="true">▤</span><span>All notes</span><span class="nav-count" id="all-count">0</span></button>
-          <button class="nav-item" data-filter="pinned" type="button"><span class="nav-icon pin-nav-icon" aria-hidden="true">◆</span><span>Pinned</span><span class="nav-count" id="pinned-count">0</span></button>
-          <button class="nav-item" data-filter="recent" type="button"><span class="nav-icon" aria-hidden="true">◷</span><span>Recently edited</span></button>
-          <button class="nav-item" id="canvas-nav" data-view="canvas" type="button"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
-          <button class="nav-item" data-feature-view="database" type="button"><span class="nav-icon" aria-hidden="true">▦</span><span>Databases</span></button>
-          <button class="nav-item" data-feature-view="graph" type="button"><span class="nav-icon" aria-hidden="true">◎</span><span>Graph</span></button>
-          <button class="nav-item" data-feature-view="settings" type="button"><span class="nav-icon" aria-hidden="true">⚙</span><span>Workspace tools</span></button>
+          <button class="nav-item is-active" data-filter="all" type="button" aria-label="All notes"><span class="nav-icon" aria-hidden="true">▤</span><span>All notes</span><span class="nav-count" id="all-count">0</span></button>
+          <button class="nav-item" data-filter="pinned" type="button" aria-label="Pinned"><span class="nav-icon pin-nav-icon" aria-hidden="true">◆</span><span>Pinned</span><span class="nav-count" id="pinned-count">0</span></button>
+          <button class="nav-item" data-filter="recent" type="button" aria-label="Recent notes"><span class="nav-icon" aria-hidden="true">◷</span><span>Recent notes</span></button>
+          <button class="nav-item" id="canvas-nav" data-view="canvas" type="button" aria-label="Canvas"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
+          <button class="nav-item" data-feature-view="database" type="button" aria-label="Databases"><span class="nav-icon" aria-hidden="true">▦</span><span>Databases</span></button>
+          <button class="nav-item" data-feature-view="graph" type="button" aria-label="Graph"><span class="nav-icon" aria-hidden="true">◎</span><span>Graph</span></button>
+          <button class="nav-item" data-feature-view="settings" type="button" aria-label="Workspace tools"><span class="nav-icon" aria-hidden="true">⚙</span><span>Workspace tools</span></button>
         </nav>
         <div class="sidebar-bottom">
           <div class="sync-card"><span class="sync-indicator" aria-hidden="true"></span><span><strong>Just you and your notes</strong><small>Saved on this device</small></span></div>
@@ -37,7 +38,7 @@
       <main class="workspace">
         <header class="topbar">
           <div class="breadcrumb"><span>YOUR SPACE</span><span class="crumb-separator">/</span><strong id="current-view-label">All notes</strong></div>
-          <div class="topbar-actions"><button class="topbar-tool" id="open-commands" type="button" aria-expanded="false" aria-controls="commands-modal"><span aria-hidden="true">⌘</span> Commands <kbd id="palette-shortcut">Ctrl P</kbd></button><button class="topbar-tool" id="open-plugins" type="button" aria-expanded="false" aria-controls="plugins-modal"><span aria-hidden="true">◇</span> Plugins</button><span class="keyboard-hint"><kbd id="command-key">Ctrl</kbd><kbd>K</kbd> to search</span><span class="avatar avatar-small" aria-hidden="true">Y</span></div>
+          <div class="topbar-actions"><button class="topbar-tool" id="open-commands" type="button" aria-expanded="false" aria-controls="commands-modal" aria-label="Commands"><span aria-hidden="true">⌘</span> Commands <kbd id="palette-shortcut">Ctrl P</kbd></button><button class="topbar-tool" id="open-plugins" type="button" aria-expanded="false" aria-controls="plugins-modal" aria-label="Plugins"><span aria-hidden="true">◇</span> Plugins</button><span class="keyboard-hint"><kbd id="command-key">Ctrl</kbd><kbd>K</kbd> to search</span><span class="avatar avatar-small" aria-hidden="true">Y</span></div>
         </header>
         <section class="content">
           <div class="page-heading" id="notes-heading">
@@ -115,11 +116,6 @@
             <div class="canvas-footer"><span id="canvas-status" role="status">JSON Canvas compatible · saved on this device</span><span>Drag cards or focus one and use arrows to move, Shift + arrows for larger steps, Alt + arrows to resize · select two cards to connect</span></div>
           </section>
           <section class="feature-view" id="feature-view" aria-label="Workspace tools" hidden>
-            <nav class="feature-tabs" aria-label="Workspace tool views">
-              <button type="button" class="feature-tab" data-feature-view="database">Databases</button>
-              <button type="button" class="feature-tab" data-feature-view="graph">Graph</button>
-              <button type="button" class="feature-tab" data-feature-view="settings">Publish, themes & backup</button>
-            </nav>
             <div class="feature-content" id="feature-content"></div>
           </section>
         </section>
@@ -157,7 +153,7 @@
           <p class="dialog-description" id="plugin-consent-provenance"></p>
           <details class="plugin-source-details"><summary>Inspect uploaded source</summary><pre id="plugin-source-view"></pre></details>
           <div class="consent-permissions" id="plugin-permissions"></div>
-          <label class="consent-trust"><input id="plugin-trust-checkbox" type="checkbox"><span>I reviewed this local package and consent to running its code in Pinboard's restricted sandbox.</span></label>
+          <label class="consent-trust"><input id="plugin-trust-checkbox" type="checkbox"><span>I reviewed this local package and consent to running its code in xPin's restricted sandbox.</span></label>
           <footer class="dialog-footer"><span id="plugin-consent-status">Unselected permissions stay unavailable.</span><div><button class="dialog-cancel" id="cancel-plugin-consent-footer" type="button">Cancel</button><button class="dialog-done" id="allow-plugin" type="button" disabled>Allow and run</button></div></footer>
         </section>
       </div>
