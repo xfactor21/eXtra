@@ -146,6 +146,8 @@
     pluginConsentStatus: byId("plugin-consent-status"),
     pluginConsentProvenance: byId("plugin-consent-provenance"),
     pluginSourceView: byId("plugin-source-view"),
+    pluginRejectRow: byId("plugin-reject-row"),
+    pluginRejectReason: byId("plugin-reject-reason"),
     allowPluginButton: byId("allow-plugin"),
     pluginFileInput: byId("plugin-file-input"),
     canvasFileInput: byId("canvas-file-input")
@@ -169,6 +171,7 @@
   let pendingPluginConsent = null;
   const activeExtensions = new Map();
   const extensionCommands = new Map();
+  const extensionStatusItems = new Map();
 
   function sanitizeCanvases(value) {
     if (!Array.isArray(value)) return structuredClone(initialWorkspace.canvases);
@@ -263,7 +266,14 @@
           ) : [],
           settings: record.settings && typeof record.settings === "object" && !Array.isArray(record.settings)
             ? record.settings
-            : {}
+            : {},
+          // Review queue (added after launch): older saves predate it, so infer
+          // the status — anything once approved stays approved, the rest is pending.
+          reviewStatus: record.reviewStatus === "approved" || record.reviewStatus === "rejected"
+            ? record.reviewStatus
+            : (typeof record.approvedHash === "string" && record.approvedHash ? "approved" : "pending"),
+          reviewReason: typeof record.reviewReason === "string" ? record.reviewReason.slice(0, 200) : null,
+          reviewedAt: typeof record.reviewedAt === "string" ? record.reviewedAt : null
         }];
       } catch (error) {
         console.error("An invalid saved xPin plugin was ignored.", error);
@@ -2005,6 +2015,13 @@
         ui.editorStatus.append(message);
       }
     });
+    extensionStatusItems.forEach((item) => {
+      const status = document.createElement("span");
+      status.className = "extension-status-item";
+      status.dataset.pluginId = item.pluginId;
+      status.textContent = item.text;
+      ui.editorStatus.append(status);
+    });
   }
 
   function availableCommands() {
@@ -2019,6 +2036,17 @@
       if (command.pluginId === pluginId) extensionCommands.delete(key);
     }
     if (!ui.commandsModal.hidden) renderCommands();
+  }
+
+  function removeExtensionStatusItems(pluginId) {
+    let changed = false;
+    for (const key of extensionStatusItems.keys()) {
+      if (extensionStatusItems.get(key).pluginId === pluginId) {
+        extensionStatusItems.delete(key);
+        changed = true;
+      }
+    }
+    if (changed) renderEditorStatus();
   }
 
   function copyPluginValue(value) {
@@ -2057,6 +2085,37 @@
       if (folderId !== null && typeof folderId !== "string") throw new TypeError("Plugin folder id is invalid.");
       return createNote({ title: options.title, body: options.body, folderId });
     }
+    if (capability === "notes:update") {
+      if (typeof payload?.id !== "string") throw new TypeError("Plugin note update requires a note id.");
+      const patch = payload?.patch;
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new TypeError("Plugin note update requires a patch object with title and/or body.");
+      }
+      const changes = {};
+      if (patch.title !== undefined) {
+        if (typeof patch.title !== "string" || patch.title.length > 120) {
+          throw new TypeError("Plugin note title must be text under 120 characters.");
+        }
+        changes.title = patch.title;
+      }
+      if (patch.body !== undefined) {
+        if (typeof patch.body !== "string" || patch.body.length > 100_000) {
+          throw new TypeError("Plugin note body must be text under 100 KB.");
+        }
+        changes.body = patch.body;
+      }
+      if (!Object.keys(changes).length) throw new TypeError("Plugin note update changed nothing.");
+      const note = state.notes.find((item) => item.id === payload.id);
+      if (!note) throw new Error("The note no longer exists.");
+      Object.assign(note, changes, { updatedAt: new Date().toISOString() });
+      refreshNoteRow(note.id);
+      if (note.id === selectedNoteId) renderEditor();
+      pluginManager?.emit("note:updated", { ...note });
+      renderPluginPanels();
+      renderEditorStatus();
+      persistWorkspace();
+      return { ...note };
+    }
     if (capability === "editor:write") {
       if (typeof payload?.text !== "string" || payload.text.length > 5_000) {
         throw new TypeError("Plugin editor insertion must be text under 5 KB.");
@@ -2075,6 +2134,31 @@
       }
       showToast(payload.message);
       return true;
+    }
+    if (capability === "ui:status") {
+      const action = payload?.action;
+      if (action === "clear") {
+        if (typeof payload?.id !== "string" || !payload.id) throw new TypeError("Plugin status item needs an id.");
+        extensionStatusItems.delete(`${plugin.manifest.id}:${payload.id}`);
+        renderEditorStatus();
+        return true;
+      }
+      if (action === "set") {
+        const item = payload?.item;
+        if (!item || typeof item !== "object" || Array.isArray(item) ||
+          typeof item.id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(item.id) ||
+          typeof item.text !== "string" || !item.text.trim() || item.text.length > 80) {
+          throw new TypeError("Plugin status item needs an id and text under 80 characters.");
+        }
+        extensionStatusItems.set(`${plugin.manifest.id}:${item.id}`, {
+          pluginId: plugin.manifest.id,
+          id: item.id,
+          text: item.text.trim()
+        });
+        renderEditorStatus();
+        return true;
+      }
+      throw new TypeError("Unknown plugin status action.");
     }
     if (capability === "commands:register") {
       const command = payload;
@@ -2113,15 +2197,37 @@
 
   async function startExtension(plugin) {
     if (activeExtensions.has(plugin.manifest.id)) return;
+    if (plugin.reviewStatus && plugin.reviewStatus !== "approved") {
+      throw new Error(`"${plugin.manifest.name}" has not been approved yet. Review it in the plugin catalogue first.`);
+    }
+    // Defense in depth: an approved plugin must never run with capabilities it
+    // did not declare. Grants are sanitized on load and on approval, so reaching
+    // here with a mismatch means the approval is stale — send it back to review.
+    const revoked = plugin.grants.filter((grant) => !plugin.manifest.permissions.includes(grant));
+    if (revoked.length) {
+      plugin.enabled = false;
+      plugin.grants = [];
+      plugin.approvedHash = null;
+      plugin.reviewStatus = "pending";
+      plugin.reviewReason = "Its approved capabilities changed since review.";
+      plugin.reviewedAt = null;
+      persistWorkspace();
+      renderPluginManager();
+      throw new Error(`"${plugin.manifest.name}" was sent back for review because its approved capabilities changed.`);
+    }
     const sandbox = window.xPinSandbox.create({
       plugin,
       permissions: plugin.grants,
       onRequest: (capability, payload) => handleExtensionRequest(plugin, capability, payload),
+      onWarning(warning) {
+        showToast(`${plugin.manifest.name}: ${warning.message}`);
+      },
       onError(error) {
         console.error(`Imported xPin plugin "${plugin.manifest.name}" stopped.`, error);
         plugin.enabled = false;
         activeExtensions.delete(plugin.manifest.id);
         removeExtensionCommands(plugin.manifest.id);
+        removeExtensionStatusItems(plugin.manifest.id);
         persistWorkspace();
         renderPluginManager();
         showToast(`${plugin.manifest.name} stopped: ${error.message}`);
@@ -2141,11 +2247,19 @@
     let updated = false;
     for (const plugin of state.extensions) {
       if (!plugin.enabled) continue;
+      if (plugin.reviewStatus === "rejected") {
+        plugin.enabled = false;
+        updated = true;
+        continue;
+      }
       const actualHash = await window.xPinSandbox.digestPackage(plugin);
       if (!actualHash || actualHash !== plugin.sha256 || actualHash !== plugin.approvedHash) {
         plugin.enabled = false;
         plugin.grants = [];
         plugin.approvedHash = null;
+        plugin.reviewStatus = "pending";
+        plugin.reviewReason = "Its package changed since approval.";
+        plugin.reviewedAt = null;
         updated = true;
         showToast(`${plugin.manifest.name} needs permission review because its package changed.`);
         continue;
@@ -2156,7 +2270,7 @@
         plugin.enabled = false;
         updated = true;
         console.error(`Could not start imported plugin "${plugin.manifest.name}".`, error);
-        showToast(`${plugin.manifest.name} could not start. Review its package and permissions.`);
+        showToast(error.message || `${plugin.manifest.name} could not start. Review its package and permissions.`);
       }
     }
     if (updated) persistWorkspace();
@@ -2166,13 +2280,21 @@
   async function importPluginFile(file) {
     if (!file) return;
     if (file.size > window.xPinSandbox.maxPackageBytes) {
-      throw new TypeError(`Plugin package must be smaller than ${window.xPinSandbox.maxPackageBytes / 1000} KB.`);
+      throw new TypeError(`Plugin package must be smaller than ${window.xPinSandbox.maxPackageBytes / 1000} KB. This file is ${Math.round(file.size / 1000)} KB.`);
     }
-    const parsed = JSON.parse(await file.text());
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (error) {
+      throw new TypeError(`"${file.name}" is not valid JSON, so it can't be a plugin package.`);
+    }
     const plugin = window.xPinSandbox.validatePackage(parsed);
-    if (pluginManager.plugins().some((item) => item.id === plugin.manifest.id) ||
-      state.extensions.some((item) => item.manifest.id === plugin.manifest.id)) {
-      throw new Error("A plugin with this id is already installed. Remove it before importing another version.");
+    const clash = state.extensions.find((item) => item.manifest.id === plugin.manifest.id);
+    if (pluginManager.plugins().some((item) => item.id === plugin.manifest.id)) {
+      throw new Error(`"${plugin.manifest.name}" clashes with a built-in xPin feature id. Pick a different plugin id.`);
+    }
+    if (clash) {
+      throw new Error(`"${clash.manifest.name}" v${clash.manifest.version} is already installed. Remove it first to import v${plugin.manifest.version}.`);
     }
     const sha256 = await window.xPinSandbox.digestPackage(plugin);
     if (!sha256) throw new Error("This browser cannot calculate a package fingerprint, so the plugin was not installed.");
@@ -2184,11 +2306,14 @@
       enabled: false,
       approvedHash: null,
       grants: [],
-      settings: {}
+      settings: {},
+      reviewStatus: "pending",
+      reviewReason: null,
+      reviewedAt: null
     });
     persistWorkspace();
     renderPluginManager();
-    showToast(`${plugin.manifest.name} was imported and is disabled until you review it.`);
+    showToast(`${plugin.manifest.name} was imported and is waiting for your review.`);
   }
 
   function openPluginConsent(plugin) {
@@ -2204,6 +2329,10 @@
       checkbox.type = "checkbox";
       checkbox.value = permission;
       checkbox.dataset.permission = permission;
+      // Requested capabilities start selected: reviewing means unchecking what
+      // the plugin should NOT have. Approving with none selected leaves the
+      // plugin unable to do anything, so that choice asks for confirmation.
+      checkbox.checked = true;
       const text = document.createElement("span");
       const name = document.createElement("strong");
       name.textContent = permission;
@@ -2215,8 +2344,10 @@
     });
     ui.pluginTrustCheckbox.checked = false;
     ui.allowPluginButton.disabled = true;
+    ui.pluginRejectRow.hidden = true;
+    ui.pluginRejectReason.value = "";
     ui.pluginConsentStatus.textContent = plugin.manifest.permissions.length
-      ? "Only permissions you select will be available."
+      ? "Requested capabilities are pre-selected. Uncheck anything this plugin should not have."
       : "This plugin requested no xPin capabilities.";
     ui.pluginConsentModal.hidden = false;
     document.body.classList.add("modal-open");
@@ -2230,19 +2361,31 @@
     byId("open-plugins").focus();
   }
 
-  async function allowPendingPlugin() {
+  async function approvePendingPlugin() {
     const plugin = pendingPluginConsent;
     if (!plugin || !ui.pluginTrustCheckbox.checked) return;
-    plugin.grants = [...ui.pluginPermissions.querySelectorAll("[data-permission]:checked")]
-      .map((checkbox) => checkbox.dataset.permission);
+    const granted = [...ui.pluginPermissions.querySelectorAll("[data-permission]:checked")]
+      .map((checkbox) => checkbox.dataset.permission)
+      .filter((permission) => plugin.manifest.permissions.includes(permission));
+    if (!granted.length && plugin.manifest.permissions.length) {
+      const proceed = window.confirm(
+        `"${plugin.manifest.name}" asked for ${plugin.manifest.permissions.length} ` +
+        `capabilities and you granted none. It probably won't work. Approve anyway?`
+      );
+      if (!proceed) return;
+    }
+    plugin.grants = granted;
     plugin.approvedHash = plugin.sha256;
     plugin.enabled = true;
+    plugin.reviewStatus = "approved";
+    plugin.reviewReason = null;
+    plugin.reviewedAt = new Date().toISOString();
     closePluginConsent();
     try {
       await startExtension(plugin);
       persistWorkspace();
       renderPluginManager();
-      showToast(`${plugin.manifest.name} is enabled with ${plugin.grants.length} granted ${plugin.grants.length === 1 ? "permission" : "permissions"}.`);
+      showToast(`${plugin.manifest.name} is approved with ${plugin.grants.length} granted ${plugin.grants.length === 1 ? "capability" : "capabilities"}.`);
     } catch (error) {
       plugin.enabled = false;
       persistWorkspace();
@@ -2252,12 +2395,34 @@
     }
   }
 
+  function rejectPendingPlugin() {
+    const plugin = pendingPluginConsent;
+    if (!plugin) return;
+    const reason = ui.pluginRejectReason.value.trim();
+    if (!reason) {
+      ui.pluginConsentStatus.textContent = "Add a short reason so you remember why this package was rejected.";
+      ui.pluginRejectReason.focus();
+      return;
+    }
+    plugin.reviewStatus = "rejected";
+    plugin.reviewReason = reason.slice(0, 200);
+    plugin.reviewedAt = new Date().toISOString();
+    plugin.enabled = false;
+    plugin.grants = [];
+    plugin.approvedHash = null;
+    closePluginConsent();
+    persistWorkspace();
+    renderPluginManager();
+    showToast(`${plugin.manifest.name} was rejected and will not run.`);
+  }
+
   function disableExtension(plugin) {
     const sandbox = activeExtensions.get(plugin.manifest.id);
     activeExtensions.delete(plugin.manifest.id);
     plugin.enabled = false;
     sandbox?.stop();
     removeExtensionCommands(plugin.manifest.id);
+    removeExtensionStatusItems(plugin.manifest.id);
     persistWorkspace();
     renderPluginManager();
   }
@@ -2322,14 +2487,18 @@
       row.append(details, toggle);
       ui.pluginList.append(row);
     });
+    const statusWeight = { pending: 0, approved: 1, rejected: 2 };
     const extensions = state.extensions.map((sourcePlugin) => ({
       sourcePlugin,
       id: sourcePlugin.manifest.id,
       name: sourcePlugin.manifest.name,
       description: sourcePlugin.manifest.description,
       author: sourcePlugin.manifest.author,
-      category: "Imported"
-    })).filter(matches);
+      category: "Imported",
+      reviewStatus: sourcePlugin.reviewStatus === "rejected" ? "rejected"
+        : sourcePlugin.reviewStatus === "approved" ? "approved" : "pending"
+    })).filter(matches)
+      .sort((a, b) => (statusWeight[a.reviewStatus] ?? 1) - (statusWeight[b.reviewStatus] ?? 1));
     extensions.forEach((plugin) => {
       const { sourcePlugin } = plugin;
       const active = activeExtensions.has(plugin.id);
@@ -2339,6 +2508,13 @@
       details.className = "plugin-row-details";
       const name = document.createElement("strong");
       name.textContent = plugin.name;
+      const status = document.createElement("span");
+      status.className = `plugin-review-pill is-${plugin.reviewStatus}`;
+      status.textContent = plugin.reviewStatus === "pending" ? "Pending review"
+        : plugin.reviewStatus === "approved" ? "Approved" : "Rejected";
+      const titleLine = document.createElement("div");
+      titleLine.className = "plugin-title-line";
+      titleLine.append(name, status);
       const description = document.createElement("p");
       description.textContent = plugin.description;
       const provenance = document.createElement("small");
@@ -2348,26 +2524,76 @@
       permissions.textContent = active
         ? `GRANTED: ${sourcePlugin.grants.length ? sourcePlugin.grants.join(", ") : "no capabilities"}`
         : `REQUESTED: ${sourcePlugin.manifest.permissions.length ? sourcePlugin.manifest.permissions.join(", ") : "no capabilities"}`;
-      details.append(name, description, provenance, permissions);
+      details.append(titleLine, description, provenance, permissions);
+      if (sourcePlugin.reviewReason) {
+        const reason = document.createElement("small");
+        reason.className = "plugin-review-reason";
+        reason.textContent = plugin.reviewStatus === "rejected"
+          ? `Rejected: ${sourcePlugin.reviewReason}`
+          : sourcePlugin.reviewReason;
+        details.append(reason);
+      }
       const actions = document.createElement("div");
       actions.className = "imported-plugin-actions";
-      const toggle = document.createElement("button");
-      toggle.type = "button";
-      toggle.className = `plugin-toggle${active ? " is-enabled" : ""}`;
-      toggle.setAttribute("role", "switch");
-      toggle.setAttribute("aria-checked", String(active));
-      toggle.setAttribute("aria-label", `${active ? "Disable" : "Review and enable"} ${plugin.name}`);
-      toggle.innerHTML = `<span></span>`;
-      toggle.addEventListener("click", () => {
-        if (active) disableExtension(sourcePlugin);
-        else openPluginConsent(sourcePlugin);
-      });
+      if (plugin.reviewStatus === "pending") {
+        const review = document.createElement("button");
+        review.type = "button";
+        review.className = "plugin-review-button";
+        review.textContent = "Review";
+        review.setAttribute("aria-label", `Review ${plugin.name}`);
+        review.addEventListener("click", () => openPluginConsent(sourcePlugin));
+        actions.append(review);
+      } else if (plugin.reviewStatus === "approved") {
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = `plugin-toggle${active ? " is-enabled" : ""}`;
+        toggle.setAttribute("role", "switch");
+        toggle.setAttribute("aria-checked", String(active));
+        toggle.setAttribute("aria-label", `${active ? "Disable" : "Enable"} ${plugin.name}`);
+        toggle.innerHTML = `<span></span>`;
+        toggle.addEventListener("click", async () => {
+          if (active) {
+            disableExtension(sourcePlugin);
+            return;
+          }
+          toggle.disabled = true;
+          try {
+            await startExtension(sourcePlugin);
+            sourcePlugin.enabled = true;
+            persistWorkspace();
+            renderPluginManager();
+            showToast(`${plugin.name} is enabled.`);
+          } catch (error) {
+            sourcePlugin.enabled = false;
+            persistWorkspace();
+            renderPluginManager();
+            console.error(`Could not enable imported plugin "${plugin.name}".`, error);
+            showToast(error.message || `${plugin.name} could not start.`);
+          }
+        });
+        actions.append(toggle);
+      } else {
+        const rereview = document.createElement("button");
+        rereview.type = "button";
+        rereview.className = "plugin-review-button";
+        rereview.textContent = "Re-review";
+        rereview.setAttribute("aria-label", `Re-review ${plugin.name}`);
+        rereview.addEventListener("click", () => {
+          sourcePlugin.reviewStatus = "pending";
+          sourcePlugin.reviewReason = null;
+          sourcePlugin.reviewedAt = null;
+          persistWorkspace();
+          renderPluginManager();
+          openPluginConsent(sourcePlugin);
+        });
+        actions.append(rereview);
+      }
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "plugin-remove";
       remove.textContent = "Remove";
       remove.addEventListener("click", () => uninstallExtension(sourcePlugin));
-      actions.append(toggle, remove);
+      actions.append(remove);
       row.append(details, actions);
       ui.pluginList.append(row);
     });
@@ -3499,7 +3725,12 @@
     });
     byId("cancel-plugin-consent").addEventListener("click", closePluginConsent);
     byId("cancel-plugin-consent-footer").addEventListener("click", closePluginConsent);
-    ui.allowPluginButton.addEventListener("click", allowPendingPlugin);
+    ui.allowPluginButton.addEventListener("click", approvePendingPlugin);
+    byId("reject-plugin").addEventListener("click", () => {
+      ui.pluginRejectRow.hidden = false;
+      ui.pluginRejectReason.focus();
+    });
+    byId("confirm-reject-plugin").addEventListener("click", rejectPendingPlugin);
     ui.pluginConsentModal.addEventListener("click", (event) => {
       if (event.target === ui.pluginConsentModal) closePluginConsent();
     });

@@ -321,6 +321,19 @@ h1 { margin: 10px 0 5px; color: #eff8f8; font-family: var(--display); font-size:
 .consent-trust { display: flex; align-items: flex-start; gap: 9px; padding: 11px 0; color: #9fb8bc; font-size: 10px; line-height: 1.5; }
 .dialog-cancel { padding: 8px 11px; margin-right: 7px; border: 1px solid #36515a; border-radius: 6px; background: transparent; color: #aac3c7; cursor: pointer; font-size: 10px; }
 .dialog-done:disabled { border-color: #34494e; background: #172a30; color: #71888d; cursor: not-allowed; }
+.plugin-title-line { display: flex; align-items: center; gap: 8px; }
+.plugin-review-pill { padding: 2px 7px; border: 1px solid #38515a; border-radius: 20px; font-family: var(--mono); font-size: 7px; letter-spacing: .6px; text-transform: uppercase; white-space: nowrap; }
+.plugin-review-pill.is-pending { border-color: #a8894a; background: rgba(232,190,106,.12); color: #e8be6a; }
+.plugin-review-pill.is-approved { border-color: #48bac3; background: rgba(84,220,232,.12); color: #7fdce4; }
+.plugin-review-pill.is-rejected { border-color: #4b3b40; background: rgba(255,117,93,.08); color: #d69a8f; }
+.plugin-review-reason { display: block; margin-top: 4px; color: #c9a06a !important; font-style: italic; }
+.plugin-review-button { padding: 6px 10px; border: 1px solid #38515a; border-radius: 6px; background: rgba(84,220,232,.08); color: #a9dfe3; cursor: pointer; font-size: 9px; }
+.plugin-review-button:hover { border-color: #48bac3; background: rgba(84,220,232,.16); }
+.consent-reject { margin: 4px 0 10px; padding: 10px; border: 1px dashed #4b3b40; border-radius: 6px; }
+.consent-reject label { display: block; color: #9fb8bc; font-size: 10px; }
+.consent-reject input { width: 100%; margin-top: 6px; padding: 8px; border: 1px solid #36515a; border-radius: 5px; background: #07171e; color: #d9e9eb; font-size: 10px; }
+.consent-reject button { margin-top: 8px; }
+.extension-status-item { color: #8fd6db; font-family: var(--mono); font-size: 9px; }
 .canvas-status.has-error { color: #ff9b88; }
 .canvas-text-editor, .canvas-group-label { font-family: var(--sans); }
 @media (max-width: 1050px) {
@@ -349,6 +362,7 @@ h1 { margin: 10px 0 5px; color: #eff8f8; font-family: var(--display); font-size:
   .query-result-row { min-height: 44px; align-items: center; }
   .dialog-done, .dialog-cancel { min-height: 44px; }
   .plugin-remove { min-height: 44px; }
+  .plugin-review-button { min-height: 44px; }
   .canvas-empty button { min-height: 44px; }
   .nav-label, .nav-item > span:not(.nav-icon), .sync-card, .profile > span { display: none; }
   .primary-nav { width: 100%; }

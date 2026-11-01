@@ -29,6 +29,10 @@ function parseSimple(sel) {
     p.attrs.push({ name: m[1], value: m[2] === undefined ? null : m[2] });
     s = s.slice(m[0].length);
   }
+  // minimal pseudo-class support (:checked); anything else never matches
+  p.pseudo = null;
+  const pm = s.match(/:([a-zA-Z-]+)$/);
+  if (pm) { p.pseudo = pm[1]; s = s.slice(0, pm.index); }
   p.rest = s.trim();
   return p;
 }
@@ -36,6 +40,8 @@ function matchesSimple(elm, sel) {
   if (!elm || elm.nodeType !== 1) return false;
   const p = parseSimple(sel);
   if (p.rest) return false;
+  if (p.pseudo === "checked" && !elm.checked) return false;
+  if (p.pseudo && p.pseudo !== "checked") return false;
   if (p.tag && elm.tagName !== p.tag) return false;
   if (p.id && elm.getAttribute("id") !== p.id) return false;
   for (const c of p.classes) if (!elm.classList.contains(c)) return false;
@@ -497,6 +503,11 @@ function buildContext(seedStorage) {
   ctx.TextDecoder = globalThis.TextDecoder;
   ctx.atob = globalThis.atob.bind(globalThis);
   ctx.btoa = globalThis.btoa.bind(globalThis);
+  // faithful <select> default: value starts as the first option's value (real browser behavior)
+  for (const sel of doc.querySelectorAll("select")) {
+    const first = sel.querySelector("option");
+    if (first) sel.value = first.getAttribute("value") ?? first.textContent;
+  }
   return { ctx, win, doc, errors, storageData, createdURLs, workers };
 }
 
@@ -514,6 +525,154 @@ function boot(seedStorage) {
   return b;
 }
 function flush(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/* ---------------- faithful iframe+Worker simulation ----------------
+ * Only browser primitives are faked (iframe document, Worker, Blob, URL).
+ * ALL app code runs for real: plugin-sandbox.js create/receive, the app's
+ * import/approve/request handling, and the worker executes the REAL
+ * WORKER_PRELUDE + plugin source + WORKER_RUNTIME strings extracted from
+ * plugin-sandbox.js. Lets the headless suite import, approve, and RUN
+ * plugins end-to-end.
+ */
+function __extractTemplate(src, name) {
+  const start = src.indexOf(`const ${name} = `);
+  if (start < 0) throw new Error("template not found: " + name);
+  let i = src.indexOf("`", start) + 1;
+  let out = "";
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "\\") { out += c + src[i + 1]; i += 2; continue; }
+    if (c === "`") break;
+    out += c; i++;
+  }
+  return out;
+}
+const __sandboxSrc = fs.readFileSync(REPO + "/plugin-sandbox.js", "utf8");
+const __maxCommands = Number(__sandboxSrc.match(/const MAX_COMMANDS = (\d+)/)[1]);
+const __workerPrelude = new Function("MAX_COMMANDS", "return `" + __extractTemplate(__sandboxSrc, "WORKER_PRELUDE") + "`;")(__maxCommands);
+const __workerRuntime = __extractTemplate(__sandboxSrc, "WORKER_RUNTIME");
+const __frameDocument = new Function(
+  "WORKER_PRELUDE", "WORKER_RUNTIME",
+  "return `" + __extractTemplate(__sandboxSrc, "FRAME_DOCUMENT") + "`;"
+)(__workerPrelude, __workerRuntime);
+
+function __makeWorkerRuntime(workerSource, onWorkerMessage) {
+  const listeners = {};
+  const workerSelf = {
+    postMessage: (msg) => onWorkerMessage(msg),
+    addEventListener: (type, fn) => { listeners[type] = fn; },
+    removeEventListener: (type) => { delete listeners[type]; },
+    navigator: {},
+    console: { log: () => {}, error: () => {}, warn: () => {} },
+  };
+  const wctx = vm.createContext(workerSelf);
+  workerSelf.self = workerSelf;
+  workerSelf.globalThis = workerSelf;
+  vm.runInContext(workerSource, wctx, { filename: "plugin-worker.js" });
+  // Bridge: Node has no per-context unhandledrejection event, so route host-level
+  // unhandled rejections from worker code to this runtime's listener, mirroring
+  // what a real DedicatedWorkerGlobalScope would fire.
+  __workerRejectionBridge.add(listeners);
+  return {
+    postMessage: (msg) => { const fn = listeners["message"]; if (fn) fn({ data: msg }); },
+    terminate: () => { delete listeners["message"]; __workerRejectionBridge.delete(listeners); },
+  };
+}
+// Test-only bridge for worker unhandledrejection (see __makeWorkerRuntime).
+const __workerRejectionBridge = new Set();
+process.on("unhandledRejection", (reason) => {
+  let routed = false;
+  for (const listeners of __workerRejectionBridge) {
+    const fn = listeners["unhandledrejection"];
+    if (fn) { routed = true; try { fn({ reason, preventDefault: () => {} }); } catch (e) { /* ignore */ } }
+  }
+  if (!routed) {
+    // A genuine harness bug, not a worker rejection: fail loudly.
+    console.error("SMOKE HARNESS UNHANDLED REJECTION (not from a plugin worker):", reason);
+    process.exit(2);
+  }
+});
+
+class __FakeWorker {
+  static blobs = new Map();
+  constructor(url) {
+    this.onmessage = null;
+    this.onerror = null;
+    this._terminated = false;
+    const parts = __FakeWorker.blobs.get(url);
+    if (!parts) throw new Error("unknown blob url");
+    const source = parts.map((p) => String(p)).join("");
+    try {
+      this._worker = __makeWorkerRuntime(source, (msg) => {
+        if (!this._terminated && this.onmessage) this.onmessage({ data: msg });
+      });
+    } catch (e) {
+      if (this.onerror) this.onerror({ message: String((e && e.message) || e) });
+      else throw e;
+    }
+  }
+  postMessage(msg) { if (!this._terminated && this._worker) this._worker.postMessage(msg); }
+  terminate() { this._terminated = true; if (this._worker) this._worker.terminate(); }
+}
+
+function simSandbox(b) {
+  const { win, doc } = b;
+  const origCreateElement = doc.createElement.bind(doc);
+  doc.createElement = function (tag) {
+    const frame = origCreateElement(tag);
+    if (String(tag).toLowerCase() !== "iframe") return frame;
+    const iframeListeners = {};
+    let srcdoc = "";
+    let booted = false;
+    let loadHandler = null;
+    const fakeParent = {
+      postMessage: (msg) => {
+        // iframe -> app relay: window message event with source = contentWindow
+        win.dispatchEvent({ type: "message", source: frame.contentWindow, data: msg });
+      },
+    };
+    const fakeContentWindow = {
+      postMessage: (msg) => {
+        // the real srcdoc script runs before load completes; mirror that here
+        if (!booted) {
+          booted = true;
+          const ictx = {
+            parent: fakeParent,
+            addEventListener: (t, fn) => { iframeListeners[t] = fn; },
+            Blob: class { constructor(parts, opts) { this.parts = parts; this.type = opts && opts.type; } },
+            URL: {
+              createObjectURL: (blob) => {
+                const u = "blob:fake-" + Math.random().toString(36).slice(2);
+                __FakeWorker.blobs.set(u, blob.parts);
+                return u;
+              },
+              revokeObjectURL: (u) => { __FakeWorker.blobs.delete(u); },
+            },
+            Worker: class extends __FakeWorker {},
+            console: { log: () => {}, error: () => {}, warn: () => {} },
+          };
+          ictx.self = ictx; ictx.globalThis = ictx; ictx.window = ictx;
+          const ctx = vm.createContext(ictx);
+          const m = String(srcdoc).match(/<script>([\s\S]*)<\/script>/);
+          if (!m) throw new Error("no script in FRAME_DOCUMENT");
+          vm.runInContext(m[1], ctx, { filename: "plugin-frame.js" });
+        }
+        const fn = iframeListeners["message"];
+        if (fn) fn({ source: fakeParent, data: msg });
+      },
+    };
+    Object.defineProperty(frame, "contentWindow", { get: () => fakeContentWindow, configurable: true });
+    Object.defineProperty(frame, "srcdoc", {
+      get: () => srcdoc, set: (v) => { srcdoc = String(v); }, configurable: true,
+    });
+    const origAddEL = frame.addEventListener.bind(frame);
+    frame.addEventListener = function (t, fn) {
+      if (t === "load") { loadHandler = fn; setTimeout(() => { if (loadHandler) loadHandler(); }, 0); return; }
+      return origAddEL(t, fn);
+    };
+    return frame;
+  };
+}
 
 /* ---------------- tests ---------------- */
 function typeInto(elm, text, win) {
@@ -820,6 +979,379 @@ async function main() {
     const daily = ws.notes.find((n) => n.body.includes("focus capture entry"));
     check("T16: entry survives the next keystroke", !!daily && daily.body.includes("!"), daily ? daily.body.slice(-160) : "entry lost");
     check("T16: no errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T17-T27: imported plugin lifecycle — approval queue + real sandbox execution.
+     simSandbox() fakes only browser primitives (iframe/Worker/Blob/URL); every
+     app code path (import, review, approve, reject, RPC, commands) runs for real. */
+
+  function pluginPackage(id, permissions, source) {
+    return {
+      manifest: {
+        id, name: `Probe ${id}`, version: "1.0.0",
+        description: `probe ${id}`, author: "smoke",
+        permissions,
+      },
+      source,
+    };
+  }
+  async function importPackage(b, pkg, fileName) {
+    const { doc, win } = b;
+    const json = JSON.stringify(pkg);
+    const input = doc.getElementById("plugin-file-input");
+    input.files = [{ name: fileName || "probe.xpin.json", size: json.length, text: async () => json }];
+    input.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(400);
+  }
+  function storedExtensions(b) {
+    return JSON.parse(b.storageData["xPin.workspace.v1"]).extensions || [];
+  }
+  // open the catalogue and click Review/Re-review on the first imported row
+  async function openReview(b, label) {
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.getElementById("open-plugins"));
+    await flush(40);
+    const row = doc.querySelector(".imported-plugin-row");
+    const btn = [...row.querySelectorAll("button")].find((el) => el.textContent === label);
+    click(btn);
+    await flush(40);
+  }
+  async function approveInModal(b, { uncheckAll = false } = {}) {
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    if (uncheckAll) {
+      doc.querySelectorAll("#plugin-permissions [data-permission]").forEach((cb) => { cb.checked = false; });
+    }
+    const trust = doc.getElementById("plugin-trust-checkbox");
+    trust.checked = true;
+    trust.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(20);
+    click(doc.getElementById("allow-plugin"));
+    await flush(900);
+  }
+  function paletteHas(b, text) {
+    const { doc, win } = b;
+    doc.getElementById("open-commands").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    return doc.getElementById("command-list").textContent.includes(text);
+  }
+  async function runPaletteCommand(b, text) {
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.getElementById("open-commands"));
+    await flush(40);
+    const row = [...doc.querySelectorAll('#command-list [role="option"]')]
+      .find((el) => el.textContent.includes(text));
+    if (row) click(row);
+    await flush(700);
+  }
+
+  /* T17: import lands in the pending-review queue, inert */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const probe = pluginPackage("t17-probe", ["commands:register", "ui:notify"],
+      `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "ping", name: "T17 ping", run: async () => { await api.ui.notify("t17 pong"); } });
+      }});`);
+    await importPackage(b, probe);
+    const { doc } = b;
+    check("T17: import toast says waiting for review",
+      doc.getElementById("toast").textContent.includes("waiting for your review"),
+      doc.getElementById("toast").textContent);
+    const ext = storedExtensions(b);
+    check("T17: stored as pending", ext.length === 1 && ext[0].reviewStatus === "pending", JSON.stringify(ext.map((e) => e.reviewStatus)));
+    check("T17: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+    doc.getElementById("open-plugins").dispatchEvent(new b.win.MouseEvent("click", { bubbles: true }));
+    await flush(40);
+    const pill = doc.querySelector(".plugin-review-pill");
+    check("T17: catalogue shows Pending review pill", !!pill && pill.textContent === "Pending review" && pill.classList.contains("is-pending"));
+    check("T17: pending plugin contributes no commands", !paletteHas(b, "T17 ping"));
+  }
+
+  /* T18: approve -> active, command actually runs end-to-end through the worker */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const probe = pluginPackage("t18-probe", ["commands:register", "ui:notify", "notes:read"],
+      `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "ping", name: "T18 ping", run: async () => {
+          const notes = await api.notes.list();
+          await api.ui.notify("t18 saw " + notes.length + " notes");
+        }});
+      }});`);
+    await importPackage(b, probe);
+    await openReview(b, "Review");
+    const { doc } = b;
+    const prechecked = [...doc.querySelectorAll("#plugin-permissions [data-permission]")].every((cb) => cb.checked);
+    check("T18: requested capabilities start pre-checked", prechecked);
+    await approveInModal(b);
+    check("T18: approval toast names granted capabilities",
+      doc.getElementById("toast").textContent.includes("approved with 3 granted"),
+      doc.getElementById("toast").textContent);
+    const ext = storedExtensions(b);
+    check("T18: stored as approved with grants",
+      ext[0].reviewStatus === "approved" && ext[0].grants.length === 3 && !!ext[0].approvedHash,
+      JSON.stringify(ext[0] && { s: ext[0].reviewStatus, g: ext[0].grants }));
+    check("T18: command in palette after approval", paletteHas(b, "T18 ping"));
+    await runPaletteCommand(b, "T18 ping");
+    check("T18: command ran through the sandbox (RPC round-trip)",
+      doc.getElementById("toast").textContent.includes("t18 saw"),
+      doc.getElementById("toast").textContent);
+    check("T18: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T19: approving with zero capabilities granted asks for explicit confirmation */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const probe = pluginPackage("t19-probe", ["commands:register", "ui:notify"],
+      `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "ping", name: "T19 ping", run: async () => { await api.ui.notify("t19 pong"); } });
+      }});`);
+    await importPackage(b, probe);
+    await openReview(b, "Review");
+    let confirmMessage = null;
+    b.win.confirm = (msg) => { confirmMessage = String(msg); return true; };
+    await approveInModal(b, { uncheckAll: true });
+    const { doc } = b;
+    check("T19: zero-grant approval asks for confirmation",
+      !!confirmMessage && /granted none/i.test(confirmMessage), confirmMessage);
+    const ext19 = storedExtensions(b);
+    check("T19: stored as approved with zero grants",
+      ext19[0].reviewStatus === "approved" && ext19[0].grants.length === 0,
+      JSON.stringify(ext19[0] && { s: ext19[0].reviewStatus, g: ext19[0].grants }));
+    check("T19: the resulting permission failure is surfaced, not silent",
+      doc.getElementById("toast").textContent.includes("This permission was not granted."),
+      doc.getElementById("toast").textContent);
+    check("T19: crippled plugin contributes no phantom command", !paletteHas(b, "T19 ping"));
+  }
+
+  /* T20: reject -> inert with reason, re-review possible */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const probe = pluginPackage("t20-probe", ["ui:notify"],
+      `xPinPlugin.register({ activate() {} });`);
+    await importPackage(b, probe);
+    await openReview(b, "Review");
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.getElementById("reject-plugin"));
+    await flush(20);
+    check("T20: reject reveals reason field", !doc.getElementById("plugin-reject-row").hidden);
+    doc.getElementById("plugin-reject-reason").value = "too nosy";
+    click(doc.getElementById("confirm-reject-plugin"));
+    await flush(100);
+    check("T20: rejection toast", doc.getElementById("toast").textContent.includes("was rejected"),
+      doc.getElementById("toast").textContent);
+    const ext = storedExtensions(b);
+    check("T20: stored as rejected with reason",
+      ext[0].reviewStatus === "rejected" && ext[0].reviewReason === "too nosy",
+      JSON.stringify(ext[0] && { s: ext[0].reviewStatus, r: ext[0].reviewReason }));
+    click(doc.getElementById("open-plugins"));
+    await flush(40);
+    const pill = doc.querySelector(".plugin-review-pill");
+    check("T20: catalogue shows Rejected pill + reason",
+      !!pill && pill.textContent === "Rejected" && doc.body.textContent.includes("too nosy"));
+    const rereview = [...doc.querySelectorAll(".imported-plugin-row button")].find((el) => el.textContent === "Re-review");
+    check("T20: re-review action exists", !!rereview);
+    if (rereview) click(rereview);
+    await flush(60);
+    check("T20: re-review reopens the consent dialog", !doc.getElementById("plugin-consent-modal").hidden);
+    check("T20: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T21: corrupt packages fail with a clear message, never silently */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const input = doc.getElementById("plugin-file-input");
+    const bad = "{ not json at all";
+    input.files = [{ name: "bad.xpin.json", size: bad.length, text: async () => bad }];
+    input.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(300);
+    check("T21: malformed JSON gets a plain-English error",
+      doc.getElementById("toast").textContent.includes("not valid JSON"),
+      doc.getElementById("toast").textContent);
+    const notPkg = JSON.stringify({ hello: "world" });
+    input.files = [{ name: "notpkg.xpin.json", size: notPkg.length, text: async () => notPkg }];
+    input.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(300);
+    check("T21: JSON without a package shape is rejected",
+      /manifest|package/i.test(doc.getElementById("toast").textContent),
+      doc.getElementById("toast").textContent);
+    const badPerm = JSON.stringify(pluginPackage("t21-probe", ["teleport"],
+      `xPinPlugin.register({ activate() {} });`));
+    input.files = [{ name: "badperm.xpin.json", size: badPerm.length, text: async () => badPerm }];
+    input.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(300);
+    check("T21: unknown permission names the culprit",
+      doc.getElementById("toast").textContent.includes('"teleport"'),
+      doc.getElementById("toast").textContent);
+    check("T21: nothing was installed", storedExtensions(b).length === 0);
+  }
+
+  /* T22: oversized packages are refused with the actual sizes */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const input = doc.getElementById("plugin-file-input");
+    input.files = [{ name: "huge.xpin.json", size: 100001, text: async () => "{}" }];
+    input.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(300);
+    check("T22: oversized package refused with sizes",
+      /smaller than 100 KB/i.test(doc.getElementById("toast").textContent),
+      doc.getElementById("toast").textContent);
+    check("T22: nothing was installed", storedExtensions(b).length === 0);
+  }
+
+  /* T23: duplicate ids name the installed version */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const src = `xPinPlugin.register({ activate() {} });`;
+    await importPackage(b, pluginPackage("t23-probe", [], src));
+    // same id, newer version
+    const v2 = pluginPackage("t23-probe", [], src);
+    v2.manifest.version = "2.0.0";
+    await importPackage(b, v2, "v2.xpin.json");
+    const { doc } = b;
+    check("T23: version conflict names both versions",
+      /1\.0\.0.*already installed.*2\.0\.0|already installed/i.test(doc.getElementById("toast").textContent),
+      doc.getElementById("toast").textContent);
+    check("T23: only the first package is stored", storedExtensions(b).length === 1);
+  }
+
+  /* T24: capability escalation is blocked — tampered grants stripped, ungranted RPC refused */
+  {
+    // (a) stored grants outside the manifest are stripped on load
+    const seedBoot = boot(null);
+    await flush(150);
+    const seedWs = JSON.parse(seedBoot.storageData["xPin.workspace.v1"]);
+    const tamperedManifest = { id: "t24-probe", name: "Probe t24-probe", version: "1.0.0", description: "probe", author: "smoke", permissions: ["ui:notify"] };
+    seedWs.extensions = [{
+      manifest: tamperedManifest, source: `xPinPlugin.register({ activate() {} });`,
+      fileName: "t.xpin.json", sha256: "abc", installedAt: new Date().toISOString(),
+      enabled: false, approvedHash: null, grants: ["notes:read"], settings: {},
+      reviewStatus: "pending", reviewReason: null, reviewedAt: null,
+    }];
+    const b = boot({ "xPin.workspace.v1": JSON.stringify(seedWs) });
+    await flush(120);
+    const ext = storedExtensions(b);
+    check("T24a: tampered grants stripped on load", ext.length === 1 && ext[0].grants.length === 0,
+      JSON.stringify(ext[0] && ext[0].grants));
+
+    // (b) a plugin calling an ungranted capability gets a clean refusal, end-to-end
+    const b2 = boot(null);
+    simSandbox(b2);
+    await flush(120);
+    const sneaky = pluginPackage("t24-sneaky", ["commands:register", "ui:notify"],
+      `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "snoop", name: "T24 snoop", run: async () => {
+          try { await api.notes.list(); await api.ui.notify("UNEXPECTED: read allowed"); }
+          catch (e) { await api.ui.notify("blocked: " + e.message); }
+        }});
+      }});`);
+    await importPackage(b2, sneaky);
+    await openReview(b2, "Review");
+    await approveInModal(b2);
+    await runPaletteCommand(b2, "T24 snoop");
+    check("T24b: ungranted notes:read refused at runtime",
+      b2.doc.getElementById("toast").textContent.includes("blocked: This permission was not granted."),
+      b2.doc.getElementById("toast").textContent);
+  }
+
+  /* T25: a package that changes after approval goes back to pending review */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const probe = pluginPackage("t25-probe", ["ui:notify"],
+      `xPinPlugin.register({ activate() {} });`);
+    await importPackage(b, probe);
+    await openReview(b, "Review");
+    await approveInModal(b);
+    check("T25: approved first", storedExtensions(b)[0].reviewStatus === "approved");
+    // tamper with the stored source (hash no longer matches) and reboot
+    const raw = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    raw.extensions[0].source += "\n// sneaky edit";
+    const b2 = boot({ "xPin.workspace.v1": JSON.stringify(raw) });
+    simSandbox(b2);
+    await flush(1500);
+    const ext = storedExtensions(b2);
+    check("T25: changed package is pending again",
+      ext[0].reviewStatus === "pending" && !ext[0].enabled,
+      JSON.stringify(ext[0] && { s: ext[0].reviewStatus, e: ext[0].enabled }));
+    check("T25: reason recorded", (ext[0].reviewReason || "").includes("changed since approval"), ext[0].reviewReason);
+    check("T25: user is told", b2.doc.getElementById("toast").textContent.includes("needs permission review"),
+      b2.doc.getElementById("toast").textContent);
+    b2.doc.getElementById("open-plugins").dispatchEvent(new b2.win.MouseEvent("click", { bubbles: true }));
+    await flush(40);
+    const pill = b2.doc.querySelector(".plugin-review-pill");
+    check("T25: catalogue shows it pending again", !!pill && pill.textContent === "Pending review");
+    check("T25: no sandbox started for the revoked plugin",
+      b2.doc.querySelectorAll("iframe").length === 0);
+  }
+
+  /* T26: new capabilities — notes:update edits a note, ui:status shows in the status bar */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Target");
+    const probe = pluginPackage("t26-probe", ["commands:register", "notes:read", "notes:update", "ui:status"],
+      `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "mark", name: "T26 mark done", run: async () => {
+          const notes = await api.notes.list();
+          const target = notes.find((n) => n.title === "Target");
+          await api.notes.update(target.id, { title: "Target (done)" });
+          await api.ui.setStatus({ id: "done-marker", text: "done!" });
+        }});
+      }});`);
+    await importPackage(b, probe);
+    await openReview(b, "Review");
+    await approveInModal(b);
+    await runPaletteCommand(b, "T26 mark done");
+    check("T26: notes:update renamed the note",
+      doc.getElementById("note-list").textContent.includes("Target (done)"),
+      doc.getElementById("note-list").textContent.slice(0, 200));
+    check("T26: ui:status rendered in the status bar",
+      doc.getElementById("editor-status").textContent.includes("done!"),
+      doc.getElementById("editor-status").textContent);
+    check("T26: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T27: the shipped example plugin (template-pack) works end-to-end */
+  {
+    const { execSync } = require("child_process");
+    execSync("node plugins/pack.mjs plugins/examples/template-pack", { cwd: REPO, stdio: "pipe" });
+    const packed = JSON.parse(fs.readFileSync(REPO + "/plugins/examples/template-pack/template-pack.xpin.json", "utf8"));
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    await importPackage(b, packed, "template-pack.xpin.json");
+    await openReview(b, "Review");
+    await approveInModal(b);
+    const { doc } = b;
+    check("T27: example plugin approved", storedExtensions(b)[0].reviewStatus === "approved");
+    check("T27: template commands in palette", paletteHas(b, "Insert meeting notes"));
+    await runPaletteCommand(b, "Insert meeting notes");
+    const body = doc.getElementById("note-body").value;
+    check("T27: meeting template inserted at caret", body.includes("## Meeting"),
+      body.slice(0, 160));
+    check("T27: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
   }
 
   /* report */

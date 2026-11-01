@@ -151,3 +151,87 @@ Accounts, servers, live sync, collaboration, remote marketplace, cloud AI / cred
 ## Future enhancements (not defects)
 
 Virtualized note list (thousands of notes), share-target/voice capture on mobile, PDF annotation, semantic search, one-click Notion/Evernote/Apple-Notes zip importers, proper passphrase dialog, import progress UI, `[[` autocomplete position refinement.
+
+---
+
+## Plugin system build-out — 2026-11-01 (plugin-system engineer)
+
+Owner report: "imported plugins don't seem to work at all — only the built-in ones."
+
+### Root cause
+
+The import/enable machinery was logically sound (proven end-to-end in headless
+Chromium: import → review → approve → command runs via real worker RPC). The
+actual defect was a UX trap in the review dialog: **requested capabilities
+started UNCHECKED**, so the natural flow (check the trust box → "Allow and run")
+approved the plugin with **zero granted capabilities**. The plugin then
+"enabled" successfully, but its first capability call failed with "This
+permission was not granted" — an unhandled worker rejection invisible to the
+user. Net effect: the plugin looked enabled and did nothing at all.
+
+### What was built
+
+**Root-cause fixes**
+- Review dialog now **pre-checks requested capabilities** (review = uncheck what
+  the plugin should NOT have). Trust checkbox still required.
+- Approving with zero of N requested capabilities asks for explicit
+  confirmation ("It probably won't work. Approve anyway?").
+- Worker `unhandledrejection`s are now relayed to the host as a visible toast
+  naming the plugin and the error — async plugin failures are never silent.
+
+**Approval queue (owner's ask)**
+- Import → **Pending review** (inert, nothing runs) → **Approve and enable** or
+  **Reject with reason** → rejected stays inert, removable, re-reviewable.
+- Catalogue shows Pending review / Approved / Rejected pills, sorted pending-first.
+- Registry persisted in the workspace per package: status, reason, reviewed-at,
+  SHA-256, approved hash, grants. Old saves migrate (once-approved → approved,
+  else pending).
+- Changed-since-approval packages go back to pending with the reason recorded.
+- `startExtension` refuses to run a plugin whose grants exceed its declared
+  permissions (defense in depth; grants are also sanitized on load).
+
+**Robustness (all with clear user-facing messages, never silent)**
+- Corrupt: malformed JSON → "not valid JSON…"; bad shape/unknown permission
+  names the exact problem (e.g. `Unknown plugin permission "teleport"`).
+- Oversized: refused with actual sizes. Duplicate id: names installed + incoming
+  versions ("Remove it first to import v2.0.0").
+- Tampered stored grants are stripped on load; ungranted RPC calls fail loudly
+  at runtime ("This permission was not granted.").
+
+**Plugin SDK (owner's "anybody could easily create a plugin")**
+- `plugins/starter/` — manifest.json + fully commented main.js skeleton +
+  README with the local workflow.
+- `plugins/pack.mjs` — assembles + validates the importable `.xpin.json`
+  (same rules the app enforces on import).
+- `plugins/examples/template-pack/` — real working plugin (meeting/decision/
+  reading templates) built against the starter; proves the SDK end-to-end.
+- `PLUGIN_GUIDE.md`: new "Developing plugins" section (manifest schema,
+  capability table, local dev workflow, approval expectations).
+
+**Expanded capabilities**: `notes:update` (edit any note's title/body),
+`ui:status` (status-bar item, set/clear) — both validated, capability-gated,
+and covered by tests.
+
+### Verification
+
+- `node --check` clean on all touched files (app.js, plugin-sandbox.js,
+  index.html/CSS via harness, tests, pack.mjs, template/example sources).
+- `npm run test:smoke`: **103/103 pass** (58 pre-existing + 45 new T17–T27).
+  New tests execute REAL imports through a faithful iframe+Worker simulation
+  (only browser primitives faked; the genuine WORKER_PRELUDE/RUNTIME strings
+  run in `vm`): import→pending→approve→command-RPC, zero-grant confirm,
+  reject→inert→re-review, corrupt/oversized/duplicate handling, escalation
+  blocked (storage tamper + live RPC refusal), changed-package→pending,
+  notes:update + ui:status, and the shipped example plugin.
+- **Live-browser verification (new)**: installed headless Chromium and drove the
+  real app — import, review (pre-checked boxes), approve, template insertion,
+  reject-with-reason — 8/8 pass, zero console errors. This also covers the
+  "CSP live-browser click-through" item left open in Build verification above:
+  plugin boot + worker execution show no CSP violations.
+- Gradle build still not run (no Android SDK); live sync still out of scope.
+
+### Needs the owner
+
+Nothing technical. The plugin SDK is ready to share; if he wants a remote
+plugin directory/marketplace later, that's a new project (needs a server,
+which he ruled out).

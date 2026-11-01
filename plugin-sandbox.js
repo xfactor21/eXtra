@@ -8,9 +8,11 @@
     "notes:read": "Read note titles and content",
     "notes:select": "Open a note in the editor",
     "notes:create": "Create a note",
+    "notes:update": "Edit a note's title or body",
     "editor:write": "Insert text into the open note",
     "commands:register": "Add actions to the command palette",
     "ui:notify": "Show xPin notifications",
+    "ui:status": "Show a small item in the editor status bar",
     "settings:read": "Read this plugin's own settings",
     "settings:write": "Save this plugin's own settings"
   });
@@ -28,13 +30,16 @@
         list: () => __xPinRequest("notes:read", { action: "list" }),
         current: () => __xPinRequest("notes:read", { action: "current" }),
         select: (id) => __xPinRequest("notes:select", { id }),
-        create: (options) => __xPinRequest("notes:create", { options })
+        create: (options) => __xPinRequest("notes:create", { options }),
+        update: (id, patch) => __xPinRequest("notes:update", { id, patch })
       }),
       editor: Object.freeze({
         insertText: (text) => __xPinRequest("editor:write", { text })
       }),
       ui: Object.freeze({
-        notify: (message) => __xPinRequest("ui:notify", { message })
+        notify: (message) => __xPinRequest("ui:notify", { message }),
+        setStatus: (item) => __xPinRequest("ui:status", { action: "set", item }),
+        clearStatus: (id) => __xPinRequest("ui:status", { action: "clear", id })
       }),
       commands: Object.freeze({
         add(command) {
@@ -118,6 +123,12 @@
         }
       }
     });
+    // An async failure the plugin never handled is a bug in the plugin, not a
+    // crash: report it to the host so the user sees it instead of silence.
+    self.addEventListener("unhandledrejection", (event) => {
+      event.preventDefault();
+      __xPinSend({ type: "plugin-error", message: String((event.reason && event.reason.message) || event.reason || "Plugin error").slice(0, 300) });
+    });
   `;
 
   const FRAME_DOCUMENT = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; worker-src blob:; connect-src 'none'; img-src data:; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><script>
@@ -158,20 +169,25 @@
     const manifest = value.manifest;
     const id = manifest.id;
     if (typeof id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) || id.length > 64) {
-      throw new TypeError("Plugin id must use lowercase letters, numbers, and hyphens.");
+      throw new TypeError("Plugin id must be 1–64 characters: lowercase letters, numbers, and hyphens only (example: \"my-plugin\").");
     }
     for (const key of ["name", "version", "description", "author"]) {
-      if (typeof manifest[key] !== "string" || !manifest[key].trim() || manifest[key].length > (key === "description" ? 240 : 80)) {
-        throw new TypeError(`Plugin manifest has an invalid ${key}.`);
+      const limit = key === "description" ? 240 : 80;
+      if (typeof manifest[key] !== "string" || !manifest[key].trim() || manifest[key].length > limit) {
+        throw new TypeError(`Plugin manifest field "${key}" must be non-empty text under ${limit} characters.`);
       }
     }
-    if (!Array.isArray(manifest.permissions) || manifest.permissions.length > Object.keys(PERMISSIONS).length ||
-      manifest.permissions.some((permission) => !Object.hasOwn(PERMISSIONS, permission)) ||
+    if (!Array.isArray(manifest.permissions) ||
+      manifest.permissions.length > Object.keys(PERMISSIONS).length ||
       new Set(manifest.permissions).size !== manifest.permissions.length) {
-      throw new TypeError("Plugin permissions must be a unique list of supported capabilities.");
+      throw new TypeError("Plugin permissions must be a list of unique capability names (see PLUGIN_GUIDE.md).");
+    }
+    const unknown = manifest.permissions.find((permission) => !Object.hasOwn(PERMISSIONS, permission));
+    if (unknown !== undefined) {
+      throw new TypeError(`Unknown plugin permission "${String(unknown).slice(0, 60)}". Supported: ${Object.keys(PERMISSIONS).join(", ")}.`);
     }
     if (!value.source.trim() || value.source.length > MAX_SOURCE_LENGTH) {
-      throw new TypeError(`Plugin source must contain 1–${MAX_SOURCE_LENGTH} characters.`);
+      throw new TypeError(`Plugin source must be 1–${MAX_SOURCE_LENGTH} characters of JavaScript calling xPinPlugin.register().`);
     }
     return {
       manifest: {
@@ -193,7 +209,7 @@
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }
 
-  function create({ plugin, permissions, onRequest, onError, onStatus }) {
+  function create({ plugin, permissions, onRequest, onError, onStatus, onWarning }) {
     if (!plugin || !Array.isArray(permissions) || typeof onRequest !== "function" || typeof onError !== "function") {
       throw new TypeError("Sandbox requires a plugin, permissions, request, and error handlers.");
     }
@@ -255,6 +271,12 @@
         onStatus?.("active");
       } else if (message.type === "runtime-error") {
         stop(new Error(String(message.message || "Plugin runtime failed.").slice(0, 300)));
+      } else if (message.type === "plugin-error") {
+        try {
+          onWarning?.(new Error(String(message.message || "Plugin error.").slice(0, 300)));
+        } catch (error) {
+          console.error("xPin plugin warning handler failed.", error);
+        }
       } else if (message.type === "command-result") {
         const pending = pendingInvocations.get(message.invokeId);
         if (!pending) return;

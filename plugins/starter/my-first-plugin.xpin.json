@@ -1,0 +1,14 @@
+{
+  "manifest": {
+    "id": "my-first-plugin",
+    "name": "My first plugin",
+    "version": "1.0.0",
+    "description": "What your plugin does, in one sentence.",
+    "author": "Your name",
+    "permissions": [
+      "commands:register",
+      "ui:notify"
+    ]
+  },
+  "source": "/* xPin plugin starter — copy this folder, rename the id in manifest.json,\n * and make it yours. There is no build step: run\n *   node plugins/pack.mjs plugins/starter\n * to produce the importable my-first-plugin.xpin.json, then import it in xPin\n * via Plugins → Choose package.\n *\n * Your code runs in an isolated worker: no DOM, no localStorage, no network.\n * Everything below goes through the `api` object xPin hands your activate().\n * Every api call that crosses the sandbox boundary returns a promise.\n */\n\nxPinPlugin.register({\n  // activate runs once when the plugin is approved and enabled.\n  // Return an async cleanup function if you need one (optional).\n  activate(api) {\n    // --- commands: actions in the command palette (needs \"commands:register\")\n    api.commands.add({\n      id: \"greet\",                       // unique within your plugin, lowercase-hyphens\n      name: \"Say hello\",                 // shown in the palette\n      description: \"Show a greeting.\",   // optional\n      run: async () => {\n        // --- ui.notify (needs \"ui:notify\")\n        await api.ui.notify(\"Hello from my first plugin.\");\n      },\n    });\n\n    // --- notes (needs \"notes:read\" / \"notes:create\" / \"notes:update\")\n    //\n    // const notes = await api.notes.list();          // [{ id, title, body, ... }] (max 500)\n    // const current = await api.notes.current();     // the open note, or null\n    // await api.notes.select(noteId);                // open a note in the editor\n    // const note = await api.notes.create({          // create a note\n    //   title: \"Shopping\", body: \"- milk\", folderId: null,\n    // });\n    // await api.notes.update(noteId, {                // edit title and/or body\n    //   title: \"Shopping (Friday)\",\n    // });\n\n    // --- editor (needs \"editor:write\")\n    //\n    // await api.editor.insertText(\"## Notes\\n\\n\");   // insert at the caret\n\n    // --- status bar (needs \"ui:status\")\n    //\n    // await api.ui.setStatus({ id: \"mood\", text: \"☀ focused\" });\n    // await api.ui.clearStatus(\"mood\");\n\n    // --- settings: your plugin's own private key/value store\n    // (needs \"settings:read\" / \"settings:write\"; values must be JSON under 16 KB)\n    //\n    // const name = await api.settings.get(\"name\", \"friend\");\n    // await api.settings.set(\"name\", \"Ada\");\n  },\n});\n"
+}

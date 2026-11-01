@@ -154,7 +154,11 @@
           <details class="plugin-source-details"><summary>Inspect uploaded source</summary><pre id="plugin-source-view"></pre></details>
           <div class="consent-permissions" id="plugin-permissions"></div>
           <label class="consent-trust"><input id="plugin-trust-checkbox" type="checkbox"><span>I reviewed this local package and consent to running its code in xPin's restricted sandbox.</span></label>
-          <footer class="dialog-footer"><span id="plugin-consent-status">Unselected permissions stay unavailable.</span><div><button class="dialog-cancel" id="cancel-plugin-consent-footer" type="button">Cancel</button><button class="dialog-done" id="allow-plugin" type="button" disabled>Allow and run</button></div></footer>
+          <div class="consent-reject" id="plugin-reject-row" hidden>
+            <label>Reason for rejection<input id="plugin-reject-reason" type="text" maxlength="200" placeholder="e.g. asks for more access than it needs"></label>
+            <button class="dialog-cancel" id="confirm-reject-plugin" type="button">Confirm rejection</button>
+          </div>
+          <footer class="dialog-footer"><span id="plugin-consent-status">Unselected permissions stay unavailable.</span><div><button class="dialog-cancel" id="cancel-plugin-consent-footer" type="button">Cancel</button><button class="dialog-cancel" id="reject-plugin" type="button">Reject</button><button class="dialog-done" id="allow-plugin" type="button" disabled>Approve and enable</button></div></footer>
         </section>
       </div>
       <div class="modal-backdrop palette-backdrop" id="commands-modal" hidden>
