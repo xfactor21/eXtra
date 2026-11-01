@@ -1,0 +1,15 @@
+{
+  "manifest": {
+    "id": "template-pack",
+    "name": "Template pack",
+    "version": "1.0.0",
+    "description": "One-tap meeting, decision, and reading notes inserted at your caret.",
+    "author": "xPin team",
+    "permissions": [
+      "commands:register",
+      "editor:write",
+      "ui:notify"
+    ]
+  },
+  "source": "/* Template pack — example xPin plugin built against plugins/starter.\n * Inserts structured note templates at the caret via editor:write.\n */\nxPinPlugin.register({\n  activate(api) {\n    const templates = [\n      {\n        id: \"meeting\",\n        name: \"Insert meeting notes\",\n        body: \"## Meeting — {{date}}\\n\\n**Attendees:** \\n\\n## Agenda\\n\\n- \\n\\n## Notes\\n\\n\\n## Decisions\\n\\n- \\n\\n## Next steps\\n\\n- [ ] \",\n      },\n      {\n        id: \"decision\",\n        name: \"Insert decision log\",\n        body: \"## Decision — {{date}}\\n\\n**Context:** \\n\\n**Options considered:**\\n\\n- \\n\\n**Chosen:** \\n\\n**Why:** \\n\",\n      },\n      {\n        id: \"reading\",\n        name: \"Insert reading notes\",\n        body: \"## Reading — {{title}}\\n\\n**Source:** \\n\\n## Key ideas\\n\\n- \\n\\n## Quotes\\n\\n> \\n\\n## My take\\n\\n\",\n      },\n    ];\n    const today = new Date();\n    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, \"0\")}-${String(today.getDate()).padStart(2, \"0\")}`;\n    for (const template of templates) {\n      api.commands.add({\n        id: template.id,\n        name: template.name,\n        description: \"Insert a structured template at the caret.\",\n        run: async () => {\n          const current = await api.notes.current().catch(() => null);\n          const title = current && typeof current.title === \"string\" ? current.title : \"\";\n          await api.editor.insertText(template.body.replaceAll(\"{{date}}\", date).replaceAll(\"{{title}}\", title));\n          await api.ui.notify(`${template.name.replace(\"Insert \", \"\")} template inserted.`);\n        },\n      });\n    }\n  },\n});\n"
+}

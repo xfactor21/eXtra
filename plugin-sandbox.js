@@ -8,33 +8,38 @@
     "notes:read": "Read note titles and content",
     "notes:select": "Open a note in the editor",
     "notes:create": "Create a note",
+    "notes:update": "Edit a note's title or body",
     "editor:write": "Insert text into the open note",
     "commands:register": "Add actions to the command palette",
-    "ui:notify": "Show Pinboard notifications",
+    "ui:notify": "Show xPin notifications",
+    "ui:status": "Show a small item in the editor status bar",
     "settings:read": "Read this plugin's own settings",
     "settings:write": "Save this plugin's own settings"
   });
 
   const WORKER_PRELUDE = `
-    const __pinboardState = { definition: null, commands: new Map(), pending: new Map(), sequence: 0 };
-    const __pinboardSend = (message) => self.postMessage(message);
-    const __pinboardRequest = (capability, payload) => new Promise((resolve, reject) => {
-      const requestId = ++__pinboardState.sequence;
-      __pinboardState.pending.set(requestId, { resolve, reject });
-      __pinboardSend({ type: "request", requestId, capability, payload });
+    const __xPinState = { definition: null, commands: new Map(), pending: new Map(), sequence: 0 };
+    const __xPinSend = (message) => self.postMessage(message);
+    const __xPinRequest = (capability, payload) => new Promise((resolve, reject) => {
+      const requestId = ++__xPinState.sequence;
+      __xPinState.pending.set(requestId, { resolve, reject });
+      __xPinSend({ type: "request", requestId, capability, payload });
     });
-    const __pinboardApi = Object.freeze({
+    const __xPinApi = Object.freeze({
       notes: Object.freeze({
-        list: () => __pinboardRequest("notes:read", { action: "list" }),
-        current: () => __pinboardRequest("notes:read", { action: "current" }),
-        select: (id) => __pinboardRequest("notes:select", { id }),
-        create: (options) => __pinboardRequest("notes:create", { options })
+        list: () => __xPinRequest("notes:read", { action: "list" }),
+        current: () => __xPinRequest("notes:read", { action: "current" }),
+        select: (id) => __xPinRequest("notes:select", { id }),
+        create: (options) => __xPinRequest("notes:create", { options }),
+        update: (id, patch) => __xPinRequest("notes:update", { id, patch })
       }),
       editor: Object.freeze({
-        insertText: (text) => __pinboardRequest("editor:write", { text })
+        insertText: (text) => __xPinRequest("editor:write", { text })
       }),
       ui: Object.freeze({
-        notify: (message) => __pinboardRequest("ui:notify", { message })
+        notify: (message) => __xPinRequest("ui:notify", { message }),
+        setStatus: (item) => __xPinRequest("ui:status", { action: "set", item }),
+        clearStatus: (id) => __xPinRequest("ui:status", { action: "clear", id })
       }),
       commands: Object.freeze({
         add(command) {
@@ -42,11 +47,11 @@
             typeof command.name !== "string" || typeof command.run !== "function") {
             throw new TypeError("Commands need an id, name, and run function.");
           }
-          if (__pinboardState.commands.has(command.id) || __pinboardState.commands.size >= ${MAX_COMMANDS}) {
+          if (__xPinState.commands.has(command.id) || __xPinState.commands.size >= ${MAX_COMMANDS}) {
             throw new Error("Command id is already registered or the plugin command limit was reached.");
           }
-          __pinboardState.commands.set(command.id, command.run);
-          return __pinboardRequest("commands:register", {
+          __xPinState.commands.set(command.id, command.run);
+          return __xPinRequest("commands:register", {
             id: command.id,
             name: command.name,
             description: typeof command.description === "string" ? command.description : ""
@@ -54,27 +59,36 @@
         }
       }),
       settings: Object.freeze({
-        get: (key, fallback) => __pinboardRequest("settings:read", { key, fallback }),
-        set: (key, value) => __pinboardRequest("settings:write", { key, value })
+        get: (key, fallback) => __xPinRequest("settings:read", { key, fallback }),
+        set: (key, value) => __xPinRequest("settings:write", { key, value })
       })
     });
-    Object.defineProperty(self, "PinboardPlugin", {
+    Object.defineProperty(self, "xPinPlugin", {
       configurable: false,
       writable: false,
       value: Object.freeze({
         register(definition) {
-          if (__pinboardState.definition || !definition || typeof definition.activate !== "function") {
+          if (__xPinState.definition || !definition || typeof definition.activate !== "function") {
             throw new TypeError("Register exactly one plugin with an activate(api) function.");
           }
-          __pinboardState.definition = definition;
+          __xPinState.definition = definition;
         }
       })
     });
-    for (const name of ["Worker", "SharedWorker", "BroadcastChannel", "indexedDB", "caches", "importScripts", "WebAssembly"]) {
+    for (const name of ["Worker", "SharedWorker", "BroadcastChannel", "indexedDB", "caches", "importScripts", "WebAssembly", "fetch", "XMLHttpRequest", "WebSocket", "EventSource"]) {
       try {
         Object.defineProperty(self, name, { configurable: false, value: undefined });
       } catch (error) {
         throw new Error("Could not restrict plugin runtime capability " + name + ": " + String(error && error.message || error));
+      }
+    }
+    if (self.navigator) {
+      for (const name of ["sendBeacon", "storage"]) {
+        try {
+          Object.defineProperty(self.navigator, name, { configurable: false, value: undefined });
+        } catch (error) {
+          throw new Error("Could not restrict plugin runtime capability navigator." + name + ": " + String(error && error.message || error));
+        }
       }
     }
   `;
@@ -85,29 +99,35 @@
       if (!message || typeof message !== "object") return;
       if (message.type === "activate") {
         try {
-          if (!__pinboardState.definition) throw new Error("Package source did not register a plugin.");
-          const cleanup = await __pinboardState.definition.activate(__pinboardApi);
-          if (typeof cleanup === "function") __pinboardState.cleanup = cleanup;
-          __pinboardSend({ type: "activated" });
+          if (!__xPinState.definition) throw new Error("Package source did not register a plugin.");
+          const cleanup = await __xPinState.definition.activate(__xPinApi);
+          if (typeof cleanup === "function") __xPinState.cleanup = cleanup;
+          __xPinSend({ type: "activated" });
         } catch (error) {
-          __pinboardSend({ type: "runtime-error", message: String(error && error.message || error).slice(0, 300) });
+          __xPinSend({ type: "runtime-error", message: String(error && error.message || error).slice(0, 300) });
         }
       } else if (message.type === "rpc-response") {
-        const pending = __pinboardState.pending.get(message.requestId);
+        const pending = __xPinState.pending.get(message.requestId);
         if (!pending) return;
-        __pinboardState.pending.delete(message.requestId);
+        __xPinState.pending.delete(message.requestId);
         if (message.ok) pending.resolve(message.result);
         else pending.reject(new Error(String(message.error || "Permission request failed.").slice(0, 300)));
       } else if (message.type === "invoke") {
-        const run = __pinboardState.commands.get(message.commandId);
+        const run = __xPinState.commands.get(message.commandId);
         try {
           if (!run) throw new Error("Command is no longer available.");
           await run();
-          __pinboardSend({ type: "command-result", invokeId: message.invokeId, ok: true });
+          __xPinSend({ type: "command-result", invokeId: message.invokeId, ok: true });
         } catch (error) {
-          __pinboardSend({ type: "command-result", invokeId: message.invokeId, ok: false, error: String(error && error.message || error).slice(0, 300) });
+          __xPinSend({ type: "command-result", invokeId: message.invokeId, ok: false, error: String(error && error.message || error).slice(0, 300) });
         }
       }
+    });
+    // An async failure the plugin never handled is a bug in the plugin, not a
+    // crash: report it to the host so the user sees it instead of silence.
+    self.addEventListener("unhandledrejection", (event) => {
+      event.preventDefault();
+      __xPinSend({ type: "plugin-error", message: String((event.reason && event.reason.message) || event.reason || "Plugin error").slice(0, 300) });
     });
   `;
 
@@ -119,7 +139,7 @@
     addEventListener("message", (event) => {
       if (event.source !== parent || !event.data || typeof event.data !== "object") return;
       const message = event.data;
-      if (message.type === "pinboard:boot" && !worker && typeof message.source === "string") {
+      if (message.type === "xPin:boot" && !worker && typeof message.source === "string") {
         try {
           const blob = new Blob([workerPrelude, "\\n(function () {\\n", message.source, "\\n})();\\n", workerRuntime], { type: "text/javascript" });
           const url = URL.createObjectURL(blob);
@@ -131,7 +151,7 @@
         } catch (error) {
           relay({ type: "runtime-error", message: String(error && error.message || error).slice(0, 300) });
         }
-      } else if (message.type === "pinboard:stop") {
+      } else if (message.type === "xPin:stop") {
         worker?.terminate();
         worker = null;
       } else if (worker) {
@@ -149,20 +169,25 @@
     const manifest = value.manifest;
     const id = manifest.id;
     if (typeof id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) || id.length > 64) {
-      throw new TypeError("Plugin id must use lowercase letters, numbers, and hyphens.");
+      throw new TypeError("Plugin id must be 1–64 characters: lowercase letters, numbers, and hyphens only (example: \"my-plugin\").");
     }
     for (const key of ["name", "version", "description", "author"]) {
-      if (typeof manifest[key] !== "string" || !manifest[key].trim() || manifest[key].length > (key === "description" ? 240 : 80)) {
-        throw new TypeError(`Plugin manifest has an invalid ${key}.`);
+      const limit = key === "description" ? 240 : 80;
+      if (typeof manifest[key] !== "string" || !manifest[key].trim() || manifest[key].length > limit) {
+        throw new TypeError(`Plugin manifest field "${key}" must be non-empty text under ${limit} characters.`);
       }
     }
-    if (!Array.isArray(manifest.permissions) || manifest.permissions.length > Object.keys(PERMISSIONS).length ||
-      manifest.permissions.some((permission) => !Object.hasOwn(PERMISSIONS, permission)) ||
+    if (!Array.isArray(manifest.permissions) ||
+      manifest.permissions.length > Object.keys(PERMISSIONS).length ||
       new Set(manifest.permissions).size !== manifest.permissions.length) {
-      throw new TypeError("Plugin permissions must be a unique list of supported capabilities.");
+      throw new TypeError("Plugin permissions must be a list of unique capability names (see PLUGIN_GUIDE.md).");
+    }
+    const unknown = manifest.permissions.find((permission) => !Object.hasOwn(PERMISSIONS, permission));
+    if (unknown !== undefined) {
+      throw new TypeError(`Unknown plugin permission "${String(unknown).slice(0, 60)}". Supported: ${Object.keys(PERMISSIONS).join(", ")}.`);
     }
     if (!value.source.trim() || value.source.length > MAX_SOURCE_LENGTH) {
-      throw new TypeError(`Plugin source must contain 1–${MAX_SOURCE_LENGTH} characters.`);
+      throw new TypeError(`Plugin source must be 1–${MAX_SOURCE_LENGTH} characters of JavaScript calling xPinPlugin.register().`);
     }
     return {
       manifest: {
@@ -184,7 +209,7 @@
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }
 
-  function create({ plugin, permissions, onRequest, onError, onStatus }) {
+  function create({ plugin, permissions, onRequest, onError, onStatus, onWarning }) {
     if (!plugin || !Array.isArray(permissions) || typeof onRequest !== "function" || typeof onError !== "function") {
       throw new TypeError("Sandbox requires a plugin, permissions, request, and error handlers.");
     }
@@ -215,7 +240,7 @@
       if (disposed) return;
       disposed = true;
       clearTimeout(startupTimer);
-      frame.contentWindow?.postMessage({ type: "pinboard:stop" }, "*");
+      frame.contentWindow?.postMessage({ type: "xPin:stop" }, "*");
       window.removeEventListener("message", receive);
       frame.remove();
       pendingInvocations.forEach(({ reject }) => reject(new Error("Plugin sandbox was stopped.")));
@@ -246,6 +271,12 @@
         onStatus?.("active");
       } else if (message.type === "runtime-error") {
         stop(new Error(String(message.message || "Plugin runtime failed.").slice(0, 300)));
+      } else if (message.type === "plugin-error") {
+        try {
+          onWarning?.(new Error(String(message.message || "Plugin error.").slice(0, 300)));
+        } catch (error) {
+          console.error("xPin plugin warning handler failed.", error);
+        }
       } else if (message.type === "command-result") {
         const pending = pendingInvocations.get(message.invokeId);
         if (!pending) return;
@@ -262,6 +293,19 @@
             error: "This permission was not granted."
           }, "*");
           return;
+        }
+        if (message.capability === "settings:read" || message.capability === "settings:write") {
+          const settingsKey = message.payload && message.payload.key;
+          if (typeof settingsKey !== "string" || settingsKey === "__proto__" ||
+            settingsKey === "constructor" || settingsKey === "prototype") {
+            frame.contentWindow.postMessage({
+              type: "rpc-response",
+              requestId: message.requestId,
+              ok: false,
+              error: "Invalid settings key."
+            }, "*");
+            return;
+          }
         }
         try {
           const result = await onRequest(message.capability, message.payload);
@@ -281,7 +325,7 @@
     frame.addEventListener("load", () => {
       if (disposed || started) return;
       started = true;
-      frame.contentWindow.postMessage({ type: "pinboard:boot", source: normalized.source }, "*");
+      frame.contentWindow.postMessage({ type: "xPin:boot", source: normalized.source }, "*");
     }, { once: true });
     document.body.append(frame);
     startupTimer = setTimeout(() => stop(new Error("Plugin did not start within 8 seconds.")), 8000);
@@ -309,7 +353,7 @@
     });
   }
 
-  window.PinboardSandbox = Object.freeze({
+  window.xPinSandbox = Object.freeze({
     permissions: PERMISSIONS,
     maxPackageBytes: MAX_PACKAGE_BYTES,
     validatePackage,

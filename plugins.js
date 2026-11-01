@@ -50,7 +50,7 @@
         api.commands.add({
           id: "open-plugins",
           name: "Open plugin manager",
-          description: "Enable or disable Pinboard features.",
+          description: "Enable or disable xPin features.",
           run: api.ui.openPluginManager
         });
         api.commands.add({
@@ -295,5 +295,5 @@
     }
   ];
 
-  window.PinboardPlugins = Object.freeze(plugins);
+  window.xPinPlugins = Object.freeze(plugins);
 })();

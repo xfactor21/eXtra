@@ -11,9 +11,10 @@ const webFiles = [
   "plugin-sandbox.js",
   "plugin-system.js",
   "plugins.js",
+  "feature-suite.js",
   "favicon.svg"
 ];
 
 await mkdir(webDirectory, { recursive: true });
 await Promise.all(webFiles.map((file) => copyFile(path.join(root, "..", file), path.join(webDirectory, file))));
-console.log(`Prepared ${webFiles.length} Pinboard web assets for Android.`);
+console.log(`Prepared ${webFiles.length} xPin web assets for Android.`);

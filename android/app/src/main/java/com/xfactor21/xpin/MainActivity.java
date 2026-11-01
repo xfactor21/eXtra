@@ -1,4 +1,4 @@
-package com.xfactor21.pinboard;
+package com.xfactor21.xpin;
 
 import com.getcapacitor.BridgeActivity;
 

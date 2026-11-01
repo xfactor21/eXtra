@@ -2,7 +2,7 @@
   "use strict";
 
   const VIEW_NAMES = ["database", "graph", "settings"];
-  const DATABASE_VIEWS = ["table", "board", "calendar", "gallery", "list", "timeline"];
+  const DATABASE_VIEWS = ["table", "board", "calendar", "gallery", "timeline"];
   const COLUMN_TYPES = ["text", "status", "date", "number", "relation", "rollup"];
   const ACCENTS = {
     cyan: ["#54dce8", "#83f0f3"],
@@ -79,7 +79,14 @@
         columnIds.add(column.id);
         const safe = makeColumn(column.id, column.name.trim().slice(0, 80) || "Untitled", column.type);
         if (column.type === "relation") safe.targetTableId = column.targetTableId;
-        if (column.type === "rollup") safe.aggregation = column.aggregation === "count" ? "count" : "count";
+        if (column.type === "rollup") {
+          safe.aggregation = "count";
+          if (typeof column.sourceColumnId === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(column.sourceColumnId)) {
+            // Deep validity (still a live relation targeting this table) is checked at count time;
+            // a stale scope cleanly falls back to counting all inbound relations.
+            safe.sourceColumnId = column.sourceColumnId;
+          }
+        }
         return [safe];
       });
       if (!table.columns.length) table.columns.push(makeColumn(makeId("field"), "Name", "text"));
@@ -137,6 +144,10 @@
     return `${prefix}-${random}`;
   }
 
+  function formatDate(value) {
+    return new Date(value).toLocaleDateString();
+  }
+
   function el(tag, className = "", text = "") {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -153,6 +164,7 @@
     const featureState = host.getState().features;
     let active = featureState.activeView;
     let queryResult = null;
+    let queryHelpOpen = false;
     let slashMenu = null;
 
     function save() {
@@ -182,7 +194,7 @@
         button.classList.toggle("is-active", button.dataset.featureView === view);
       });
       const labels = {
-        database: ["Databases", "One set of records, six ways to see it."],
+        database: ["Databases", "One set of records, five ways to see it."],
         graph: ["Note graph", "Follow the links and parent pages that already live in your notes."],
         settings: ["Workspace tools", "Make a safe portable copy, tune the canvas, or export a page."]
       };
@@ -247,7 +259,13 @@
       const addTable = el("button", "feature-button", "＋ Database");
       addTable.type = "button";
       addTable.dataset.action = "add-table";
-      controls.append(tablePicker, viewPicker, addRow, addTable);
+      const renameTableButton = el("button", "feature-button", "Rename");
+      renameTableButton.type = "button";
+      renameTableButton.dataset.action = "rename-table";
+      const deleteTableButton = el("button", "feature-button", "Delete");
+      deleteTableButton.type = "button";
+      deleteTableButton.dataset.action = "delete-table";
+      controls.append(tablePicker, viewPicker, addRow, addTable, renameTableButton, deleteTableButton);
       header.append(titleGroup, controls);
       wrap.append(header);
       if (!table) {
@@ -260,8 +278,7 @@
       else if (table.view === "board") wrap.append(renderBoard(table));
       else if (table.view === "calendar") wrap.append(renderCalendar(table));
       else if (table.view === "gallery") wrap.append(renderGallery(table));
-      else if (table.view === "timeline") wrap.append(renderTimeline(table));
-      else wrap.append(renderList(table));
+      else wrap.append(renderTimeline(table));
       wrap.append(renderQuery());
       content.replaceChildren(wrap);
     }
@@ -269,8 +286,10 @@
     function fieldControl(table, row, column) {
       const value = row.values[column.id] ?? "";
       if (column.type === "rollup") {
-        const badge = el("span", "rollup-value", String(incomingRelations(table.id, row.id)));
-        badge.title = "Count of records in other tables related to this row.";
+        const badge = el("span", "rollup-value", String(incomingRelations(table.id, row.id, column.sourceColumnId)));
+        badge.title = column.sourceColumnId
+          ? "Count of records linked to this row through the selected relation."
+          : "Count of records in other tables related to this row.";
         return badge;
       }
       if (column.type === "status") {
@@ -378,7 +397,7 @@
       type.setAttribute("aria-label", "New property type");
       [
         ["text", "Text"], ["status", "Status"], ["date", "Date"], ["number", "Number"],
-        ["relation", "Relation to notes"], ["rollup", "Rollup count"]
+        ["relation", "Relation"], ["rollup", "Rollup count"]
       ].forEach(([value, label]) => {
         const option = el("option", "", label);
         option.value = value;
@@ -395,21 +414,52 @@
         option.value = candidate.id;
         target.append(option);
       });
+      const source = el("select", "feature-select");
+      source.dataset.role = "new-column-source";
+      source.setAttribute("aria-label", "Rollup relation source");
+      const allOption = el("option", "", "All incoming relations");
+      allOption.value = "";
+      source.append(allOption);
+      rollupSources(table).forEach((item) => {
+        const option = el("option", "", item.label);
+        option.value = item.id;
+        source.append(option);
+      });
       target.hidden = type.value !== "relation";
-      type.addEventListener("change", () => { target.hidden = type.value !== "relation"; });
+      source.hidden = type.value !== "rollup";
+      type.addEventListener("change", () => {
+        target.hidden = type.value !== "relation";
+        source.hidden = type.value !== "rollup";
+      });
       const add = el("button", "feature-button", "＋ Property");
       add.type = "button";
       add.dataset.action = "add-column";
-      fieldControls.append(name, type, target, add);
+      fieldControls.append(name, type, target, source, add);
+      const manageControls = el("div", "database-add-field");
+      const existing = el("select", "feature-select");
+      existing.dataset.role = "manage-column";
+      existing.setAttribute("aria-label", "Choose property to manage");
+      table.columns.forEach((column) => {
+        const option = el("option", "", `${column.name} (${column.type})`);
+        option.value = column.id;
+        existing.append(option);
+      });
+      const renameColumnButton = el("button", "feature-button", "Rename property");
+      renameColumnButton.type = "button";
+      renameColumnButton.dataset.action = "rename-column";
+      const deleteColumnButton = el("button", "feature-button", "Delete property");
+      deleteColumnButton.type = "button";
+      deleteColumnButton.dataset.action = "delete-column";
+      manageControls.append(existing, renameColumnButton, deleteColumnButton);
       const bottom = el("div", "database-table-bottom");
-      bottom.append(footer, fieldControls);
+      bottom.append(footer, fieldControls, manageControls);
       container.append(bottom);
       return container;
     }
 
     function valueText(table, row, column) {
       const value = row.values[column.id] ?? "";
-      if (column.type === "rollup") return `${incomingRelations(table.id, row.id)} linked`;
+      if (column.type === "rollup") return `${incomingRelations(table.id, row.id, column.sourceColumnId)} linked`;
       if (column.type === "relation") {
         if (column.targetTableId === "notes") return host.getState().notes.find((note) => note.id === value)?.title ?? "";
         const relatedTable = tableById(column.targetTableId);
@@ -417,23 +467,6 @@
         return relatedRow?.values[relatedTable.columns[0]?.id] ?? "";
       }
       return String(value);
-    }
-
-    function renderList(table) {
-      const list = el("div", "database-record-list");
-      table.rows.forEach((row) => {
-        const item = el("article", "database-record-line");
-        item.append(el("strong", "", row.values[table.columns[0]?.id] || "Untitled record"));
-        const details = el("span");
-        table.columns.slice(1).forEach((column) => {
-          const value = valueText(table, row, column);
-          if (value) details.append(el("span", "database-property-chip", `${column.name}: ${value}`));
-        });
-        item.append(details);
-        list.append(item);
-      });
-      if (!table.rows.length) list.append(el("p", "feature-empty", "This view will fill as you add records."));
-      return list;
     }
 
     function renderGallery(table) {
@@ -445,6 +478,24 @@
           const value = valueText(table, row, column);
           if (value) card.append(el("p", "", `${column.name} · ${value}`));
         });
+        const noteId = rowLinkedNoteId(table, row);
+        if (noteId) {
+          card.classList.add("is-linked");
+          card.tabIndex = 0;
+          card.setAttribute("role", "button");
+          card.title = "Open linked page";
+          const openNote = () => {
+            deactivate();
+            host.selectNote(noteId);
+          };
+          card.addEventListener("click", openNote);
+          card.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openNote();
+            }
+          });
+        }
         gallery.append(card);
       });
       if (!table.rows.length) gallery.append(el("p", "feature-empty", "Your gallery is ready for its first record."));
@@ -453,9 +504,18 @@
 
     function renderBoard(table) {
       const board = el("div", "database-board");
-      STATUSES.forEach((status) => {
+      const statusColumn = table.columns.find((column) => column.type === "status");
+      // Lanes follow the status values actually present in the data; the defaults are only a
+      // fallback when there is nothing to show yet.
+      const present = [];
+      table.rows.forEach((row) => {
+        const value = row.values[statusColumn?.id] ?? "Not started";
+        if (!present.includes(value)) present.push(value);
+      });
+      const lanes = present.length ? present : STATUSES.slice();
+      lanes.forEach((status) => {
         const lane = el("section", "database-lane");
-        const records = table.rows.filter((row) => (row.values[table.columns.find((column) => column.type === "status")?.id] ?? "Not started") === status);
+        const records = table.rows.filter((row) => (row.values[statusColumn?.id] ?? "Not started") === status);
         lane.append(el("h3", "", `${status} · ${records.length}`));
         records.forEach((row) => {
           const card = el("article", "database-board-card");
@@ -484,13 +544,29 @@
       [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).forEach(([date, rows]) => {
         const day = el("section", "calendar-day");
         day.append(el("h3", "", date));
-        rows.forEach((row) => day.append(el("p", "", row.values[table.columns[0]?.id] || "Untitled record")));
+        rows.forEach((row) => {
+          const entry = el("p", "", row.values[table.columns[0]?.id] || "Untitled record");
+          const noteId = rowLinkedNoteId(table, row);
+          if (noteId) {
+            entry.classList.add("is-linked");
+            entry.tabIndex = 0;
+            entry.setAttribute("role", "button");
+            entry.title = "Open linked page";
+            entry.addEventListener("click", () => {
+              deactivate();
+              host.selectNote(noteId);
+            });
+          }
+          day.append(entry);
+        });
         calendar.append(day);
       });
       if (!groups.size) calendar.append(el("p", "feature-empty", "Add dates to place records on the calendar."));
       return calendar;
     }
 
+    // Timeline stays read-only on purpose: it is a chronological overview of records, and a
+    // record has no single obvious target to open, so no click interaction is attached here.
     function renderTimeline(table) {
       const timeline = el("div", "database-timeline");
       const dateColumn = table.columns.find((column) => column.type === "date");
@@ -501,14 +577,30 @@
         const marker = el("span", "timeline-marker");
         marker.setAttribute("aria-hidden", "true");
         item.append(marker, el("strong", "", row.values[table.columns[0]?.id] || "Untitled record"));
-        item.style.setProperty("--timeline-index", String(index));
         timeline.append(item);
       });
       if (!rows.length) timeline.append(el("p", "feature-empty", "Set a due date to start a timeline."));
       return timeline;
     }
 
-    function incomingRelations(tableId, rowId) {
+    // Resolves the page a record links to (via its first relation-to-notes column), or null
+    // when the record has no live link to a note. Used to make gallery/calendar entries clickable.
+    function rowLinkedNoteId(table, row) {
+      const column = table.columns.find((item) => item.type === "relation" && item.targetTableId === "notes");
+      const id = column ? row.values[column.id] : "";
+      return id && host.getState().notes.some((note) => note.id === id) ? id : null;
+    }
+
+    // Rollups count inbound relation links. When sourceColumnId names a live relation column that
+    // targets this table, only links through that relation are counted; otherwise every inbound
+    // relation link is counted (the historical default).
+    function incomingRelations(tableId, rowId, sourceColumnId) {
+      if (sourceColumnId) {
+        const source = featureState.tables.find((candidate) => candidate.columns.some((column) =>
+          column.id === sourceColumnId && column.type === "relation" && column.targetTableId === tableId));
+        const column = source?.columns.find((item) => item.id === sourceColumnId);
+        if (source && column) return source.rows.filter((row) => row.values[column.id] === rowId).length;
+      }
       let count = 0;
       featureState.tables.forEach((source) => source.columns.filter((column) =>
         column.type === "relation" && column.targetTableId === tableId
@@ -516,6 +608,36 @@
         count += source.rows.filter((row) => row.values[column.id] === rowId).length;
       }));
       return count;
+    }
+
+    // Relation columns in any table that point at the given table: the valid scopes for a rollup.
+    function rollupSources(table) {
+      const sources = [];
+      featureState.tables.forEach((sourceTable) => sourceTable.columns
+        .filter((column) => column.type === "relation" && column.targetTableId === table.id)
+        .forEach((column) => sources.push({ id: column.id, label: `${sourceTable.name} · ${column.name}` })));
+      return sources;
+    }
+
+    function renderQueryHelp() {
+      const panel = el("div", "query-help");
+      panel.hidden = !queryHelpOpen;
+      const examples = [
+        ["LIST FROM notes", "One line per matching note."],
+        ["TABLE title,folder,tags FROM notes", "Columns: title, folder, pinned, created, updated, parent, tags."],
+        ["LIST FROM notes WHERE title = \"Exact title\"", "Exact match, case-insensitive."],
+        ["LIST FROM notes WHERE title CONTAINS \"part\"", "Substring match. Also works with folder."],
+        ["LIST FROM notes WHERE folder = \"Work\"", "Matches the folder name."],
+        ["LIST FROM notes WHERE tag = work", "Matches notes tagged #work (#work works too)."],
+        ["LIST FROM notes WHERE pinned = true", "Pinned notes; use false for the rest."]
+      ];
+      examples.forEach(([syntax, meaning]) => {
+        const item = el("div", "query-help-item");
+        item.append(el("code", "", syntax), el("span", "", meaning));
+        panel.append(item);
+      });
+      panel.append(el("p", "feature-help", "One WHERE condition per query. Click a result to open the note."));
+      return panel;
     }
 
     function renderQuery() {
@@ -528,15 +650,25 @@
       input.maxLength = 500;
       input.setAttribute("aria-label", "Safe note query");
       input.dataset.action = "query-input";
+      const help = el("button", "feature-button", "?");
+      help.type = "button";
+      help.dataset.action = "query-help";
+      help.title = "Query grammar reference";
+      help.setAttribute("aria-label", "Toggle query grammar reference");
       const run = el("button", "feature-button", "Run query");
       run.type = "button";
       run.dataset.action = "run-query";
-      controls.append(input, run);
-      sectionEl.append(intro, controls);
+      controls.append(input, help, run);
+      sectionEl.append(intro, controls, renderQueryHelp());
       const result = el("div", "query-results");
       if (queryResult) result.append(queryResult);
       sectionEl.append(result);
       return sectionEl;
+    }
+
+    function toggleQueryHelp() {
+      queryHelpOpen = !queryHelpOpen;
+      render();
     }
 
     function runQuery() {
@@ -544,7 +676,7 @@
       const match = raw.match(/^(LIST|TABLE(?:\s+([a-zA-Z, ]+))?)\s+FROM\s+notes(?:\s+WHERE\s+(title|folder|tag|pinned)\s*(=|CONTAINS)\s*(.+))?$/i);
       if (!match) throw new TypeError("Use LIST FROM notes or TABLE title,folder FROM notes with one supported WHERE condition.");
       const mode = match[1].toLocaleUpperCase().startsWith("TABLE") ? "TABLE" : "LIST";
-      const fields = mode === "LIST" ? ["title"] : (match[2] || "title").split(",").map((field) => field.trim());
+      const fields = mode === "LIST" ? ["title"] : (match[2] || "title").split(",").map((field) => field.trim().toLocaleLowerCase());
       const allowed = new Set(["title", "folder", "pinned", "created", "updated", "parent", "tags"]);
       if (!fields.length || fields.some((field) => !allowed.has(field))) {
         throw new TypeError("Query fields must be title, folder, pinned, created, updated, parent, or tags.");
@@ -565,7 +697,12 @@
           : filterField === "folder" ? folder
             : filterField === "pinned" ? String(note.pinned)
               : filterField === "tag" ? note.body : "";
-        if (filterField === "tag") return host.extractTags(`${note.title}\n${note.body}`).includes(value.toLocaleLowerCase());
+        if (filterField === "tag") {
+          // extractTags returns tags with a # prefix, so accept the value with or without it.
+          const wanted = value.toLocaleLowerCase();
+          const normalized = wanted.startsWith("#") ? wanted : `#${wanted}`;
+          return host.extractTags(`${note.title}\n${note.body}`).includes(normalized);
+        }
         if (filterField === "pinned") return current.toLocaleLowerCase() === value.toLocaleLowerCase();
         return operator === "CONTAINS"
           ? current.toLocaleLowerCase().includes(value.toLocaleLowerCase())
@@ -585,8 +722,8 @@
             title: note.title || "Untitled note",
             folder,
             pinned: note.pinned ? "Pinned" : "—",
-            created: new Date(note.createdAt).toLocaleDateString(),
-            updated: new Date(note.updatedAt).toLocaleDateString(),
+            created: formatDate(note.createdAt),
+            updated: formatDate(note.updatedAt),
             parent: host.getState().notes.find((item) => item.id === note.parentNoteId)?.title ?? "—",
             tags: host.extractTags(`${note.title}\n${note.body}`).join(", ") || "—"
           };
@@ -687,7 +824,7 @@
       wrap.append(appearance);
 
       const publishing = el("section", "tools-section");
-      publishing.append(el("h2", "", "Static page export"), el("p", "", "Download the selected note as a standalone HTML file. Host it yourself to make it public; Pinboard does not upload it."));
+      publishing.append(el("h2", "", "Static page export"), el("p", "", "Download the selected note as a standalone HTML file. Host it yourself to make it public; xPin does not upload it."));
       const publish = el("button", "feature-button feature-button-primary", "Export current page");
       publish.type = "button";
       publish.dataset.action = "publish";
@@ -705,7 +842,7 @@
       importButton.dataset.action = "backup-import";
       const fileInput = el("input");
       fileInput.type = "file";
-      fileInput.accept = ".pinboard-backup,application/json";
+      fileInput.accept = ".xPin-backup,application/json";
       fileInput.hidden = true;
       fileInput.dataset.action = "backup-file";
       backupActions.append(exportButton, importButton, fileInput);
@@ -761,7 +898,7 @@
       const [accent, bright] = ACCENTS[featureState.theme.accent] ?? ACCENTS.cyan;
       document.documentElement.style.setProperty("--cyan", accent);
       document.documentElement.style.setProperty("--cyan-bright", bright);
-      document.documentElement.dataset.pinboardDensity = featureState.theme.density;
+      document.documentElement.dataset.xPinDensity = featureState.theme.density;
     }
 
     function addRow(table) {
@@ -792,6 +929,73 @@
       render();
     }
 
+    function renameTable(table) {
+      const name = window.prompt("Rename this database:", table.name);
+      if (name === null) return;
+      const clean = name.trim().slice(0, 80);
+      if (!clean) return host.notify("Database names cannot be empty.");
+      table.name = clean;
+      save();
+      render();
+    }
+
+    function removeTable(table) {
+      if (!window.confirm(`Delete the database "${table.name}"? This removes ${table.rows.length} ${table.rows.length === 1 ? "record" : "records"} and cannot be undone.`)) return;
+      // Relation columns in other tables that pointed at the deleted table are dropped too,
+      // mirroring what sanitizeState does with dangling relation targets on load.
+      const droppedIds = new Set();
+      featureState.tables.forEach((source) => {
+        source.columns.filter((column) => column.type === "relation" && column.targetTableId === table.id)
+          .forEach((column) => droppedIds.add(column.id));
+      });
+      if (droppedIds.size) {
+        featureState.tables.forEach((source) => {
+          source.columns = source.columns.filter((column) => !droppedIds.has(column.id));
+          source.rows.forEach((row) => droppedIds.forEach((id) => delete row.values[id]));
+          source.columns.forEach((column) => {
+            if (column.type === "rollup" && column.sourceColumnId && droppedIds.has(column.sourceColumnId)) {
+              delete column.sourceColumnId;
+            }
+          });
+          if (!source.columns.length) source.columns.push(makeColumn(makeId("field"), "Name", "text"));
+        });
+      }
+      featureState.tables = featureState.tables.filter((candidate) => candidate.id !== table.id);
+      if (featureState.selectedTableId === table.id) featureState.selectedTableId = featureState.tables[0]?.id ?? null;
+      save();
+      render();
+    }
+
+    function renameColumn(table) {
+      const column = columnById(table, content.querySelector('[data-role="manage-column"]')?.value);
+      if (!column) return;
+      const name = window.prompt("Rename this property:", column.name);
+      if (name === null) return;
+      const clean = name.trim().slice(0, 80);
+      if (!clean) return host.notify("Property names cannot be empty.");
+      if (table.columns.some((candidate) => candidate.id !== column.id &&
+        candidate.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
+        return host.notify("This database already has a property with that name.");
+      }
+      column.name = clean;
+      save();
+      render();
+    }
+
+    function removeColumn(table) {
+      const column = columnById(table, content.querySelector('[data-role="manage-column"]')?.value);
+      if (!column) return;
+      if (table.columns.length === 1) return host.notify("A database needs at least one property.");
+      if (!window.confirm(`Delete the property "${column.name}"? All of its values will be removed.`)) return;
+      table.columns = table.columns.filter((candidate) => candidate.id !== column.id);
+      table.rows.forEach((row) => delete row.values[column.id]);
+      featureState.tables.forEach((source) => source.columns.forEach((item) => {
+        if (item.type === "rollup" && item.sourceColumnId === column.id) delete item.sourceColumnId;
+      }));
+      save();
+      render();
+    }
+
     function addColumn(table) {
       const input = content.querySelector('[data-role="new-column-name"]');
       const typeInput = content.querySelector('[data-role="new-column-type"]');
@@ -809,7 +1013,13 @@
           return host.notify("Choose an existing relation target.");
         }
       }
-      if (type === "rollup") column.aggregation = "count";
+      if (type === "rollup") {
+        column.aggregation = "count";
+        const sourceId = content.querySelector('[data-role="new-column-source"]')?.value;
+        if (sourceId && rollupSources(table).some((item) => item.id === sourceId)) {
+          column.sourceColumnId = sourceId;
+        }
+      }
       table.columns.push(column);
       save();
       render();
@@ -867,8 +1077,8 @@
       host.flushSave();
       const title = note.title.trim() || "Untitled note";
       const html = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="A page exported from Pinboard"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'"><title>${escapeHtml(title)}</title><style>body{max-width:760px;margin:12vh auto;padding:0 24px;background:#07151d;color:#e8f4f6;font:17px/1.8 system-ui,sans-serif}h1{font-size:clamp(2rem,7vw,3.8rem);letter-spacing:-.05em;line-height:1.05}article{white-space:pre-wrap;overflow-wrap:anywhere;color:#b8cbd0}footer{margin-top:4rem;color:#8299a1;font-size:.8rem}</style></head><body><main><h1>${escapeHtml(title)}</h1><article>${escapeHtml(note.body)}</article><footer>Static page export · Pinboard</footer></main></body></html>`;
-      safeDownload(`${title.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "pinboard-page"}.html`, html, "text/html;charset=utf-8");
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="A page exported from xPin"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'"><title>${escapeHtml(title)}</title><style>body{max-width:760px;margin:12vh auto;padding:0 24px;background:#07151d;color:#e8f4f6;font:17px/1.8 system-ui,sans-serif}h1{font-size:clamp(2rem,7vw,3.8rem);letter-spacing:-.05em;line-height:1.05}article{white-space:pre-wrap;overflow-wrap:anywhere;color:#b8cbd0}footer{margin-top:4rem;color:#8299a1;font-size:.8rem}</style></head><body><main><h1>${escapeHtml(title)}</h1><article>${escapeHtml(note.body)}</article><footer>Static page export · xPin</footer></main></body></html>`;
+      safeDownload(`${title.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "xPin-page"}.html`, html, "text/html;charset=utf-8");
       host.notify("Static HTML page exported. Host the file yourself to publish it.");
     }
 
@@ -896,7 +1106,7 @@
 
     async function exportBackup() {
       host.flushSave();
-      if (!globalThis.crypto?.subtle) throw new Error("This browser does not support Web Crypto. Open Pinboard from localhost or a secure origin.");
+      if (!globalThis.crypto?.subtle) throw new Error("This browser does not support Web Crypto. Open xPin from localhost or a secure origin.");
       const passphrase = window.prompt("Choose a passphrase (at least 12 characters). It cannot be recovered:");
       if (passphrase === null) return;
       if (passphrase.length < 12) throw new TypeError("Use a passphrase with at least 12 characters.");
@@ -907,7 +1117,7 @@
       if (data.length > 10_000_000) throw new TypeError("This workspace is too large for a single backup file (10 MB limit).");
       const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
       const payload = JSON.stringify({
-        format: "pinboard-encrypted-backup",
+        format: "xPin-encrypted-backup",
         version: 1,
         kdf: "PBKDF2-SHA-256",
         iterations: 310_000,
@@ -916,20 +1126,20 @@
         iv: bytesToBase64(iv),
         ciphertext: bytesToBase64(new Uint8Array(encrypted))
       }, null, 2);
-      safeDownload("pinboard-encrypted-backup.pinboard-backup", payload, "application/json");
+      safeDownload("xPin-encrypted-backup.xPin-backup", payload, "application/json");
       host.notify("Encrypted backup exported. Keep the passphrase separate from the file.");
     }
 
     async function importBackup(file) {
       if (!file) return;
       if (file.size > 15_000_000) throw new TypeError("Backup file exceeds the 15 MB import limit.");
-      if (!globalThis.crypto?.subtle) throw new Error("This browser does not support Web Crypto. Open Pinboard from localhost or a secure origin.");
+      if (!globalThis.crypto?.subtle) throw new Error("This browser does not support Web Crypto. Open xPin from localhost or a secure origin.");
       const envelope = JSON.parse(await file.text());
-      if (!envelope || envelope.format !== "pinboard-encrypted-backup" || envelope.version !== 1 ||
+      if (!envelope || (envelope.format !== "xPin-encrypted-backup" && envelope.format !== "xpin-encrypted-backup") || envelope.version !== 1 ||
         envelope.kdf !== "PBKDF2-SHA-256" || envelope.cipher !== "AES-256-GCM" ||
         envelope.iterations !== 310_000 || typeof envelope.salt !== "string" ||
         typeof envelope.iv !== "string" || typeof envelope.ciphertext !== "string") {
-        throw new TypeError("This is not a supported Pinboard encrypted backup.");
+        throw new TypeError("This is not a supported xPin encrypted backup.");
       }
       const passphrase = window.prompt("Enter the backup passphrase:");
       if (passphrase === null) return;
@@ -938,7 +1148,7 @@
         const key = await deriveKey(passphrase, base64ToBytes(envelope.salt));
         clear = await crypto.subtle.decrypt({ name: "AES-GCM", iv: base64ToBytes(envelope.iv) }, key, base64ToBytes(envelope.ciphertext));
       } catch (error) {
-        console.error("Could not decrypt Pinboard backup.", error);
+        console.error("Could not decrypt xPin backup.", error);
         throw new Error("The passphrase is incorrect or this backup is damaged.");
       }
       const imported = JSON.parse(new TextDecoder().decode(clear));
@@ -1012,6 +1222,8 @@
     }
 
     function setup() {
+      // Theme tokens must apply on boot, not only when a feature view renders.
+      applyTheme();
       document.querySelectorAll("[data-feature-view]").forEach((button) => {
         button.addEventListener("click", () => open(button.dataset.featureView));
       });
@@ -1022,8 +1234,19 @@
           if (action === "add-row" && table) addRow(table);
           else if (action === "add-table") addTable();
           else if (action === "add-column" && table) addColumn(table);
-          else if (action === "delete-row" && table) removeRow(table, event.target.closest("[data-row-id]").dataset.rowId);
+          else if (action === "rename-table" && table) renameTable(table);
+          else if (action === "delete-table" && table) removeTable(table);
+          else if (action === "rename-column" && table) renameColumn(table);
+          else if (action === "delete-column" && table) removeColumn(table);
+          else if (action === "delete-row" && table) {
+            const rowElement = event.target.closest("[data-row-id]");
+            const row = table.rows.find((item) => item.id === rowElement?.dataset.rowId);
+            const label = row?.values[table.columns[0]?.id] || "this record";
+            if (!window.confirm(`Delete "${label}"? This cannot be undone.`)) return;
+            removeRow(table, rowElement.dataset.rowId);
+          }
           else if (action === "run-query") runQuery();
+          else if (action === "query-help") toggleQueryHelp();
           else if (action === "publish") exportPage();
           else if (action === "backup-export") await exportBackup();
           else if (action === "backup-import") content.querySelector('[data-action="backup-file"]')?.click();
@@ -1035,7 +1258,7 @@
             render();
           }
         } catch (error) {
-          console.error("Pinboard workspace tool failed.", error);
+          console.error("xPin workspace tool failed.", error);
           host.notify(error.message || "This workspace action could not be completed.");
         }
       });
@@ -1129,5 +1352,5 @@
     })[character]);
   }
 
-  window.PinboardFeatures = { initialState, sanitizeState, create, escapeHtml };
+  window.xPinFeatures = { initialState, sanitizeState, create, escapeHtml };
 })();

@@ -1,12 +1,41 @@
 (() => {
   "use strict";
 
-  const STORAGE_KEY = "pinboard.workspace.v1";
+  const STORAGE_KEY = "xPin.workspace.v1";
+  const LEGACY_STORAGE_KEYS = ["xpin.workspace.v1", "pinboard.workspace.v1"]; // pre-rename keys; migrated once on first run, newest first
   const SAVE_DELAY = 2000;
   const SORTS = ["modified-desc", "modified-asc", "created-desc", "created-asc", "title-asc", "title-desc"];
   const MAX_CANVASES = 30;
   const MAX_CANVAS_NODES = 200;
   const MAX_CANVAS_EDGES = 500;
+
+  function seedTemplates() {
+    return [
+      {
+        id: makeId("template"),
+        name: "Daily note",
+        content: "# {{date}}\n\n## Inbox\n"
+      },
+      {
+        id: makeId("template"),
+        name: "Meeting notes",
+        content: "# {{title}} — {{date}}\n\nAttendees: \n\n## Notes\n\n- \n\n## Actions\n\n- [ ] "
+      }
+    ];
+  }
+
+  function sanitizeTemplates(value) {
+    if (!Array.isArray(value)) return seedTemplates();
+    const clean = value
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        id: typeof item.id === "string" && item.id ? item.id : makeId("template"),
+        name: typeof item.name === "string" ? item.name.slice(0, 80) : "Untitled template",
+        content: typeof item.content === "string" ? item.content.slice(0, 100_000) : ""
+      }))
+      .filter((item) => item.name.trim());
+    return clean;
+  }
   const initialWorkspace = {
     sort: "modified-desc",
     filter: "all",
@@ -15,7 +44,8 @@
     collapsed: [],
     plugins: { enabled: {}, settings: {} },
     extensions: [],
-    features: window.PinboardFeatures.initialState(),
+    templates: seedTemplates(),
+    features: window.xPinFeatures.initialState(),
     selectedCanvasId: "canvas-main",
     canvases: [{ id: "canvas-main", name: "Thinking board", nodes: [], edges: [] }],
     folders: [
@@ -116,6 +146,8 @@
     pluginConsentStatus: byId("plugin-consent-status"),
     pluginConsentProvenance: byId("plugin-consent-provenance"),
     pluginSourceView: byId("plugin-source-view"),
+    pluginRejectRow: byId("plugin-reject-row"),
+    pluginRejectReason: byId("plugin-reject-reason"),
     allowPluginButton: byId("allow-plugin"),
     pluginFileInput: byId("plugin-file-input"),
     canvasFileInput: byId("canvas-file-input")
@@ -133,9 +165,13 @@
   let canvasGesture = null;
   let connectFromNodeId = null;
   let selectedCanvasNodeId = null;
+  let selectedCanvasEdgeId = null;
+  let canvasEdgeEditor = null;
+  let shortcutsDialog = null;
   let pendingPluginConsent = null;
   const activeExtensions = new Map();
   const extensionCommands = new Map();
+  const extensionStatusItems = new Map();
 
   function sanitizeCanvases(value) {
     if (!Array.isArray(value)) return structuredClone(initialWorkspace.canvases);
@@ -167,7 +203,8 @@
         if (node.type === "text" && typeof node.text === "string") safeNode.text = node.text;
         if (node.type === "file" && typeof node.file === "string") {
           safeNode.file = node.file;
-          if (typeof node.pinboardNoteId === "string") safeNode.pinboardNoteId = node.pinboardNoteId;
+          if (typeof node.xPinNoteId === "string") safeNode.xPinNoteId = node.xPinNoteId;
+          else if (typeof node.pinboardNoteId === "string") safeNode.xPinNoteId = node.pinboardNoteId; // pre-rename field
         }
         if (node.type === "link" && typeof node.url === "string") {
           try {
@@ -214,7 +251,7 @@
     if (!Array.isArray(value)) return [];
     return value.slice(0, 50).flatMap((record) => {
       try {
-        const plugin = window.PinboardSandbox.validatePackage(record);
+        const plugin = window.xPinSandbox.validatePackage(record);
         if (typeof record.fileName !== "string" || typeof record.sha256 !== "string" ||
           typeof record.installedAt !== "string") return [];
         return [{
@@ -229,10 +266,17 @@
           ) : [],
           settings: record.settings && typeof record.settings === "object" && !Array.isArray(record.settings)
             ? record.settings
-            : {}
+            : {},
+          // Review queue (added after launch): older saves predate it, so infer
+          // the status — anything once approved stays approved, the rest is pending.
+          reviewStatus: record.reviewStatus === "approved" || record.reviewStatus === "rejected"
+            ? record.reviewStatus
+            : (typeof record.approvedHash === "string" && record.approvedHash ? "approved" : "pending"),
+          reviewReason: typeof record.reviewReason === "string" ? record.reviewReason.slice(0, 200) : null,
+          reviewedAt: typeof record.reviewedAt === "string" ? record.reviewedAt : null
         }];
       } catch (error) {
-        console.error("An invalid saved Pinboard plugin was ignored.", error);
+        console.error("An invalid saved xPin plugin was ignored.", error);
         return [];
       }
     });
@@ -240,7 +284,33 @@
 
   function loadWorkspace() {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      let saved = null;
+      try {
+        saved = localStorage.getItem(STORAGE_KEY);
+      } catch (readError) {
+        saved = null;
+      }
+      if (saved === null) {
+        // One-time migration: the app was renamed Pinboard -> xpin -> xPin.
+        // Copy the newest legacy workspace forward so existing notes are not lost.
+        // Legacy keys are intentionally left in place as backups.
+        try {
+          for (const legacyKey of LEGACY_STORAGE_KEYS) {
+            const legacy = localStorage.getItem(legacyKey);
+            if (legacy !== null) {
+              try {
+                localStorage.setItem(STORAGE_KEY, legacy);
+              } catch (copyError) {
+                /* storage full/blocked: fall through and read legacy directly */
+              }
+              saved = legacy;
+              break;
+            }
+          }
+        } catch (legacyError) {
+          /* legacy keys unreadable: continue with a fresh workspace */
+        }
+      }
       if (saved === null) return structuredClone(initialWorkspace);
       const parsed = JSON.parse(saved);
       if (!parsed || !Array.isArray(parsed.notes) || !Array.isArray(parsed.folders)) {
@@ -298,7 +368,8 @@
         selectedCanvasId: typeof parsed.selectedCanvasId === "string" ? parsed.selectedCanvasId : "canvas-main",
         canvases: sanitizeCanvases(parsed.canvases),
         extensions: sanitizeExtensions(parsed.extensions),
-        features: window.PinboardFeatures.sanitizeState(parsed.features, notes),
+        templates: sanitizeTemplates(parsed.templates),
+        features: window.xPinFeatures.sanitizeState(parsed.features, notes),
         plugins: parsed.plugins && typeof parsed.plugins === "object"
           ? {
             enabled: parsed.plugins.enabled && typeof parsed.plugins.enabled === "object" ? parsed.plugins.enabled : {},
@@ -307,7 +378,7 @@
           : { enabled: {}, settings: {} }
       };
     } catch (error) {
-      console.error("Could not load the saved Pinboard workspace.", error);
+      console.error("Could not load the saved xPin workspace.", error);
       window.setTimeout(() => showToast("Saved notes could not be read. A fresh workspace is open."), 0);
       return structuredClone(initialWorkspace);
     }
@@ -319,7 +390,7 @@
       setSaveState("saved");
       return true;
     } catch (error) {
-      console.error("Could not save the Pinboard workspace.", error);
+      console.error("Could not save the xPin workspace.", error);
       setSaveState("error");
       showToast("Could not save on this device. Check browser storage settings.");
       return false;
@@ -398,9 +469,17 @@
     if (state.tagFilter) {
       notes = notes.filter((note) => extractTags(`${note.title}\n${note.body}`).includes(state.tagFilter));
     }
-    const query = ui.search.value.trim().toLocaleLowerCase();
-    if (query) {
-      notes = notes.filter((note) => `${note.title}\n${note.body}`.toLocaleLowerCase().includes(query));
+    const rawQuery = ui.search.value.trim();
+    if (rawQuery.startsWith("#")) {
+      // Tag search: "#parent" matches #parent exactly and nested #parent/child tags.
+      const tagQuery = rawQuery.toLocaleLowerCase();
+      notes = notes.filter((note) => extractTags(`${note.title}\n${note.body}`)
+        .some((tag) => tag === tagQuery || tag.startsWith(`${tagQuery}/`)));
+    } else {
+      const query = rawQuery.toLocaleLowerCase();
+      if (query) {
+        notes = notes.filter((note) => `${note.title}\n${note.body}`.toLocaleLowerCase().includes(query));
+      }
     }
     return sortNotes(notes);
   }
@@ -504,12 +583,15 @@
 
     byId("all-count").textContent = String(state.notes.length);
     byId("pinned-count").textContent = String(state.notes.filter((note) => note.pinned).length);
-    const labels = { all: ["All notes", "ALL NOTES"], pinned: ["Pinned", "PINNED"], recent: ["Recently edited", "RECENTLY EDITED"] };
+    const labels = { all: ["All notes", "ALL NOTES"], pinned: ["Pinned", "PINNED"], recent: ["Recent notes", "RECENT NOTES"] };
     const [label, heading] = labels[state.filter];
     const viewLabel = state.tagFilter ? `Tagged ${state.tagFilter}` : label;
-    ui.currentView.textContent = state.view === "canvas" ? "Canvas" : viewLabel;
+    const featureViewOpen = Boolean(state.features.activeView);
+    if (!featureViewOpen) {
+      ui.currentView.textContent = state.view === "canvas" ? "Canvas" : viewLabel;
+    }
     ui.listHeading.textContent = state.tagFilter ? `TAG ${state.tagFilter.toLocaleUpperCase()}` : heading;
-    if (state.view === "notes") {
+    if (state.view === "notes" && !featureViewOpen) {
       ui.pageTitle.innerHTML = `${state.tagFilter ? `Tag ${escapeText(state.tagFilter)}` : state.filter === "all" ? "Your notes" : escapeText(label)}<span class="title-period">.</span>`;
     }
   }
@@ -565,6 +647,7 @@
       return;
     }
     selectedCanvasNodeId = nodeId;
+    hideEdgeEditor();
     ui.canvasNodes.querySelectorAll(".canvas-node").forEach((item) =>
       item.classList.toggle("is-selected", item.dataset.nodeId === selectedCanvasNodeId)
     );
@@ -614,6 +697,16 @@
       line.setAttribute("y2", String(toPoint.y));
       line.setAttribute("stroke", canvasColor(edge.color));
       line.setAttribute("stroke-width", "2");
+      line.dataset.edgeId = edge.id;
+      line.style.pointerEvents = "stroke";
+      line.style.cursor = "pointer";
+      const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      tip.textContent = edge.label ? `Connection: ${edge.label}` : "Connection — select to edit";
+      line.append(tip);
+      if (edge.id === selectedCanvasEdgeId) {
+        line.setAttribute("stroke-width", "3.5");
+        line.style.opacity = "1";
+      }
       if (edge.fromEnd === "arrow") line.setAttribute("marker-start", "url(#canvas-arrow)");
       if (edge.toEnd === "arrow") line.setAttribute("marker-end", "url(#canvas-arrow)");
       ui.canvasEdges.append(line);
@@ -695,7 +788,7 @@
         });
         card.append(text);
       } else if (node.type === "file") {
-        const note = state.notes.find((item) => item.id === node.pinboardNoteId);
+        const note = state.notes.find((item) => item.id === node.xPinNoteId);
         const link = document.createElement("button");
         link.type = "button";
         link.className = "canvas-note-link";
@@ -743,14 +836,15 @@
 
   function switchView(view) {
     featureSuite?.deactivate();
+    hideEdgeEditor();
     state.view = view === "canvas" ? "canvas" : "notes";
     const isCanvas = state.view === "canvas";
-    ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : "Recently edited");
+    ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : "Recent notes");
     byId("notes-toolbar").hidden = isCanvas;
     byId("notes-layout").hidden = isCanvas;
     ui.canvasView.hidden = !isCanvas;
     byId("new-folder").hidden = isCanvas;
-    ui.pageTitle.innerHTML = `${isCanvas ? "Canvas" : (state.tagFilter ? `Tag ${escapeText(state.tagFilter)}` : state.filter === "all" ? "Your notes" : escapeText(state.filter === "pinned" ? "Pinned" : "Recently edited"))}<span class="title-period">.</span>`;
+    ui.pageTitle.innerHTML = `${isCanvas ? "Canvas" : (state.tagFilter ? `Tag ${escapeText(state.tagFilter)}` : state.filter === "all" ? "Your notes" : escapeText(state.filter === "pinned" ? "Pinned" : "Recent notes"))}<span class="title-period">.</span>`;
     byId("notes-heading").querySelector(".page-subtitle").textContent = isCanvas
       ? "Arrange notes, fragments, and links into a visual map."
       : "A home for the thoughts worth keeping.";
@@ -813,9 +907,17 @@
   function removeCanvasNode(nodeId) {
     const board = currentCanvas();
     if (!board) return;
-    board.nodes = board.nodes.filter((node) => node.id !== nodeId);
+    const node = board.nodes.find((item) => item.id === nodeId);
+    if (!node) return;
+    const label = node.type === "text"
+      ? `“${node.text.trim().split("\n")[0].slice(0, 40) || "Text card"}”`
+      : node.type === "file" ? "this note reference" : node.type === "link" ? "this web link" : "this group";
+    if (!window.confirm(`Remove ${label} from the board? This cannot be undone.`)) return;
+    hideEdgeEditor();
+    board.nodes = board.nodes.filter((item) => item.id !== nodeId);
     board.edges = board.edges.filter((edge) => edge.fromNode !== nodeId && edge.toNode !== nodeId);
     if (selectedCanvasNodeId === nodeId) selectedCanvasNodeId = null;
+    if (selectedCanvasEdgeId && !board.edges.some((edge) => edge.id === selectedCanvasEdgeId)) selectedCanvasEdgeId = null;
     renderCanvas();
     saveCanvasSoon();
   }
@@ -831,6 +933,180 @@
     board.edges.push({ id: makeId("edge"), fromNode, toNode, toEnd: "arrow", color: "5" });
     renderCanvas();
     saveCanvasSoon();
+  }
+
+  const EDGE_SIDES = ["top", "right", "bottom", "left"];
+  const EDGE_COLORS = [["1", "Coral"], ["2", "Amber"], ["3", "Sand"], ["4", "Mint"], ["5", "Cyan"], ["6", "Lavender"]];
+
+  function hideEdgeEditor() {
+    selectedCanvasEdgeId = null;
+    if (canvasEdgeEditor) canvasEdgeEditor.hidden = true;
+  }
+
+  function removeCanvasEdge(edgeId) {
+    const board = currentCanvas();
+    if (!board || !board.edges.some((edge) => edge.id === edgeId)) return;
+    if (!window.confirm("Delete this connection? This cannot be undone.")) return;
+    hideEdgeEditor();
+    board.edges = board.edges.filter((edge) => edge.id !== edgeId);
+    renderCanvas();
+    saveCanvasSoon();
+  }
+
+  function renameCanvasBoard() {
+    const board = currentCanvas();
+    if (!board) return;
+    const name = window.prompt("Rename this board:", board.name);
+    if (name === null) return;
+    const cleanName = name.trim().slice(0, 100);
+    if (!cleanName) return showToast("Board names cannot be empty.");
+    board.name = cleanName;
+    renderCanvas();
+    updateCanvasSaveStatus(persistWorkspace());
+    showToast("Board renamed.");
+  }
+
+  function deleteCanvasBoard() {
+    const board = currentCanvas();
+    if (!board) return;
+    if (state.canvases.length <= 1) return showToast("Keep at least one board — rename it instead.");
+    const cardCount = board.nodes.length;
+    if (!window.confirm(`Delete the board “${board.name}”?${cardCount ? ` Its ${cardCount} ${cardCount === 1 ? "card" : "cards"} will go too.` : ""} This cannot be undone.`)) return;
+    hideEdgeEditor();
+    state.canvases = state.canvases.filter((canvas) => canvas.id !== board.id);
+    state.selectedCanvasId = state.canvases[0]?.id ?? null;
+    selectedCanvasNodeId = null;
+    renderCanvas();
+    updateCanvasSaveStatus(persistWorkspace());
+    showToast("Board deleted.");
+  }
+
+  function ensureEdgeEditor() {
+    if (canvasEdgeEditor) return canvasEdgeEditor;
+    const panel = document.createElement("div");
+    panel.id = "canvas-edge-editor";
+    panel.hidden = true;
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "Edit connection");
+    Object.assign(panel.style, {
+      position: "fixed", zIndex: "70", width: "252px", boxSizing: "border-box",
+      background: "var(--sidebar)", border: "1px solid #28454e", borderRadius: "10px",
+      padding: "12px", boxShadow: "0 12px 32px rgba(0,0,0,.5)",
+      color: "var(--ink)", fontFamily: "var(--sans)", fontSize: "12px"
+    });
+    const inputStyle = "width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;border:1px solid #28454e;border-radius:6px;background:#0a1d26;color:var(--ink);font-size:12px;";
+    const sideOptions = ['<option value="">Auto</option>', ...EDGE_SIDES.map((side) =>
+      `<option value="${side}">${side[0].toLocaleUpperCase()}${side.slice(1)}</option>`)].join("");
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <strong style="font-size:11px;letter-spacing:.08em;color:var(--muted);">CONNECTION</strong>
+        <button type="button" data-edge-close aria-label="Close connection editor" style="border:0;background:transparent;color:var(--muted);font-size:16px;cursor:pointer;line-height:1;">×</button>
+      </div>
+      <label style="display:block;margin-bottom:10px;color:var(--muted);">Label
+        <input type="text" data-edge-label maxlength="120" placeholder="Describe this link…" style="${inputStyle}">
+      </label>
+      <div style="display:flex;gap:8px;margin-bottom:10px;">
+        <label style="flex:1;color:var(--muted);">From side
+          <select data-edge-fromside style="${inputStyle}">${sideOptions}</select>
+        </label>
+        <label style="flex:1;color:var(--muted);">To side
+          <select data-edge-toside style="${inputStyle}">${sideOptions}</select>
+        </label>
+      </div>
+      <div style="display:flex;gap:14px;margin-bottom:10px;color:var(--muted);">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" data-edge-fromend> Arrow at start</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" data-edge-toend> Arrow at end</label>
+      </div>
+      <label style="display:block;color:var(--muted);">Color
+        <select data-edge-color style="${inputStyle};margin-bottom:12px;"></select>
+      </label>
+      <button type="button" data-edge-delete style="width:100%;padding:7px 8px;border:1px solid rgba(255,117,93,.4);border-radius:6px;background:rgba(255,117,93,.08);color:#ff9a87;font-size:12px;cursor:pointer;">Delete connection</button>`;
+    const field = (name) => panel.querySelector(`[data-edge-${name}]`);
+    const currentEdge = () => currentCanvas()?.edges.find((edge) => edge.id === selectedCanvasEdgeId);
+    const apply = (mutate) => {
+      const edge = currentEdge();
+      if (!edge) return;
+      mutate(edge);
+      renderCanvas();
+      saveCanvasSoon();
+    };
+    field("label").addEventListener("input", (event) => apply((edge) => {
+      const value = event.target.value.slice(0, 120);
+      if (value.trim()) edge.label = value;
+      else delete edge.label;
+    }));
+    field("fromside").addEventListener("change", (event) => apply((edge) => {
+      if (EDGE_SIDES.includes(event.target.value)) edge.fromSide = event.target.value;
+      else delete edge.fromSide;
+    }));
+    field("toside").addEventListener("change", (event) => apply((edge) => {
+      if (EDGE_SIDES.includes(event.target.value)) edge.toSide = event.target.value;
+      else delete edge.toSide;
+    }));
+    field("fromend").addEventListener("change", (event) => apply((edge) => {
+      edge.fromEnd = event.target.checked ? "arrow" : "none";
+    }));
+    field("toend").addEventListener("change", (event) => apply((edge) => {
+      edge.toEnd = event.target.checked ? "arrow" : "none";
+    }));
+    field("color").addEventListener("change", (event) => apply((edge) => {
+      edge.color = event.target.value;
+    }));
+    field("delete").addEventListener("click", () => {
+      if (selectedCanvasEdgeId) removeCanvasEdge(selectedCanvasEdgeId);
+    });
+    field("close").addEventListener("click", () => {
+      hideEdgeEditor();
+      renderCanvas();
+    });
+    document.body.append(panel);
+    canvasEdgeEditor = panel;
+    return panel;
+  }
+
+  function openEdgeEditor(clientX, clientY) {
+    const board = currentCanvas();
+    const edge = board?.edges.find((item) => item.id === selectedCanvasEdgeId);
+    const panel = ensureEdgeEditor();
+    if (!edge) {
+      panel.hidden = true;
+      return;
+    }
+    const field = (name) => panel.querySelector(`[data-edge-${name}]`);
+    field("label").value = edge.label ?? "";
+    field("fromside").value = edge.fromSide ?? "";
+    field("toside").value = edge.toSide ?? "";
+    field("fromend").checked = edge.fromEnd === "arrow";
+    field("toend").checked = edge.toEnd === "arrow";
+    const colorField = field("color");
+    colorField.replaceChildren();
+    EDGE_COLORS.forEach(([value, name]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = name;
+      colorField.append(option);
+    });
+    if (typeof edge.color === "string" && /^#[0-9a-f]{6}$/i.test(edge.color)) {
+      const custom = document.createElement("option");
+      custom.value = edge.color;
+      custom.textContent = "Custom";
+      colorField.append(custom);
+    }
+    colorField.value = typeof edge.color === "string" ? edge.color : "5";
+    const x = Math.max(8, Math.min(clientX ?? window.innerWidth / 2, window.innerWidth - 268));
+    const y = Math.max(8, Math.min(clientY ?? 120, window.innerHeight - 340));
+    panel.style.left = `${x}px`;
+    panel.style.top = `${y}px`;
+    panel.hidden = false;
+  }
+
+  function selectCanvasEdge(edgeId, clientX, clientY) {
+    const board = currentCanvas();
+    if (!board?.edges.some((edge) => edge.id === edgeId)) return;
+    selectedCanvasEdgeId = edgeId;
+    selectedCanvasNodeId = null;
+    renderCanvas();
+    openEdgeEditor(clientX, clientY);
   }
 
   function beginCanvasGesture(event, kind, node) {
@@ -900,6 +1176,10 @@
       line.setAttribute("y2", String(toPoint.y));
       line.setAttribute("stroke", canvasColor(edge.color));
       line.setAttribute("stroke-width", "2");
+      line.dataset.edgeId = edge.id;
+      line.style.pointerEvents = "stroke";
+      line.style.cursor = "pointer";
+      if (edge.id === selectedCanvasEdgeId) line.setAttribute("stroke-width", "3.5");
       if (edge.fromEnd === "arrow") line.setAttribute("marker-start", "url(#canvas-arrow)");
       if (edge.toEnd === "arrow") line.setAttribute("marker-end", "url(#canvas-arrow)");
       ui.canvasEdges.append(line);
@@ -925,7 +1205,7 @@
     if (value.nodes.some((node) =>
       node && ((node.type === "text" && typeof node.text === "string" && node.text.length > 100_000) ||
         (node.type === "file" && typeof node.file === "string" && node.file.length > 240) ||
-        (node.type === "file" && typeof node.pinboardNoteId === "string" && node.pinboardNoteId.length > 100) ||
+        (node.type === "file" && typeof node.xPinNoteId === "string" && node.xPinNoteId.length > 100) ||
         (node.type === "group" && typeof node.label === "string" && node.label.length > 100) ||
         (node.type === "group" && typeof node.background === "string" && node.background.length > 240))
     ) || value.edges.some((edge) => edge && typeof edge.label === "string" && edge.label.length > 120)) {
@@ -954,7 +1234,7 @@
     const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `${board.name.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "pinboard"}.canvas`;
+    anchor.download = `${board.name.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "xPin"}.canvas`;
     anchor.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     canvasStatus("Canvas exported as JSON Canvas 1.0");
@@ -1130,13 +1410,26 @@
         : null;
     }
     if (provider === "figma" && ["figma.com", "www.figma.com"].includes(host) && /^\/(file|design|board)\/[A-Za-z0-9]+/.test(url.pathname)) {
-      return { kind: "frame", url: `https://www.figma.com/embed?embed_host=pinboard&url=${encodeURIComponent(url.href)}`, label: "Figma file" };
+      return { kind: "frame", url: `https://www.figma.com/embed?embed_host=xPin&url=${encodeURIComponent(url.href)}`, label: "Figma file" };
     }
     if (provider === "drive" && ["drive.google.com", "docs.google.com"].includes(host)) {
-      const fileId = url.pathname.match(/\/(?:file\/d|document\/d|spreadsheets\/d|presentation\/d)\/([A-Za-z0-9_-]{8,})/)?.[1];
-      return fileId && host === "drive.google.com"
-        ? { kind: "frame", url: `https://drive.google.com/file/d/${fileId}/preview`, label: "Google Drive file" }
-        : null;
+      const idPattern = "([A-Za-z0-9_-]{8,})";
+      if (host === "drive.google.com") {
+        const pathId = url.pathname.match(new RegExp(`/(?:file/d|drive/folders)/${idPattern}`))?.[1];
+        const paramId = url.searchParams.get("id");
+        const fileId = pathId ?? (/^[A-Za-z0-9_-]{8,}$/.test(paramId ?? "") ? paramId : null);
+        if (!fileId) return null;
+        if (url.pathname.includes("/drive/folders/")) {
+          return { kind: "frame", url: `https://drive.google.com/embeddedfolderview?id=${fileId}#list`, label: "Google Drive folder" };
+        }
+        return { kind: "frame", url: `https://drive.google.com/file/d/${fileId}/preview`, label: "Google Drive file" };
+      }
+      const docMatch = url.pathname.match(new RegExp(`^/(document|spreadsheets|presentation)/d/${idPattern}`));
+      if (!docMatch) return null;
+      const [, docKind, docId] = docMatch;
+      const label = docKind === "document" ? "Google Doc" : docKind === "spreadsheets" ? "Google Sheet" : "Google Slides";
+      const embedPath = docKind === "presentation" ? "embed" : "preview";
+      return { kind: "frame", url: `https://docs.google.com/${docKind}/d/${docId}/${embedPath}`, label };
     }
     if (provider === "typeform" && ["typeform.com", "www.typeform.com", "form.typeform.com"].includes(host)) {
       const formId = url.pathname.match(/\/to\/([A-Za-z0-9]+)/)?.[1];
@@ -1386,6 +1679,8 @@
 
   function renderEditor() {
     const note = currentNote();
+    hideLinkSuggestions();
+    renderBacklinks();
     ui.editorFields.hidden = !note;
     ui.editorEmpty.hidden = Boolean(note);
     ui.pinButton.disabled = !note;
@@ -1447,6 +1742,229 @@
     ui.noteParent.value = note.parentNoteId ?? "";
   }
 
+  function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function findBacklinks(note) {
+    const title = note.title.trim();
+    const linkPattern = title ? new RegExp(`\\[\\[${escapeRegExp(title)}\\]\\]`, "i") : null;
+    return state.notes
+      .filter((other) => other.id !== note.id &&
+        (other.parentNoteId === note.id || (linkPattern !== null && linkPattern.test(other.body))))
+      .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" }));
+  }
+
+  function renderBacklinks() {
+    const note = currentNote();
+    const meta = byId("editor-fields")?.querySelector(".note-meta");
+    let section = byId("backlinks-section");
+    if (!note || !meta) {
+      section?.remove();
+      return;
+    }
+    if (!section) {
+      section = document.createElement("div");
+      section.id = "backlinks-section";
+      section.className = "backlinks";
+      section.setAttribute("aria-label", "Notes linking here");
+      meta.insertAdjacentElement("afterend", section);
+    }
+    section.replaceChildren();
+    const heading = document.createElement("div");
+    heading.className = "backlinks-heading";
+    heading.textContent = "LINKED HERE";
+    section.append(heading);
+    const backlinks = findBacklinks(note);
+    if (!backlinks.length) {
+      const empty = document.createElement("p");
+      empty.className = "backlinks-empty";
+      empty.textContent = "No notes link here yet.";
+      section.append(empty);
+      return;
+    }
+    backlinks.forEach((other) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "backlink-row";
+      row.title = other.parentNoteId === note.id ? "Sub-page — open" : "Links here — open";
+      const label = document.createElement("span");
+      label.textContent = other.title.trim() || "Untitled note";
+      row.append(label);
+      if (other.parentNoteId === note.id) {
+        const tag = document.createElement("span");
+        tag.className = "backlink-tag";
+        tag.textContent = "SUB-PAGE";
+        row.append(tag);
+      }
+      row.addEventListener("click", () => selectNote(other.id));
+      section.append(row);
+    });
+  }
+
+  /* ---------- [[ page-link autocomplete ---------- */
+  let linkSuggestMenu = null;
+  let linkSuggestItems = [];
+  let linkSuggestIndex = 0;
+  let linkTriggerStart = -1;
+
+  function hideLinkSuggestions() {
+    if (linkSuggestMenu) linkSuggestMenu.hidden = true;
+    linkSuggestItems = [];
+    linkSuggestIndex = 0;
+    linkTriggerStart = -1;
+  }
+
+  function caretViewportOffset(textarea, position) {
+    // Mirror-div caret measurement: copy the textarea's text metrics into an
+    // invisible div, mark the caret with a zero-width span, and read its offset.
+    const mirror = document.createElement("div");
+    const style = window.getComputedStyle(textarea);
+    ["fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing",
+      "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
+      "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth",
+      "textTransform", "wordSpacing", "textIndent"].forEach((property) => {
+      mirror.style[property] = style[property];
+    });
+    mirror.style.position = "absolute";
+    mirror.style.visibility = "hidden";
+    mirror.style.whiteSpace = "pre-wrap";
+    mirror.style.wordWrap = "break-word";
+    mirror.style.overflowWrap = "break-word";
+    mirror.style.width = `${textarea.clientWidth}px`;
+    mirror.textContent = textarea.value.slice(0, position);
+    const marker = document.createElement("span");
+    marker.textContent = "​";
+    mirror.append(marker);
+    document.body.append(mirror);
+    const markerRect = marker.getBoundingClientRect();
+    const fieldRect = textarea.getBoundingClientRect();
+    const top = markerRect.top - fieldRect.top;
+    const left = markerRect.left - fieldRect.left;
+    mirror.remove();
+    return { top, left };
+  }
+
+  function renderLinkSuggestions() {
+    if (!linkSuggestMenu) {
+      linkSuggestMenu = document.createElement("div");
+      linkSuggestMenu.className = "link-suggest";
+      linkSuggestMenu.setAttribute("role", "listbox");
+      linkSuggestMenu.setAttribute("aria-label", "Link to a note");
+      linkSuggestMenu.hidden = true;
+      document.body.append(linkSuggestMenu);
+    }
+    linkSuggestMenu.replaceChildren();
+    if (!linkSuggestItems.length) {
+      linkSuggestMenu.hidden = true;
+      return;
+    }
+    linkSuggestIndex = Math.max(0, Math.min(linkSuggestIndex, linkSuggestItems.length - 1));
+    linkSuggestItems.forEach((item, index) => {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = `link-suggest-option${index === linkSuggestIndex ? " is-active" : ""}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(index === linkSuggestIndex));
+      option.textContent = item.title.trim() || "Untitled note";
+      option.addEventListener("mousedown", (event) => event.preventDefault());
+      option.addEventListener("click", () => completeLinkSuggestion(item));
+      option.addEventListener("mouseenter", () => {
+        linkSuggestIndex = index;
+        renderLinkSuggestions();
+      });
+      linkSuggestMenu.append(option);
+    });
+    try {
+      const caret = caretViewportOffset(ui.noteBody, ui.noteBody.selectionStart);
+      const fieldRect = ui.noteBody.getBoundingClientRect();
+      const lineHeight = Number.parseFloat(window.getComputedStyle(ui.noteBody).lineHeight) || 20;
+      linkSuggestMenu.style.left = `${Math.max(8, Math.min(fieldRect.left + caret.left, window.innerWidth - 260))}px`;
+      linkSuggestMenu.style.top = `${fieldRect.top + caret.top + lineHeight + 4}px`;
+    } catch (error) {
+      linkSuggestMenu.style.left = "24px";
+      linkSuggestMenu.style.top = "50%";
+    }
+    linkSuggestMenu.hidden = false;
+  }
+
+  function updateLinkSuggestions() {
+    const note = currentNote();
+    const caret = ui.noteBody.selectionStart;
+    const before = ui.noteBody.value.slice(0, caret);
+    const match = before.match(/\[\[([^\[\]\n]*)$/);
+    if (!match) {
+      hideLinkSuggestions();
+      return;
+    }
+    linkTriggerStart = caret - match[0].length;
+    const query = match[1].toLocaleLowerCase();
+    linkSuggestItems = state.notes
+      .filter((item) => (!note || item.id !== note.id) &&
+        item.title.toLocaleLowerCase().includes(query))
+      .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" }))
+      .slice(0, 8);
+    linkSuggestIndex = 0;
+    renderLinkSuggestions();
+  }
+
+  function completeLinkSuggestion(item) {
+    const textarea = ui.noteBody;
+    const caret = textarea.selectionStart;
+    if (linkTriggerStart < 0 || caret < linkTriggerStart) {
+      // The caret moved away from the trigger (e.g. arrow keys) after the
+      // suggestions appeared — re-scan from the current position instead of
+      // throwing IndexSizeError in setRangeText.
+      const before = textarea.value.slice(0, caret);
+      const match = before.match(/\[\[([^\[\]\n]*)$/);
+      if (!match) { hideLinkSuggestions(); return; }
+      linkTriggerStart = caret - match[0].length;
+    }
+    const title = item.title.trim() || "Untitled note";
+    const insertion = `[[${title}]]`;
+    textarea.setRangeText(insertion, linkTriggerStart, caret, "end");
+    let end = linkTriggerStart + insertion.length;
+    if (textarea.value.slice(end, end + 2) === "]]") {
+      // Consume the auto-closed brackets left by the editor's bracket pairing.
+      textarea.setRangeText("", end, end + 2, "end");
+    }
+    textarea.setSelectionRange(end, end);
+    hideLinkSuggestions();
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.focus();
+  }
+
+  function setupLinkAutocomplete() {
+    ui.noteBody.addEventListener("input", () => {
+      const slashMenu = document.querySelector(".slash-command-menu");
+      if (slashMenu && !slashMenu.hidden) {
+        hideLinkSuggestions();
+        return;
+      }
+      updateLinkSuggestions();
+    });
+    ui.noteBody.addEventListener("keydown", (event) => {
+      if (event.defaultPrevented) return;
+      if (!linkSuggestMenu || linkSuggestMenu.hidden || !linkSuggestItems.length) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        linkSuggestIndex = (linkSuggestIndex + (event.key === "ArrowDown" ? 1 : -1) + linkSuggestItems.length) % linkSuggestItems.length;
+        renderLinkSuggestions();
+      } else if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        completeLinkSuggestion(linkSuggestItems[linkSuggestIndex]);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        hideLinkSuggestions();
+      }
+      event.stopPropagation();
+    });
+    ui.noteBody.addEventListener("blur", () => {
+      window.setTimeout(hideLinkSuggestions, 120);
+    });
+    ui.noteBody.addEventListener("scroll", hideLinkSuggestions);
+  }
+
   function renderPluginPanels() {
     if (!ui.pluginPanels) return;
     ui.pluginPanels.replaceChildren();
@@ -1468,7 +1986,7 @@
         if (!(content instanceof Node)) throw new TypeError(`Panel "${panel.title}" did not return a DOM node.`);
         wrapper.append(content);
       } catch (error) {
-        console.error(`Pinboard plugin panel "${panel.title}" failed.`, error);
+        console.error(`xPin plugin panel "${panel.title}" failed.`, error);
         const message = document.createElement("p");
         message.className = "plugin-error";
         message.textContent = "This feature could not be displayed.";
@@ -1490,12 +2008,19 @@
         if (!(content instanceof Node)) throw new TypeError(`Status item "${item.id}" did not return a DOM node.`);
         ui.editorStatus.append(content);
       } catch (error) {
-        console.error(`Pinboard plugin status item "${item.id}" failed.`, error);
+        console.error(`xPin plugin status item "${item.id}" failed.`, error);
         const message = document.createElement("span");
         message.className = "plugin-error";
         message.textContent = "Feature unavailable";
         ui.editorStatus.append(message);
       }
+    });
+    extensionStatusItems.forEach((item) => {
+      const status = document.createElement("span");
+      status.className = "extension-status-item";
+      status.dataset.pluginId = item.pluginId;
+      status.textContent = item.text;
+      ui.editorStatus.append(status);
     });
   }
 
@@ -1511,6 +2036,17 @@
       if (command.pluginId === pluginId) extensionCommands.delete(key);
     }
     if (!ui.commandsModal.hidden) renderCommands();
+  }
+
+  function removeExtensionStatusItems(pluginId) {
+    let changed = false;
+    for (const key of extensionStatusItems.keys()) {
+      if (extensionStatusItems.get(key).pluginId === pluginId) {
+        extensionStatusItems.delete(key);
+        changed = true;
+      }
+    }
+    if (changed) renderEditorStatus();
   }
 
   function copyPluginValue(value) {
@@ -1549,6 +2085,37 @@
       if (folderId !== null && typeof folderId !== "string") throw new TypeError("Plugin folder id is invalid.");
       return createNote({ title: options.title, body: options.body, folderId });
     }
+    if (capability === "notes:update") {
+      if (typeof payload?.id !== "string") throw new TypeError("Plugin note update requires a note id.");
+      const patch = payload?.patch;
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new TypeError("Plugin note update requires a patch object with title and/or body.");
+      }
+      const changes = {};
+      if (patch.title !== undefined) {
+        if (typeof patch.title !== "string" || patch.title.length > 120) {
+          throw new TypeError("Plugin note title must be text under 120 characters.");
+        }
+        changes.title = patch.title;
+      }
+      if (patch.body !== undefined) {
+        if (typeof patch.body !== "string" || patch.body.length > 100_000) {
+          throw new TypeError("Plugin note body must be text under 100 KB.");
+        }
+        changes.body = patch.body;
+      }
+      if (!Object.keys(changes).length) throw new TypeError("Plugin note update changed nothing.");
+      const note = state.notes.find((item) => item.id === payload.id);
+      if (!note) throw new Error("The note no longer exists.");
+      Object.assign(note, changes, { updatedAt: new Date().toISOString() });
+      refreshNoteRow(note.id);
+      if (note.id === selectedNoteId) renderEditor();
+      pluginManager?.emit("note:updated", { ...note });
+      renderPluginPanels();
+      renderEditorStatus();
+      persistWorkspace();
+      return { ...note };
+    }
     if (capability === "editor:write") {
       if (typeof payload?.text !== "string" || payload.text.length > 5_000) {
         throw new TypeError("Plugin editor insertion must be text under 5 KB.");
@@ -1567,6 +2134,31 @@
       }
       showToast(payload.message);
       return true;
+    }
+    if (capability === "ui:status") {
+      const action = payload?.action;
+      if (action === "clear") {
+        if (typeof payload?.id !== "string" || !payload.id) throw new TypeError("Plugin status item needs an id.");
+        extensionStatusItems.delete(`${plugin.manifest.id}:${payload.id}`);
+        renderEditorStatus();
+        return true;
+      }
+      if (action === "set") {
+        const item = payload?.item;
+        if (!item || typeof item !== "object" || Array.isArray(item) ||
+          typeof item.id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(item.id) ||
+          typeof item.text !== "string" || !item.text.trim() || item.text.length > 80) {
+          throw new TypeError("Plugin status item needs an id and text under 80 characters.");
+        }
+        extensionStatusItems.set(`${plugin.manifest.id}:${item.id}`, {
+          pluginId: plugin.manifest.id,
+          id: item.id,
+          text: item.text.trim()
+        });
+        renderEditorStatus();
+        return true;
+      }
+      throw new TypeError("Unknown plugin status action.");
     }
     if (capability === "commands:register") {
       const command = payload;
@@ -1605,15 +2197,37 @@
 
   async function startExtension(plugin) {
     if (activeExtensions.has(plugin.manifest.id)) return;
-    const sandbox = window.PinboardSandbox.create({
+    if (plugin.reviewStatus && plugin.reviewStatus !== "approved") {
+      throw new Error(`"${plugin.manifest.name}" has not been approved yet. Review it in the plugin catalogue first.`);
+    }
+    // Defense in depth: an approved plugin must never run with capabilities it
+    // did not declare. Grants are sanitized on load and on approval, so reaching
+    // here with a mismatch means the approval is stale — send it back to review.
+    const revoked = plugin.grants.filter((grant) => !plugin.manifest.permissions.includes(grant));
+    if (revoked.length) {
+      plugin.enabled = false;
+      plugin.grants = [];
+      plugin.approvedHash = null;
+      plugin.reviewStatus = "pending";
+      plugin.reviewReason = "Its approved capabilities changed since review.";
+      plugin.reviewedAt = null;
+      persistWorkspace();
+      renderPluginManager();
+      throw new Error(`"${plugin.manifest.name}" was sent back for review because its approved capabilities changed.`);
+    }
+    const sandbox = window.xPinSandbox.create({
       plugin,
       permissions: plugin.grants,
       onRequest: (capability, payload) => handleExtensionRequest(plugin, capability, payload),
+      onWarning(warning) {
+        showToast(`${plugin.manifest.name}: ${warning.message}`);
+      },
       onError(error) {
-        console.error(`Imported Pinboard plugin "${plugin.manifest.name}" stopped.`, error);
+        console.error(`Imported xPin plugin "${plugin.manifest.name}" stopped.`, error);
         plugin.enabled = false;
         activeExtensions.delete(plugin.manifest.id);
         removeExtensionCommands(plugin.manifest.id);
+        removeExtensionStatusItems(plugin.manifest.id);
         persistWorkspace();
         renderPluginManager();
         showToast(`${plugin.manifest.name} stopped: ${error.message}`);
@@ -1633,11 +2247,19 @@
     let updated = false;
     for (const plugin of state.extensions) {
       if (!plugin.enabled) continue;
-      const actualHash = await window.PinboardSandbox.digestPackage(plugin);
+      if (plugin.reviewStatus === "rejected") {
+        plugin.enabled = false;
+        updated = true;
+        continue;
+      }
+      const actualHash = await window.xPinSandbox.digestPackage(plugin);
       if (!actualHash || actualHash !== plugin.sha256 || actualHash !== plugin.approvedHash) {
         plugin.enabled = false;
         plugin.grants = [];
         plugin.approvedHash = null;
+        plugin.reviewStatus = "pending";
+        plugin.reviewReason = "Its package changed since approval.";
+        plugin.reviewedAt = null;
         updated = true;
         showToast(`${plugin.manifest.name} needs permission review because its package changed.`);
         continue;
@@ -1648,7 +2270,7 @@
         plugin.enabled = false;
         updated = true;
         console.error(`Could not start imported plugin "${plugin.manifest.name}".`, error);
-        showToast(`${plugin.manifest.name} could not start. Review its package and permissions.`);
+        showToast(error.message || `${plugin.manifest.name} could not start. Review its package and permissions.`);
       }
     }
     if (updated) persistWorkspace();
@@ -1657,16 +2279,24 @@
 
   async function importPluginFile(file) {
     if (!file) return;
-    if (file.size > window.PinboardSandbox.maxPackageBytes) {
-      throw new TypeError(`Plugin package must be smaller than ${window.PinboardSandbox.maxPackageBytes / 1000} KB.`);
+    if (file.size > window.xPinSandbox.maxPackageBytes) {
+      throw new TypeError(`Plugin package must be smaller than ${window.xPinSandbox.maxPackageBytes / 1000} KB. This file is ${Math.round(file.size / 1000)} KB.`);
     }
-    const parsed = JSON.parse(await file.text());
-    const plugin = window.PinboardSandbox.validatePackage(parsed);
-    if (pluginManager.plugins().some((item) => item.id === plugin.manifest.id) ||
-      state.extensions.some((item) => item.manifest.id === plugin.manifest.id)) {
-      throw new Error("A plugin with this id is already installed. Remove it before importing another version.");
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (error) {
+      throw new TypeError(`"${file.name}" is not valid JSON, so it can't be a plugin package.`);
     }
-    const sha256 = await window.PinboardSandbox.digestPackage(plugin);
+    const plugin = window.xPinSandbox.validatePackage(parsed);
+    const clash = state.extensions.find((item) => item.manifest.id === plugin.manifest.id);
+    if (pluginManager.plugins().some((item) => item.id === plugin.manifest.id)) {
+      throw new Error(`"${plugin.manifest.name}" clashes with a built-in xPin feature id. Pick a different plugin id.`);
+    }
+    if (clash) {
+      throw new Error(`"${clash.manifest.name}" v${clash.manifest.version} is already installed. Remove it first to import v${plugin.manifest.version}.`);
+    }
+    const sha256 = await window.xPinSandbox.digestPackage(plugin);
     if (!sha256) throw new Error("This browser cannot calculate a package fingerprint, so the plugin was not installed.");
     state.extensions.push({
       ...plugin,
@@ -1676,11 +2306,14 @@
       enabled: false,
       approvedHash: null,
       grants: [],
-      settings: {}
+      settings: {},
+      reviewStatus: "pending",
+      reviewReason: null,
+      reviewedAt: null
     });
     persistWorkspace();
     renderPluginManager();
-    showToast(`${plugin.manifest.name} was imported and is disabled until you review it.`);
+    showToast(`${plugin.manifest.name} was imported and is waiting for your review.`);
   }
 
   function openPluginConsent(plugin) {
@@ -1696,20 +2329,26 @@
       checkbox.type = "checkbox";
       checkbox.value = permission;
       checkbox.dataset.permission = permission;
+      // Requested capabilities start selected: reviewing means unchecking what
+      // the plugin should NOT have. Approving with none selected leaves the
+      // plugin unable to do anything, so that choice asks for confirmation.
+      checkbox.checked = true;
       const text = document.createElement("span");
       const name = document.createElement("strong");
       name.textContent = permission;
       const description = document.createElement("small");
-      description.textContent = window.PinboardSandbox.permissions[permission];
+      description.textContent = window.xPinSandbox.permissions[permission];
       text.append(name, description);
       label.append(checkbox, text);
       ui.pluginPermissions.append(label);
     });
     ui.pluginTrustCheckbox.checked = false;
     ui.allowPluginButton.disabled = true;
+    ui.pluginRejectRow.hidden = true;
+    ui.pluginRejectReason.value = "";
     ui.pluginConsentStatus.textContent = plugin.manifest.permissions.length
-      ? "Only permissions you select will be available."
-      : "This plugin requested no Pinboard capabilities.";
+      ? "Requested capabilities are pre-selected. Uncheck anything this plugin should not have."
+      : "This plugin requested no xPin capabilities.";
     ui.pluginConsentModal.hidden = false;
     document.body.classList.add("modal-open");
     byId("cancel-plugin-consent").focus();
@@ -1718,23 +2357,35 @@
   function closePluginConsent() {
     ui.pluginConsentModal.hidden = true;
     pendingPluginConsent = null;
-    if (ui.pluginsModal.hidden && ui.commandsModal.hidden) document.body.classList.remove("modal-open");
+    syncModalOpenClass();
     byId("open-plugins").focus();
   }
 
-  async function allowPendingPlugin() {
+  async function approvePendingPlugin() {
     const plugin = pendingPluginConsent;
     if (!plugin || !ui.pluginTrustCheckbox.checked) return;
-    plugin.grants = [...ui.pluginPermissions.querySelectorAll("[data-permission]:checked")]
-      .map((checkbox) => checkbox.dataset.permission);
+    const granted = [...ui.pluginPermissions.querySelectorAll("[data-permission]:checked")]
+      .map((checkbox) => checkbox.dataset.permission)
+      .filter((permission) => plugin.manifest.permissions.includes(permission));
+    if (!granted.length && plugin.manifest.permissions.length) {
+      const proceed = window.confirm(
+        `"${plugin.manifest.name}" asked for ${plugin.manifest.permissions.length} ` +
+        `capabilities and you granted none. It probably won't work. Approve anyway?`
+      );
+      if (!proceed) return;
+    }
+    plugin.grants = granted;
     plugin.approvedHash = plugin.sha256;
     plugin.enabled = true;
+    plugin.reviewStatus = "approved";
+    plugin.reviewReason = null;
+    plugin.reviewedAt = new Date().toISOString();
     closePluginConsent();
     try {
       await startExtension(plugin);
       persistWorkspace();
       renderPluginManager();
-      showToast(`${plugin.manifest.name} is enabled with ${plugin.grants.length} granted ${plugin.grants.length === 1 ? "permission" : "permissions"}.`);
+      showToast(`${plugin.manifest.name} is approved with ${plugin.grants.length} granted ${plugin.grants.length === 1 ? "capability" : "capabilities"}.`);
     } catch (error) {
       plugin.enabled = false;
       persistWorkspace();
@@ -1744,12 +2395,34 @@
     }
   }
 
+  function rejectPendingPlugin() {
+    const plugin = pendingPluginConsent;
+    if (!plugin) return;
+    const reason = ui.pluginRejectReason.value.trim();
+    if (!reason) {
+      ui.pluginConsentStatus.textContent = "Add a short reason so you remember why this package was rejected.";
+      ui.pluginRejectReason.focus();
+      return;
+    }
+    plugin.reviewStatus = "rejected";
+    plugin.reviewReason = reason.slice(0, 200);
+    plugin.reviewedAt = new Date().toISOString();
+    plugin.enabled = false;
+    plugin.grants = [];
+    plugin.approvedHash = null;
+    closePluginConsent();
+    persistWorkspace();
+    renderPluginManager();
+    showToast(`${plugin.manifest.name} was rejected and will not run.`);
+  }
+
   function disableExtension(plugin) {
     const sandbox = activeExtensions.get(plugin.manifest.id);
     activeExtensions.delete(plugin.manifest.id);
     plugin.enabled = false;
     sandbox?.stop();
     removeExtensionCommands(plugin.manifest.id);
+    removeExtensionStatusItems(plugin.manifest.id);
     persistWorkspace();
     renderPluginManager();
   }
@@ -1814,14 +2487,18 @@
       row.append(details, toggle);
       ui.pluginList.append(row);
     });
+    const statusWeight = { pending: 0, approved: 1, rejected: 2 };
     const extensions = state.extensions.map((sourcePlugin) => ({
       sourcePlugin,
       id: sourcePlugin.manifest.id,
       name: sourcePlugin.manifest.name,
       description: sourcePlugin.manifest.description,
       author: sourcePlugin.manifest.author,
-      category: "Imported"
-    })).filter(matches);
+      category: "Imported",
+      reviewStatus: sourcePlugin.reviewStatus === "rejected" ? "rejected"
+        : sourcePlugin.reviewStatus === "approved" ? "approved" : "pending"
+    })).filter(matches)
+      .sort((a, b) => (statusWeight[a.reviewStatus] ?? 1) - (statusWeight[b.reviewStatus] ?? 1));
     extensions.forEach((plugin) => {
       const { sourcePlugin } = plugin;
       const active = activeExtensions.has(plugin.id);
@@ -1831,6 +2508,13 @@
       details.className = "plugin-row-details";
       const name = document.createElement("strong");
       name.textContent = plugin.name;
+      const status = document.createElement("span");
+      status.className = `plugin-review-pill is-${plugin.reviewStatus}`;
+      status.textContent = plugin.reviewStatus === "pending" ? "Pending review"
+        : plugin.reviewStatus === "approved" ? "Approved" : "Rejected";
+      const titleLine = document.createElement("div");
+      titleLine.className = "plugin-title-line";
+      titleLine.append(name, status);
       const description = document.createElement("p");
       description.textContent = plugin.description;
       const provenance = document.createElement("small");
@@ -1840,26 +2524,76 @@
       permissions.textContent = active
         ? `GRANTED: ${sourcePlugin.grants.length ? sourcePlugin.grants.join(", ") : "no capabilities"}`
         : `REQUESTED: ${sourcePlugin.manifest.permissions.length ? sourcePlugin.manifest.permissions.join(", ") : "no capabilities"}`;
-      details.append(name, description, provenance, permissions);
+      details.append(titleLine, description, provenance, permissions);
+      if (sourcePlugin.reviewReason) {
+        const reason = document.createElement("small");
+        reason.className = "plugin-review-reason";
+        reason.textContent = plugin.reviewStatus === "rejected"
+          ? `Rejected: ${sourcePlugin.reviewReason}`
+          : sourcePlugin.reviewReason;
+        details.append(reason);
+      }
       const actions = document.createElement("div");
       actions.className = "imported-plugin-actions";
-      const toggle = document.createElement("button");
-      toggle.type = "button";
-      toggle.className = `plugin-toggle${active ? " is-enabled" : ""}`;
-      toggle.setAttribute("role", "switch");
-      toggle.setAttribute("aria-checked", String(active));
-      toggle.setAttribute("aria-label", `${active ? "Disable" : "Review and enable"} ${plugin.name}`);
-      toggle.innerHTML = `<span></span>`;
-      toggle.addEventListener("click", () => {
-        if (active) disableExtension(sourcePlugin);
-        else openPluginConsent(sourcePlugin);
-      });
+      if (plugin.reviewStatus === "pending") {
+        const review = document.createElement("button");
+        review.type = "button";
+        review.className = "plugin-review-button";
+        review.textContent = "Review";
+        review.setAttribute("aria-label", `Review ${plugin.name}`);
+        review.addEventListener("click", () => openPluginConsent(sourcePlugin));
+        actions.append(review);
+      } else if (plugin.reviewStatus === "approved") {
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = `plugin-toggle${active ? " is-enabled" : ""}`;
+        toggle.setAttribute("role", "switch");
+        toggle.setAttribute("aria-checked", String(active));
+        toggle.setAttribute("aria-label", `${active ? "Disable" : "Enable"} ${plugin.name}`);
+        toggle.innerHTML = `<span></span>`;
+        toggle.addEventListener("click", async () => {
+          if (active) {
+            disableExtension(sourcePlugin);
+            return;
+          }
+          toggle.disabled = true;
+          try {
+            await startExtension(sourcePlugin);
+            sourcePlugin.enabled = true;
+            persistWorkspace();
+            renderPluginManager();
+            showToast(`${plugin.name} is enabled.`);
+          } catch (error) {
+            sourcePlugin.enabled = false;
+            persistWorkspace();
+            renderPluginManager();
+            console.error(`Could not enable imported plugin "${plugin.name}".`, error);
+            showToast(error.message || `${plugin.name} could not start.`);
+          }
+        });
+        actions.append(toggle);
+      } else {
+        const rereview = document.createElement("button");
+        rereview.type = "button";
+        rereview.className = "plugin-review-button";
+        rereview.textContent = "Re-review";
+        rereview.setAttribute("aria-label", `Re-review ${plugin.name}`);
+        rereview.addEventListener("click", () => {
+          sourcePlugin.reviewStatus = "pending";
+          sourcePlugin.reviewReason = null;
+          sourcePlugin.reviewedAt = null;
+          persistWorkspace();
+          renderPluginManager();
+          openPluginConsent(sourcePlugin);
+        });
+        actions.append(rereview);
+      }
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "plugin-remove";
       remove.textContent = "Remove";
       remove.addEventListener("click", () => uninstallExtension(sourcePlugin));
-      actions.append(toggle, remove);
+      actions.append(remove);
       row.append(details, actions);
       ui.pluginList.append(row);
     });
@@ -1885,7 +2619,7 @@
 
   function closeDialog(dialog) {
     dialog.hidden = true;
-    if (ui.pluginsModal.hidden && ui.commandsModal.hidden && ui.pluginConsentModal.hidden) document.body.classList.remove("modal-open");
+    syncModalOpenClass();
     if (dialog === ui.pluginsModal) {
       byId("open-plugins").setAttribute("aria-expanded", "false");
       byId("open-plugins").focus();
@@ -1934,9 +2668,152 @@
     try {
       await command.run();
     } catch (error) {
-      console.error(`Pinboard command "${command.name}" failed.`, error);
+      console.error(`xPin command "${command.name}" failed.`, error);
       showToast(`${command.name} could not be completed.`);
     }
+  }
+
+  function setupSlashMenuKeyboard() {
+    document.addEventListener("keydown", (event) => {
+      const menu = document.querySelector(".slash-command-menu");
+      if (!menu || menu.hidden) return;
+      const options = [...menu.querySelectorAll(".slash-command-option")];
+      if (!options.length) return;
+      const editor = byId("note-body");
+      const active = document.activeElement;
+      if (active !== editor && !menu.contains(active)) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const current = options.indexOf(active);
+        const next = event.key === "ArrowDown"
+          ? options[(current + 1) % options.length]
+          : options[(current - 1 + options.length) % options.length];
+        next.focus();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        menu.hidden = true;
+        editor.focus();
+      }
+    }, true);
+  }
+
+  function openShortcutsDialog() {
+    if (!shortcutsDialog) {
+      const isMac = navigator.platform.toLocaleLowerCase().includes("mac");
+      const mod = isMac ? "⌘" : "Ctrl";
+      const rows = [
+        [[`${mod} P`], "Open the command palette"],
+        [[`${mod} K`], "Search your notes"],
+        [[`${mod} Shift C`], "Quick capture to today's note"],
+        [["N"], "New note"],
+        [["/"], "Focus the search box"],
+        [["?"], "Open this shortcuts reference"],
+        [["↑", "↓", "Enter"], "Move through the command palette and the slash menu"],
+        [["Esc"], "Close dialogs, menus, and the connection editor"],
+        [["Delete"], "Remove the selected canvas card (asks first)"],
+        [["Enter", "Space"], "Select the focused canvas card"],
+        [["←", "→", "↑", "↓"], "Nudge the focused canvas card (Shift: bigger steps · Alt: resize)"]
+      ];
+      const backdrop = document.createElement("div");
+      backdrop.className = "modal-backdrop";
+      backdrop.id = "shortcuts-modal";
+      backdrop.hidden = true;
+      const dialog = document.createElement("section");
+      dialog.className = "dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-labelledby", "shortcuts-title");
+      dialog.style.maxWidth = "440px";
+      const header = document.createElement("header");
+      header.className = "dialog-header";
+      header.innerHTML = '<div><div class="dialog-kicker">REFERENCE</div><h2 id="shortcuts-title">Keyboard shortcuts</h2></div>';
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "icon-button dialog-close";
+      closeButton.setAttribute("aria-label", "Close keyboard shortcuts");
+      closeButton.textContent = "×";
+      closeButton.addEventListener("click", closeShortcutsDialog);
+      header.append(closeButton);
+      const list = document.createElement("div");
+      list.style.cssText = "display:flex;flex-direction:column;gap:2px;padding:4px 0 12px;";
+      rows.forEach(([keys, description]) => {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:12px;padding:7px 4px;border-bottom:1px solid rgba(255,255,255,.05);";
+        const keyWrap = document.createElement("span");
+        keyWrap.style.cssText = "display:flex;gap:4px;min-width:128px;flex-wrap:wrap;";
+        keys.forEach((key) => {
+          const kbd = document.createElement("kbd");
+          kbd.textContent = key;
+          keyWrap.append(kbd);
+        });
+        const label = document.createElement("span");
+        label.style.color = "var(--muted)";
+        label.textContent = description;
+        row.append(keyWrap, label);
+        list.append(row);
+      });
+      const footer = document.createElement("footer");
+      footer.className = "dialog-footer";
+      const hint = document.createElement("span");
+      hint.textContent = "Press ? anywhere to reopen this.";
+      const done = document.createElement("button");
+      done.type = "button";
+      done.className = "dialog-done";
+      done.textContent = "Done";
+      done.addEventListener("click", closeShortcutsDialog);
+      footer.append(hint, done);
+      dialog.append(header, list, footer);
+      backdrop.append(dialog);
+      backdrop.addEventListener("click", (event) => {
+        if (event.target === backdrop) closeShortcutsDialog();
+      });
+      document.querySelector(".app-shell")?.append(backdrop);
+      shortcutsDialog = backdrop;
+    }
+    shortcutsDialog.hidden = false;
+    document.body.classList.add("modal-open");
+    shortcutsDialog.querySelector(".dialog-close").focus();
+  }
+
+  function closeShortcutsDialog() {
+    if (!shortcutsDialog) return;
+    shortcutsDialog.hidden = true;
+    syncModalOpenClass();
+    byId("open-shortcuts")?.focus();
+  }
+
+  function registerCoreCommands() {
+    const core = [
+      {
+        id: "core-quick-capture",
+        name: "Quick capture to today's note",
+        description: "Append a timestamped line to today's note without leaving your place",
+        run: () => openQuickCaptureDialog()
+      },
+      {
+        id: "core-new-from-template",
+        name: "New note from template…",
+        description: "Pick a template and create a note from it",
+        run: () => openTemplatePickerDialog()
+      },
+      {
+        id: "core-open-daily",
+        name: "Open today's note",
+        description: "Open or create the daily note",
+        run: () => openDailyNote()
+      },
+      {
+        id: "core-shortcuts",
+        name: "Keyboard shortcuts",
+        description: "Open the shortcuts reference",
+        run: () => openShortcutsDialog()
+      }
+    ];
+    core.forEach((command) => {
+      if (!extensionCommands.has(command.id)) {
+        extensionCommands.set(command.id, { ...command, pluginId: "core" });
+      }
+    });
   }
 
   function openCommandPalette() {
@@ -1960,10 +2837,11 @@
     renderEditorStatus();
     if (state.view === "canvas") renderCanvas();
     featureSuite?.render();
+    renderCoreToolsSections();
   }
 
   function selectNote(id) {
-    if (!state.notes.some((note) => note.id === id)) throw new Error(`Unknown Pinboard note: ${id}`);
+    if (!state.notes.some((note) => note.id === id)) throw new Error(`Unknown xPin note: ${id}`);
     flushSave();
     if (state.view !== "notes") switchView("notes");
     selectedNoteId = id;
@@ -1976,11 +2854,23 @@
     if (!note) return;
     Object.assign(note, changes, { updatedAt: new Date().toISOString() });
     ui.editorDate.textContent = `EDITED ${formatRelative(note.updatedAt).toLocaleUpperCase()}`;
-    renderList();
+    refreshNoteRow(note.id);
     pluginManager?.emit("note:updated", { ...note });
     renderPluginPanels();
     renderEditorStatus();
     scheduleSave();
+  }
+
+  let listRefreshTimer = null;
+  function refreshNoteRow(noteId) {
+    const note = state.notes.find((item) => item.id === noteId);
+    const existing = note ? ui.noteList.querySelector(`[data-note-id="${CSS.escape(noteId)}"]`) : null;
+    if (existing) existing.replaceWith(renderNoteRow(note));
+    window.clearTimeout(listRefreshTimer);
+    listRefreshTimer = window.setTimeout(() => {
+      listRefreshTimer = null;
+      renderList();
+    }, 600);
   }
 
   function setActiveFilter(filter) {
@@ -1991,23 +2881,27 @@
     });
   }
 
-  function createNote({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
+  function buildNoteRecord({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
     if (typeof title !== "string" || typeof body !== "string") {
       throw new TypeError("New note title and body must be text.");
     }
     if (folderId !== null && !state.folders.some((folder) => folder.id === folderId)) {
-      throw new Error(`Unknown Pinboard folder: ${folderId}`);
+      throw new Error(`Unknown xPin folder: ${folderId}`);
     }
     if (parentNoteId !== null && !state.notes.some((note) => note.id === parentNoteId)) {
-      throw new Error(`Unknown Pinboard parent page: ${parentNoteId}`);
+      throw new Error(`Unknown xPin parent page: ${parentNoteId}`);
     }
     if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
       throw new TypeError("New note metadata must be an object.");
     }
+    const now = new Date().toISOString();
+    return { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: { ...metadata } };
+  }
+
+  function createNote({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
+    const note = buildNoteRecord({ title, body, folderId, parentNoteId, metadata });
     if (state.view !== "notes") switchView("notes");
     flushSave();
-    const now = new Date().toISOString();
-    const note = { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: { ...metadata } };
     state.notes.push(note);
     setActiveFilter("all");
     ui.search.value = "";
@@ -2027,18 +2921,513 @@
     return `${year}-${month}-${day}`;
   }
 
-  function openDailyNote(dateKey = localDateKey()) {
+  function applyTemplatePlaceholders(content, { title = "" } = {}) {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, "0");
+    return String(content ?? "")
+      .replaceAll("{{date}}", localDateKey(now))
+      .replaceAll("{{time}}", `${pad(now.getHours())}:${pad(now.getMinutes())}`)
+      .replaceAll("{{title}}", String(title ?? ""));
+  }
+
+  function getOrCreateDailyNote(dateKey = localDateKey()) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) throw new TypeError("Daily note date must use YYYY-MM-DD.");
     const date = new Date(`${dateKey}T12:00:00`);
     if (Number.isNaN(date.getTime()) || localDateKey(date) !== dateKey) throw new TypeError("Daily note date is not a valid calendar day.");
     const existing = state.notes.find((note) => note.metadata?.dailyDate === dateKey);
-    if (existing) {
-      selectNote(existing.id);
-      showToast("Today's note is open.");
-      return existing;
-    }
+    if (existing) return { note: existing, created: false };
     const title = date.toLocaleDateString(undefined, { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-    return createNote({ title, metadata: { dailyDate: dateKey } });
+    const dailyTemplate = state.templates.find((template) => template.name.trim().toLocaleLowerCase() === "daily note");
+    const body = dailyTemplate ? applyTemplatePlaceholders(dailyTemplate.content, { title }) : "";
+    const note = buildNoteRecord({ title, body, metadata: { dailyDate: dateKey } });
+    state.notes.push(note);
+    pluginManager?.emit("note:created", { ...note });
+    return { note, created: true };
+  }
+
+  function openDailyNote(dateKey = localDateKey()) {
+    const { note, created } = getOrCreateDailyNote(dateKey);
+    if (!created) {
+      selectNote(note.id);
+      showToast("Today's note is open.");
+      return note;
+    }
+    if (state.view !== "notes") switchView("notes");
+    flushSave();
+    setActiveFilter("all");
+    ui.search.value = "";
+    selectedNoteId = note.id;
+    render();
+    persistWorkspace();
+    showToast("Your note is ready.");
+    return note;
+  }
+
+  function appendToDailyNote(text) {
+    const clean = String(text ?? "").trim();
+    if (!clean) {
+      showToast("Write something to capture first.");
+      return null;
+    }
+    const { note } = getOrCreateDailyNote(localDateKey());
+    const now = new Date();
+    const stamp = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    const entry = `- [${stamp}] ${clean}`;
+    const trimmed = note.body.replace(/\s+$/, "");
+    note.body = /^##\s+inbox\s*$/im.test(note.body)
+      ? `${trimmed}\n${entry}`
+      : `${trimmed}${trimmed ? "\n\n" : ""}## Inbox\n${entry}`;
+    note.updatedAt = new Date().toISOString();
+    refreshNoteRow(note.id);
+    if (note.id === selectedNoteId && ui.noteBody) {
+      // The daily note may be open in the editor right now. The textarea is the
+      // editor's source of truth on the next keystroke, so it must reflect the
+      // appended entry too — otherwise the next keystroke would overwrite
+      // note.body with the stale textarea value and silently drop the capture.
+      const field = ui.noteBody;
+      const focused = document.activeElement === field;
+      const caret = focused ? field.selectionStart ?? field.value.length : 0;
+      const atEnd = caret >= field.value.length;
+      field.value = note.body;
+      if (focused) {
+        const pos = atEnd ? field.value.length : Math.min(caret, field.value.length);
+        field.selectionStart = field.selectionEnd = pos;
+      }
+    }
+    pluginManager?.emit("note:updated", { ...note });
+    renderPluginPanels();
+    renderEditorStatus();
+    persistWorkspace();
+    showToast("Captured to today's note");
+    return note;
+  }
+
+  let quickCaptureDialog = null;
+  let captureReturnFocus = null;
+
+  function openQuickCaptureDialog() {
+    if (!quickCaptureDialog) {
+      const backdrop = document.createElement("div");
+      backdrop.className = "modal-backdrop";
+      backdrop.id = "quick-capture-modal";
+      backdrop.hidden = true;
+      const dialog = document.createElement("section");
+      dialog.className = "dialog quick-capture-dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-labelledby", "quick-capture-title");
+      const header = document.createElement("header");
+      header.className = "dialog-header";
+      header.innerHTML = '<div><div class="dialog-kicker">QUICK CAPTURE</div><h2 id="quick-capture-title">Capture to today\'s note</h2></div>';
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "icon-button dialog-close";
+      closeButton.setAttribute("aria-label", "Close quick capture");
+      closeButton.textContent = "×";
+      header.append(closeButton);
+      const field = document.createElement("textarea");
+      field.id = "quick-capture-input";
+      field.className = "quick-capture-input";
+      field.rows = 4;
+      field.maxLength = 2000;
+      field.placeholder = "What's on your mind?";
+      field.setAttribute("aria-label", "Capture text");
+      const footer = document.createElement("footer");
+      footer.className = "dialog-footer";
+      const hint = document.createElement("span");
+      hint.textContent = "Ctrl+Enter captures · Esc cancels";
+      const actions = document.createElement("span");
+      actions.className = "quick-capture-actions";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "dialog-button-secondary";
+      cancel.textContent = "Cancel";
+      const capture = document.createElement("button");
+      capture.type = "button";
+      capture.className = "dialog-done";
+      capture.textContent = "Capture";
+      actions.append(cancel, capture);
+      footer.append(hint, actions);
+      dialog.append(header, field, footer);
+      backdrop.append(dialog);
+      const close = () => {
+        backdrop.hidden = true;
+        syncModalOpenClass();
+        // Hand focus back where the user was — capture shouldn't displace them.
+        const target = captureReturnFocus;
+        captureReturnFocus = null;
+        if (target && document.contains(target) && typeof target.focus === "function") {
+          target.focus();
+        }
+      };
+      const submit = () => {
+        const value = field.value;
+        field.value = "";
+        close();
+        appendToDailyNote(value);
+      };
+      closeButton.addEventListener("click", close);
+      cancel.addEventListener("click", close);
+      capture.addEventListener("click", submit);
+      backdrop.addEventListener("click", (event) => {
+        if (event.target === backdrop) close();
+      });
+      field.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          close();
+        } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          submit();
+        }
+        event.stopPropagation();
+      });
+      document.querySelector(".app-shell")?.append(backdrop);
+      quickCaptureDialog = { backdrop, field, close };
+    }
+    const opener = document.activeElement;
+    captureReturnFocus = opener && !quickCaptureDialog.backdrop.contains(opener) ? opener : null;
+    quickCaptureDialog.field.value = "";
+    quickCaptureDialog.backdrop.hidden = false;
+    document.body.classList.add("modal-open");
+    quickCaptureDialog.field.focus();
+  }
+
+  /* ---------- note templates ---------- */
+  function findTemplate(id) {
+    return state.templates.find((template) => template.id === id) ?? null;
+  }
+
+  function addTemplate(name, content) {
+    const cleanName = String(name ?? "").trim().slice(0, 80);
+    if (!cleanName) {
+      showToast("Give your template a name first.");
+      return null;
+    }
+    if (state.templates.some((template) => template.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase())) {
+      showToast("A template with that name already exists.");
+      return null;
+    }
+    const template = { id: makeId("template"), name: cleanName, content: String(content ?? "").slice(0, 100_000) };
+    state.templates.push(template);
+    persistWorkspace();
+    renderCoreToolsSections(true);
+    showToast(`Template “${cleanName}” saved.`);
+    return template;
+  }
+
+  function deleteTemplate(id) {
+    const template = findTemplate(id);
+    if (!template) return;
+    if (!window.confirm(`Delete the “${template.name}” template? Notes made from it are not affected.`)) return;
+    state.templates = state.templates.filter((item) => item.id !== id);
+    persistWorkspace();
+    renderCoreToolsSections(true);
+    showToast("Template deleted.");
+  }
+
+  function saveCurrentNoteAsTemplate() {
+    const note = currentNote();
+    if (!note) {
+      showToast("Open a note first to save it as a template.");
+      return;
+    }
+    addTemplate(note.title.trim() || "Untitled template", note.body);
+  }
+
+  function createNoteFromTemplate(templateId) {
+    const template = findTemplate(templateId);
+    if (!template) {
+      showToast("That template is gone.");
+      return null;
+    }
+    const body = applyTemplatePlaceholders(template.content, { title: template.name });
+    const note = createNote({ title: template.name, body });
+    featureSuite?.deactivate();
+    return note;
+  }
+
+  let templatePickerDialog = null;
+
+  function openTemplatePickerDialog() {
+    if (!state.templates.length) {
+      showToast("No templates yet — add one under Workspace tools.");
+      return;
+    }
+    if (!templatePickerDialog) {
+      const backdrop = document.createElement("div");
+      backdrop.className = "modal-backdrop";
+      backdrop.id = "template-picker-modal";
+      backdrop.hidden = true;
+      const dialog = document.createElement("section");
+      dialog.className = "dialog template-picker-dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-labelledby", "template-picker-title");
+      const header = document.createElement("header");
+      header.className = "dialog-header";
+      header.innerHTML = '<div><div class="dialog-kicker">TEMPLATES</div><h2 id="template-picker-title">New note from template</h2></div>';
+      const closeButton = document.createElement("button");
+      closeButton.type = "button";
+      closeButton.className = "icon-button dialog-close";
+      closeButton.setAttribute("aria-label", "Close template picker");
+      closeButton.textContent = "×";
+      header.append(closeButton);
+      const list = document.createElement("div");
+      list.className = "template-picker-list";
+      const footer = document.createElement("footer");
+      footer.className = "dialog-footer";
+      const hint = document.createElement("span");
+      hint.textContent = "Esc closes";
+      const done = document.createElement("button");
+      done.type = "button";
+      done.className = "dialog-done";
+      done.textContent = "Cancel";
+      footer.append(hint, done);
+      dialog.append(header, list, footer);
+      backdrop.append(dialog);
+      const close = () => {
+        backdrop.hidden = true;
+        syncModalOpenClass();
+      };
+      closeButton.addEventListener("click", close);
+      done.addEventListener("click", close);
+      backdrop.addEventListener("click", (event) => {
+        if (event.target === backdrop) close();
+      });
+      dialog.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          close();
+        }
+        event.stopPropagation();
+      });
+      document.querySelector(".app-shell")?.append(backdrop);
+      templatePickerDialog = { backdrop, list, close };
+    }
+    templatePickerDialog.list.replaceChildren();
+    state.templates.forEach((template) => {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "template-picker-option";
+      const name = document.createElement("strong");
+      name.textContent = template.name;
+      const preview = document.createElement("small");
+      preview.textContent = template.content.trim().split("\n")[0]?.slice(0, 80) ?? "";
+      option.append(name, preview);
+      option.addEventListener("click", () => {
+        templatePickerDialog.close();
+        createNoteFromTemplate(template.id);
+      });
+      templatePickerDialog.list.append(option);
+    });
+    templatePickerDialog.backdrop.hidden = false;
+    document.body.classList.add("modal-open");
+    templatePickerDialog.list.querySelector(".template-picker-option")?.focus();
+  }
+
+  /* Single source of truth for the modal-open body class. Every dialog close
+   * funnels through here so no close path can strand (or prematurely drop)
+   * the class while another dialog is still visible. */
+  function anyModalOpen() {
+    if (!ui.pluginsModal.hidden || !ui.commandsModal.hidden || !ui.pluginConsentModal.hidden) return true;
+    if (shortcutsDialog && !shortcutsDialog.hidden) return true;
+    if (quickCaptureDialog && !quickCaptureDialog.backdrop.hidden) return true;
+    if (templatePickerDialog && !templatePickerDialog.backdrop.hidden) return true;
+    return false;
+  }
+
+  function syncModalOpenClass() {
+    document.body.classList.toggle("modal-open", anyModalOpen());
+  }
+
+  /* ---------- workspace-tools sections (rendered from app.js) ----------
+   * feature-suite.js owns the settings view markup and is outside this batch's
+   * file scope, so these core sections are appended to #feature-content from
+   * here and kept in place with a MutationObserver (feature-suite re-renders
+   * its own sections on some actions, e.g. deleting a shared block).        */
+  function renderTemplatesSection() {
+    const section = document.createElement("section");
+    section.className = "tools-section";
+    const heading = document.createElement("h2");
+    heading.textContent = "Note templates";
+    const blurb = document.createElement("p");
+    blurb.textContent = "Reusable starting points for new notes. {{date}}, {{time}} and {{title}} are filled in when a template is used. The “Daily note” template shapes each new daily note.";
+    section.append(heading, blurb);
+    const list = document.createElement("div");
+    list.className = "template-list";
+    if (!state.templates.length) {
+      const empty = document.createElement("p");
+      empty.className = "feature-empty";
+      empty.textContent = "No templates yet.";
+      list.append(empty);
+    }
+    state.templates.forEach((template) => {
+      const row = document.createElement("div");
+      row.className = "template-row";
+      const name = document.createElement("span");
+      name.className = "template-name";
+      name.textContent = template.name;
+      const use = document.createElement("button");
+      use.type = "button";
+      use.className = "feature-button";
+      use.textContent = "Use";
+      use.setAttribute("aria-label", `Create a note from the ${template.name} template`);
+      use.addEventListener("click", () => createNoteFromTemplate(template.id));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "feature-button";
+      remove.textContent = "Delete";
+      remove.setAttribute("aria-label", `Delete the ${template.name} template`);
+      remove.addEventListener("click", () => deleteTemplate(template.id));
+      row.append(name, use, remove);
+      list.append(row);
+    });
+    section.append(list);
+    const form = document.createElement("div");
+    form.className = "template-form";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "feature-input template-name-input";
+    nameInput.placeholder = "Template name";
+    nameInput.maxLength = 80;
+    nameInput.setAttribute("aria-label", "New template name");
+    const contentInput = document.createElement("textarea");
+    contentInput.className = "feature-input template-content-input";
+    contentInput.placeholder = "Template content — try {{date}}, {{time}}, {{title}}";
+    contentInput.rows = 4;
+    contentInput.maxLength = 100_000;
+    contentInput.setAttribute("aria-label", "New template content");
+    const addButton = document.createElement("button");
+    addButton.type = "button";
+    addButton.className = "feature-button feature-button-primary";
+    addButton.textContent = "Add template";
+    addButton.addEventListener("click", () => addTemplate(nameInput.value, contentInput.value));
+    const saveButton = document.createElement("button");
+    saveButton.type = "button";
+    saveButton.className = "feature-button";
+    saveButton.textContent = "Save current note as template";
+    saveButton.addEventListener("click", saveCurrentNoteAsTemplate);
+    const formActions = document.createElement("div");
+    formActions.className = "template-form-actions";
+    formActions.append(addButton, saveButton);
+    form.append(nameInput, contentInput, formActions);
+    section.append(form);
+    return section;
+  }
+
+  function renderImportSection() {
+    const section = document.createElement("section");
+    section.className = "tools-section";
+    const heading = document.createElement("h2");
+    heading.textContent = "Import Markdown";
+    const blurb = document.createElement("p");
+    blurb.textContent = "Bring in .md files from this device. Each file becomes one note, titled after its filename. Everything stays local; empty files are skipped.";
+    section.append(heading, blurb);
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".md,text/markdown";
+    fileInput.multiple = true;
+    fileInput.hidden = true;
+    fileInput.setAttribute("aria-label", "Choose Markdown files to import");
+    const importButton = document.createElement("button");
+    importButton.type = "button";
+    importButton.className = "feature-button";
+    importButton.textContent = "Import Markdown files";
+    importButton.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      importMarkdownFiles(fileInput.files);
+      fileInput.value = "";
+    });
+    section.append(importButton, fileInput);
+    return section;
+  }
+
+  function renderCoreToolsSections(force = false) {
+    if (!featureSuite || !featureSuite.active || state.features.activeView !== "settings") return;
+    const content = byId("feature-content");
+    if (!content) return;
+    const existing = content.querySelector("[data-core-tools]");
+    if (existing && !force) return;
+    // Preserve an in-progress template draft: settings re-renders (e.g. after
+    // deleting a shared block) must not wipe what the user already typed.
+    const draft = existing ? {
+      name: existing.querySelector(".template-name-input")?.value ?? "",
+      content: existing.querySelector(".template-content-input")?.value ?? "",
+    } : null;
+    existing?.remove();
+    const wrap = document.createElement("div");
+    wrap.dataset.coreTools = "true";
+    const templatesSection = renderTemplatesSection();
+    if (draft && (draft.name || draft.content)) {
+      const nameInput = templatesSection.querySelector(".template-name-input");
+      const contentInput = templatesSection.querySelector(".template-content-input");
+      if (nameInput) nameInput.value = draft.name;
+      if (contentInput) contentInput.value = draft.content;
+    }
+    wrap.append(templatesSection, renderImportSection());
+    content.append(wrap);
+  }
+
+  function observeCoreToolsSections() {
+    const content = byId("feature-content");
+    if (!content || typeof MutationObserver === "undefined") return;
+    const observer = new MutationObserver(() => renderCoreToolsSections());
+    observer.observe(content, { childList: true });
+  }
+
+  const MAX_IMPORT_BYTES = 5_000_000; // 5 MB per file — bigger files are skipped, not read
+  function importMarkdownFiles(fileList) {
+    const picked = [...(fileList ?? [])].filter((file) => /\.md$/i.test(file.name ?? ""));
+    if (!picked.length) {
+      showToast("Choose .md files to import.");
+      return;
+    }
+    if (typeof FileReader === "undefined") {
+      showToast("File import is not available in this browser.");
+      return;
+    }
+    const files = [];
+    let oversize = 0;
+    for (const file of picked) {
+      if (typeof file.size === "number" && file.size > MAX_IMPORT_BYTES) oversize += 1;
+      else files.push(file);
+    }
+    if (!files.length) {
+      showToast(oversize ? `All ${oversize === 1 ? "file was" : "files were"} over the 5 MB import limit — nothing imported.` : "Choose .md files to import.");
+      return;
+    }
+    let pending = files.length;
+    let created = 0;
+    let skipped = oversize;
+    const finish = () => {
+      setActiveFilter("all");
+      ui.search.value = "";
+      render();
+      persistWorkspace();
+      showToast(`Imported ${created} ${created === 1 ? "note" : "notes"} (${skipped} skipped${oversize ? `, ${oversize} over 5 MB` : ""})`);
+    };
+    files.forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = String(reader.result ?? "");
+        if (!text.trim()) {
+          skipped += 1;
+        } else {
+          const title = (file.name ?? "note").replace(/\.md$/i, "").trim().slice(0, 120) || "Untitled note";
+          const record = buildNoteRecord({ title, body: text.slice(0, 100_000) });
+          state.notes.push(record);
+          pluginManager?.emit("note:created", { ...record });
+          created += 1;
+        }
+        if (--pending === 0) finish();
+      };
+      reader.onerror = () => {
+        skipped += 1;
+        if (--pending === 0) finish();
+      };
+      reader.readAsText(file);
+    });
   }
 
   function createFolder() {
@@ -2103,7 +3492,15 @@
           if (row.values[column.id] === note.id) delete row.values[column.id];
         }));
     });
-    selectedNoteId = state.notes[0]?.id ?? null;
+    state.canvases.forEach((board) => {
+      board.nodes.forEach((node) => {
+        if (node.type === "file" && node.xPinNoteId === note.id) {
+          node.xPinNoteId = null;
+          node.file = `notes/${note.id}.md (deleted note)`;
+        }
+      });
+    });
+    selectedNoteId = visibleNotes()[0]?.id ?? null;
     pluginManager?.emit("note:deleted", { ...note });
     render();
     persistWorkspace();
@@ -2168,7 +3565,24 @@
 
   function setupCanvasEvents() {
     byId("canvas-nav")?.addEventListener("click", () => switchView("canvas"));
-    byId("new-canvas").addEventListener("click", () => {
+    const newCanvasButton = byId("new-canvas");
+    const renameBoardButton = document.createElement("button");
+    renameBoardButton.type = "button";
+    renameBoardButton.className = "canvas-tool-button";
+    renameBoardButton.textContent = "Rename";
+    renameBoardButton.setAttribute("aria-label", "Rename current board");
+    renameBoardButton.title = "Rename current board";
+    renameBoardButton.addEventListener("click", renameCanvasBoard);
+    const deleteBoardButton = document.createElement("button");
+    deleteBoardButton.type = "button";
+    deleteBoardButton.className = "canvas-tool-button";
+    deleteBoardButton.textContent = "Delete board";
+    deleteBoardButton.setAttribute("aria-label", "Delete current board");
+    deleteBoardButton.title = "Delete current board";
+    deleteBoardButton.addEventListener("click", deleteCanvasBoard);
+    newCanvasButton.insertAdjacentElement("afterend", deleteBoardButton);
+    newCanvasButton.insertAdjacentElement("afterend", renameBoardButton);
+    newCanvasButton.addEventListener("click", () => {
       if (state.canvases.length >= MAX_CANVASES) {
         showToast(`This workspace can contain at most ${MAX_CANVASES} boards.`);
         return;
@@ -2189,6 +3603,7 @@
     ui.canvasSelect.addEventListener("change", () => {
       state.selectedCanvasId = ui.canvasSelect.value;
       selectedCanvasNodeId = null;
+      hideEdgeEditor();
       canvasViewportState = { x: 0, y: 0, zoom: 1 };
       renderCanvas();
       updateCanvasSaveStatus(persistWorkspace());
@@ -2198,7 +3613,7 @@
     byId("add-note-node").addEventListener("click", () => {
       const note = currentNote();
       if (!note) return showToast("Open a note first to add it to this board.");
-      addCanvasNode("file", { file: `notes/${note.id}.md`, pinboardNoteId: note.id });
+      addCanvasNode("file", { file: `notes/${note.id}.md`, xPinNoteId: note.id });
     });
     byId("add-link-node").addEventListener("click", () => {
       const value = window.prompt("Enter an http or https link:");
@@ -2238,6 +3653,14 @@
     });
     ui.canvasNodes.addEventListener("pointerup", finishCanvasGesture);
     ui.canvasNodes.addEventListener("pointercancel", finishCanvasGesture);
+    ui.canvasEdges.addEventListener("pointerdown", (event) => {
+      const line = event.target instanceof Element ? event.target.closest("line") : null;
+      const edgeId = line?.dataset.edgeId;
+      if (!edgeId) return;
+      event.stopPropagation();
+      event.preventDefault();
+      selectCanvasEdge(edgeId, event.clientX, event.clientY);
+    });
     ui.canvasViewport.addEventListener("pointerdown", (event) => {
       if (event.target.closest(".canvas-node, button")) return;
       beginCanvasGesture(event, "pan");
@@ -2302,7 +3725,12 @@
     });
     byId("cancel-plugin-consent").addEventListener("click", closePluginConsent);
     byId("cancel-plugin-consent-footer").addEventListener("click", closePluginConsent);
-    ui.allowPluginButton.addEventListener("click", allowPendingPlugin);
+    ui.allowPluginButton.addEventListener("click", approvePendingPlugin);
+    byId("reject-plugin").addEventListener("click", () => {
+      ui.pluginRejectRow.hidden = false;
+      ui.pluginRejectReason.focus();
+    });
+    byId("confirm-reject-plugin").addEventListener("click", rejectPendingPlugin);
     ui.pluginConsentModal.addEventListener("click", (event) => {
       if (event.target === ui.pluginConsentModal) closePluginConsent();
     });
@@ -2314,9 +3742,26 @@
     byId("palette-shortcut").textContent = isMac ? "⌘ P" : "Ctrl P";
     byId("open-commands").addEventListener("click", openCommandPalette);
     byId("open-plugins").addEventListener("click", openPluginManager);
+    const shortcutsButton = document.createElement("button");
+    shortcutsButton.type = "button";
+    shortcutsButton.className = "topbar-tool";
+    shortcutsButton.id = "open-shortcuts";
+    shortcutsButton.innerHTML = '<span aria-hidden="true">?</span> Shortcuts';
+    shortcutsButton.setAttribute("aria-label", "Open keyboard shortcuts reference");
+    shortcutsButton.title = "Keyboard shortcuts (?)";
+    shortcutsButton.addEventListener("click", openShortcutsDialog);
+    document.querySelector(".topbar-actions .keyboard-hint")?.insertAdjacentElement("beforebegin", shortcutsButton);
     document.querySelectorAll("[data-close-dialog]").forEach((button) => {
       button.addEventListener("click", () => closeDialog(button.closest(".modal-backdrop")));
     });
+    document.addEventListener("click", (event) => {
+      const deleteButton = event.target instanceof Element ? event.target.closest('[data-action="delete-synced-block"]') : null;
+      if (!deleteButton) return;
+      if (!window.confirm("Delete this shared block? Notes that reference it will show “This shared block is missing.” This cannot be undone.")) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    }, true);
     [ui.pluginsModal, ui.commandsModal].forEach((dialog) => {
       dialog.addEventListener("click", (event) => {
         if (event.target === dialog) closeDialog(dialog);
@@ -2327,6 +3772,15 @@
       renderCommands();
     });
     byId("new-note").addEventListener("click", () => createNote());
+    const todayButton = document.createElement("button");
+    todayButton.type = "button";
+    todayButton.className = "nav-item";
+    todayButton.id = "today-note";
+    todayButton.innerHTML = '<span class="nav-icon" aria-hidden="true">☀</span><span>Today</span>';
+    todayButton.setAttribute("aria-label", "Open today's daily note");
+    todayButton.title = "Open today's daily note";
+    todayButton.addEventListener("click", () => openDailyNote());
+    byId("canvas-nav")?.insertAdjacentElement("beforebegin", todayButton);
     ui.emptyCreate.addEventListener("click", () => createNote());
     byId("editor-create").addEventListener("click", () => createNote());
     byId("new-folder").addEventListener("click", createFolder);
@@ -2395,7 +3849,8 @@
       const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName);
       const activeDialog = !ui.pluginConsentModal.hidden
         ? ui.pluginConsentModal
-        : !ui.commandsModal.hidden ? ui.commandsModal : !ui.pluginsModal.hidden ? ui.pluginsModal : null;
+        : !ui.commandsModal.hidden ? ui.commandsModal : !ui.pluginsModal.hidden ? ui.pluginsModal
+        : shortcutsDialog && !shortcutsDialog.hidden ? shortcutsDialog : null;
       if (event.key === "Tab" && activeDialog) {
         const focusable = [...activeDialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
           .filter((element) => element.getClientRects().length > 0);
@@ -2443,6 +3898,16 @@
         closeDialog(ui.pluginsModal);
         return;
       }
+      if (shortcutsDialog && !shortcutsDialog.hidden && event.key === "Escape") {
+        event.preventDefault();
+        closeShortcutsDialog();
+        return;
+      }
+      if (command && event.shiftKey && event.key.toLocaleLowerCase() === "c") {
+        event.preventDefault();
+        openQuickCaptureDialog();
+        return;
+      }
       if (command && event.key.toLocaleLowerCase() === "p") {
         event.preventDefault();
         openCommandPalette();
@@ -2458,6 +3923,13 @@
       } else if (event.key === "/" && !typing) {
         event.preventDefault();
         ui.search.focus();
+      } else if (event.key === "?" && !typing) {
+        event.preventDefault();
+        openShortcutsDialog();
+      } else if (event.key === "Escape" && selectedCanvasEdgeId && !typing) {
+        event.preventDefault();
+        hideEdgeEditor();
+        renderCanvas();
       } else if (state.view === "canvas" && event.key === "Delete" && selectedCanvasNodeId && !typing) {
         removeCanvasNode(selectedCanvasNodeId);
       }
@@ -2483,12 +3955,17 @@
     });
     setupCanvasEvents();
     setupPluginEvents();
+    setupSlashMenuKeyboard();
+    setupLinkAutocomplete();
+    observeCoreToolsSections();
+    registerCoreCommands();
     featureSuite.setup();
   }
 
-  const restoredFeatureView = state.features.activeView;
+  const KNOWN_FEATURE_VIEWS = ["database", "graph", "settings"];
+  const restoredFeatureView = KNOWN_FEATURE_VIEWS.includes(state.features.activeView) ? state.features.activeView : null;
   state.features.activeView = null;
-  featureSuite = window.PinboardFeatures.create({
+  featureSuite = window.xPinFeatures.create({
     getState: () => state,
     currentNote,
     createNote,
@@ -2509,8 +3986,8 @@
     }
   });
   setActiveFilter(state.filter);
-  pluginManager = window.PinboardPluginSystem.create({
-    definitions: window.PinboardPlugins,
+  pluginManager = window.xPinPluginSystem.create({
+    definitions: window.xPinPlugins,
     savedState: state.plugins,
     host: createPluginHost(),
     onChange() {
@@ -2533,7 +4010,7 @@
     render();
     return startSavedExtensions();
   }).catch((error) => {
-    console.error("Could not start Pinboard plugins.", error);
-    showToast("Some Pinboard features could not be started.");
+    console.error("Could not start xPin plugins.", error);
+    showToast("Some xPin features could not be started.");
   });
 })();

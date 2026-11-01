@@ -1,6 +1,6 @@
-# Pinboard
+# xPin
 
-Pinboard is a local-first notes experiment with sortable notes, autosaving, nested pages, Markdown editing, JSON Canvas boards, a notes graph, shared text blocks, safe embeds, and relational databases with multiple views. Workspace tools include constrained note queries, theme tokens, static HTML export, and passphrase-encrypted backup import/export. It is an original prototype, not a clone of another notes product.
+xPin is a local-first notes experiment with sortable notes, autosaving, nested pages, Markdown editing, JSON Canvas boards, a notes graph, shared text blocks, safe embeds, and relational databases with multiple views. Workspace tools include constrained note queries, theme tokens, static HTML export, and passphrase-encrypted backup import/export. It is an original prototype, not a clone of another notes product.
 
 ## Run locally
 
@@ -28,11 +28,15 @@ npm install
 npm run android:debug
 ```
 
+On Windows (PowerShell or cmd), use `npm run android:debug:win` instead; the default `android:debug` script calls `./gradlew`, which needs a Unix-like shell.
+
+The `www/` directory that Capacitor packages is generated, not checked in: `npm run build:web` (via `scripts/prepare-web.mjs`) copies the web assets into it. On a fresh clone, always run `npm run android:sync` rather than a raw `npx cap sync android` — the latter will package a missing or stale `www/` and the app will fail to boot.
+
 The debug APK is written to `android\app\build\outputs\apk\debug\app-debug.apk`. Gradle signs it with a debug key for local installation/testing. For a Play Store or public release, configure a private release signing key and build a signed release APK or Android App Bundle; never commit signing keys. The Android app keeps notes in its own WebView storage, separate from the desktop browser, so export/backup support should be used before uninstalling.
 
 ## Data and backups
 
-Notes, folders, boards, database records, shared blocks, plugin preferences, and imported plugin packages are stored in the browser's `localStorage` under `pinboard.workspace.v1`. Data is local to the browser profile and origin; clearing site data or changing the origin can make it unavailable. Use **Workspace tools → Export encrypted backup** for a portable AES-GCM encrypted workspace file. The passphrase is not stored and cannot be recovered. Import replaces the current local workspace after confirmation.
+Notes, folders, boards, database records, shared blocks, plugin preferences, and imported plugin packages are stored in the browser's `localStorage` under `xPin.workspace.v1`. Data is local to the browser profile and origin; clearing site data or changing the origin can make it unavailable. Use **Workspace tools → Export encrypted backup** for a portable AES-GCM encrypted workspace file. The passphrase is not stored and cannot be recovered. Import replaces the current local workspace after confirmation.
 
 Autosave is debounced while editing. Browser `localStorage` writes are synchronous, so very large workspaces may affect responsiveness or exceed the browser quota. If storage reports an error, the editor displays a save failure; keep independent backups of important content.
 
@@ -43,13 +47,13 @@ Autosave is debounced while editing. Browser `localStorage` writes are synchrono
 - **Databases:** Projects and Tasks are local tables. Relations may point to another database or a note; rollup fields count incoming database relations. Table, board, calendar, gallery, list, and timeline views use the same records.
 - **Note queries:** The database view includes a read-only query grammar such as `LIST FROM notes WHERE tag = #ideas` and `TABLE title,folder,pinned FROM notes`. Supported fields/operators are intentionally limited; queries never execute code.
 - **Embeds:** Markdown preview accepts `@[youtube](https://...)`, `@[figma](https://...)`, `@[drive](https://...)`, `@[typeform](https://...)`, and explicit HTTPS image/audio/video URLs with matching media extensions. Each embed requires a click to load; raw HTML and ordinary Markdown images are still not rendered.
-- **Static page export:** Workspace tools can download the selected note as a standalone HTML file. The user must host it; Pinboard does not publish to a public service or provide custom domains or SEO.
+- **Static page export:** Workspace tools can download the selected note as a standalone HTML file. The user must host it; xPin does not publish to a public service or provide custom domains or SEO.
 - **Themes:** Select from validated accent and density tokens. Arbitrary CSS snippets are not enabled.
 - **Backup versus sync:** The encrypted backup is a manual file handoff, not live cross-device synchronization. No account, server, merge/conflict resolution, or encryption-key recovery service is included.
 
 ## Plugins
 
-First-party features are registered in `plugins.js` through `plugin-system.js`; the local catalogue can be searched and filtered by category. Imported JSON packages are disabled until reviewed and explicitly allowed, and receive only selected capabilities. The worker sandbox restricts browser APIs and network access, but browser workers do not provide a hard memory quota or OS-level isolation. Only enable code you trust. Pinboard currently supports local package import, not a remote marketplace.
+First-party features are registered in `plugins.js` through `plugin-system.js`; the local catalogue can be searched and filtered by category. Imported JSON packages are disabled until reviewed and explicitly allowed, and receive only selected capabilities. The worker sandbox restricts browser APIs and network access, but browser workers do not provide a hard memory quota or OS-level isolation. Only enable code you trust. xPin currently supports local package import, not a remote marketplace.
 
 Folders can be renamed, collapsed, and deleted; deleting a folder moves its notes to Uncategorized rather than deleting them. Markdown preview supports headings, paragraphs, inline emphasis/code/links, lists and task lists, blockquotes, tables, horizontal rules, and fenced code. Preview does not render raw HTML or remote images; only HTTP(S) links become clickable.
 

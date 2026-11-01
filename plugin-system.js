@@ -34,7 +34,7 @@
     });
 
     function report(error, context) {
-      console.error(`Pinboard plugin ${context} failed.`, error);
+      console.error(`xPin plugin ${context} failed.`, error);
       host.notify(`${context} failed. See the browser console for details.`);
     }
 
@@ -178,7 +178,7 @@
     async function setEnabled(pluginId, enabled) {
       if (typeof enabled !== "boolean") throw new TypeError("Plugin enabled state must be a boolean.");
       const definition = registry.get(pluginId);
-      if (!definition) throw new Error(`Unknown Pinboard plugin: ${pluginId}`);
+      if (!definition) throw new Error(`Unknown xPin plugin: ${pluginId}`);
       if (Boolean(preferences.enabled[pluginId]) === enabled && active.has(pluginId) === enabled) return;
       if (enabled) {
         await activate(definition);
@@ -221,5 +221,5 @@
     });
   }
 
-  window.PinboardPluginSystem = Object.freeze({ create });
+  window.xPinPluginSystem = Object.freeze({ create });
 })();
