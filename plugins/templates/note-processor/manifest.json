@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Template: batch note processor. Reads all notes, applies a transform, writes back only what changed.","id":"template-note-processor","name":"Note processor template","permissions":["commands:register","notes:read","notes:update","ui:notify"],"version":"1.0.0"}

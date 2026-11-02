@@ -478,7 +478,10 @@ function buildContext(seedStorage) {
   win.Blob = class { constructor(parts) { this.parts = parts; } };
   win.FileReader = class { readAsText() {} };
   const createdURLs = [];
-  win.URL = { createObjectURL: (b) => { createdURLs.push(b); return "blob:smoke"; }, revokeObjectURL() {} };
+  win.URL = class extends globalThis.URL {
+    static createObjectURL(b) { createdURLs.push(b); return "blob:smoke"; }
+    static revokeObjectURL() {}
+  };
   const workers = [];
   win.Worker = class {
     constructor(url) { this.url = url; this._l = {}; workers.push(this); }
@@ -564,6 +567,13 @@ function __makeWorkerRuntime(workerSource, onWorkerMessage) {
     removeEventListener: (type) => { delete listeners[type]; },
     navigator: {},
     console: { log: () => {}, error: () => {}, warn: () => {} },
+    // Real DedicatedWorkerGlobalScope has timers; plugins like word-tally
+    // (status-bar polling) depend on them. Bind to the outer realm so fake
+    // time still advances with the real event loop.
+    setTimeout: (...a) => setTimeout(...a),
+    clearTimeout: (...a) => clearTimeout(...a),
+    setInterval: (...a) => setInterval(...a),
+    clearInterval: (...a) => clearInterval(...a),
   };
   const wctx = vm.createContext(workerSelf);
   workerSelf.self = workerSelf;
@@ -1352,6 +1362,288 @@ async function main() {
     check("T27: meeting template inserted at caret", body.includes("## Meeting"),
       body.slice(0, 160));
     check("T27: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T28-T36: marketplace browser + OEM plugins end-to-end.
+     The directory index fetch is mocked (a canned JSON index), which is the
+     only faked part: every app code path (render, search, install, review,
+     approve, sandbox RPC, plugin execution) runs for real. */
+
+  function mockIndex(plugins) {
+    return { name: "xPin Plugin Directory", version: 1, plugins };
+  }
+  function mockPluginEntry(over) {
+    return {
+      id: "smoke-probe", name: "Smoke Probe", version: "1.0.0",
+      description: "A probe plugin for the smoke suite.", author: "smoke",
+      capabilities: ["ui:notify"], downloadUrl: "https://cdn.example.com/smoke-probe-1.0.0.xpin.json",
+      sha256: "00", updated: "2026-11-01", ...over,
+    };
+  }
+  function mockFetchFor(index, downloads) {
+    // index: served for any */index.json ; downloads: map absolute URL -> parsed package
+    return async (url) => {
+      const u = String(url);
+      if (/index\.json(\?|$)/.test(u)) return { ok: true, json: async () => index };
+      if (downloads && downloads[u]) return { ok: true, json: async () => downloads[u] };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+  }
+  function marketplaceCacheKey(url) {
+    // must match app.js marketplaceCacheKey exactly
+    let hash = 0;
+    for (let i = 0; i < url.length; i += 1) hash = (hash * 31 + url.charCodeAt(i)) | 0;
+    return `xpin.marketplace.cache.${(hash >>> 0).toString(36)}`;
+  }
+  const DEFAULT_DIR = "https://raw.githubusercontent.com/xfactor21/eXtra/main/marketplace/index.json";
+  async function openMarketplaceTab(b) {
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.getElementById("open-plugins"));
+    await flush(40);
+    click(doc.getElementById("plugin-tab-marketplace-btn"));
+    await flush(500); // renderMarketplace is async (fetch + render)
+  }
+  function packOem(id) {
+    const { execSync } = require("child_process");
+    execSync(`node plugins/pack.mjs plugins/oem/${id}`, { cwd: REPO, stdio: "pipe" });
+    return JSON.parse(fs.readFileSync(`${REPO}/plugins/oem/${id}/${id}.xpin.json`, "utf8"));
+  }
+
+  /* T28: marketplace tab renders the directory listing */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc } = b;
+    b.win.fetch = mockFetchFor(mockIndex([
+      mockPluginEntry(),
+      mockPluginEntry({ id: "word-tally", name: "Word Tally", description: "Live word counts.", capabilities: ["notes:read", "ui:status"] }),
+    ]));
+    await openMarketplaceTab(b);
+    check("T28: marketplace panel shown, catalogue hidden",
+      !doc.getElementById("plugin-tab-marketplace").hidden && doc.getElementById("plugin-tab-catalogue").hidden);
+    const listText = doc.getElementById("marketplace-list").textContent;
+    check("T28: both directory plugins render", listText.includes("Smoke Probe") && listText.includes("Word Tally"), listText.slice(0, 200));
+    check("T28: status reports the count", /2 plugins/.test(doc.getElementById("marketplace-status").textContent),
+      doc.getElementById("marketplace-status").textContent);
+    check("T28: capability badges render", listText.includes("ui:notify") && listText.includes("notes:read"), listText.slice(0, 300));
+    check("T28: every card has an Install button",
+      doc.querySelectorAll("#marketplace-list .marketplace-card").length === 2 &&
+      [...doc.querySelectorAll("#marketplace-list .marketplace-card button")].every((btn) => btn.textContent === "Install"));
+    check("T28: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T29: marketplace search filters the listing */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    b.win.fetch = mockFetchFor(mockIndex([
+      mockPluginEntry(),
+      mockPluginEntry({ id: "word-tally", name: "Word Tally", description: "Live word counts." }),
+    ]));
+    await openMarketplaceTab(b);
+    const search = doc.getElementById("marketplace-search");
+    typeInto(search, "tally", win);
+    await flush(400);
+    const list1 = doc.getElementById("marketplace-list").textContent;
+    check("T29: search narrows to the match", list1.includes("Word Tally") && !list1.includes("Smoke Probe"), list1.slice(0, 200));
+    typeInto(search, "no-such-plugin-zzz", win);
+    await flush(400);
+    check("T29: empty result message", doc.getElementById("marketplace-status").textContent.includes("No plugins match"),
+      doc.getElementById("marketplace-status").textContent);
+    typeInto(search, "", win);
+    await flush(400);
+    check("T29: clearing search restores the listing",
+      doc.getElementById("marketplace-list").textContent.includes("Smoke Probe"));
+    check("T29: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T30: marketplace install stages into the Pending queue — never auto-runs */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const realTally = JSON.parse(fs.readFileSync(`${REPO}/marketplace/packages/word-tally-1.0.0.xpin.json`, "utf8"));
+    const dlUrl = "https://cdn.example.com/word-tally-1.0.0.xpin.json";
+    b.win.fetch = mockFetchFor(
+      mockIndex([mockPluginEntry({ id: "word-tally", name: "Word Tally", downloadUrl: dlUrl, capabilities: ["notes:read", "ui:status"] })]),
+      { [dlUrl]: realTally }
+    );
+    await openMarketplaceTab(b);
+    const card = [...doc.querySelectorAll("#marketplace-list .marketplace-card")]
+      .find((c) => c.textContent.includes("Word Tally"));
+    check("T30: word-tally card found", !!card);
+    card.querySelector("button").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    await flush(600); // download + sha256 digest + staging
+    check("T30: install toast says waiting for review",
+      doc.getElementById("toast").textContent.includes("waiting for your review"),
+      doc.getElementById("toast").textContent);
+    const ext = storedExtensions(b);
+    check("T30: stored as pending", ext.length === 1 && ext[0].reviewStatus === "pending",
+      JSON.stringify(ext.map((e) => e.reviewStatus)));
+    check("T30: provenance records the marketplace directory",
+      (ext[0].installedFrom || "").startsWith("marketplace:"), ext[0].installedFrom);
+    check("T30: pending plugin contributes no commands", !paletteHas(b, "Word"));
+    check("T30: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T31: a marketplace-installed OEM plugin (case-converter) runs end-to-end */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    const realPkg = JSON.parse(fs.readFileSync(`${REPO}/marketplace/packages/case-converter-1.0.0.xpin.json`, "utf8"));
+    const dlUrl = "https://cdn.example.com/case-converter-1.0.0.xpin.json";
+    b.win.fetch = mockFetchFor(
+      mockIndex([mockPluginEntry({ id: "case-converter", name: "Case Converter", downloadUrl: dlUrl,
+        capabilities: ["notes:read", "notes:update", "commands:register", "ui:notify"] })]),
+      { [dlUrl]: realPkg }
+    );
+    await openMarketplaceTab(b);
+    const card = [...doc.querySelectorAll("#marketplace-list .marketplace-card")]
+      .find((c) => c.textContent.includes("Case Converter"));
+    card.querySelector("button").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    await flush(600);
+    await openReview(b, "Review");
+    await approveInModal(b);
+    const ext = storedExtensions(b);
+    check("T31: marketplace plugin approved with 4 grants",
+      ext[0].reviewStatus === "approved" && ext[0].grants.length === 4,
+      JSON.stringify(ext[0] && { s: ext[0].reviewStatus, g: ext[0].grants }));
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Mixed Case Title");
+    type(doc.getElementById("note-body"), "hello world");
+    await runPaletteCommand(b, "UPPERCASE note");
+    const listText = doc.getElementById("note-list").textContent;
+    check("T31: command uppercased title and body",
+      listText.includes("MIXED CASE TITLE") && doc.getElementById("note-body").value === "HELLO WORLD",
+      listText.slice(0, 160));
+    check("T31: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T32: unreachable directory falls back to the offline cache */
+  {
+    const cached = mockIndex([mockPluginEntry({ id: "cached-one", name: "Cached One" })]);
+    const seed = {};
+    seed[marketplaceCacheKey(DEFAULT_DIR)] = JSON.stringify({ ...cached, _cachedAt: new Date().toISOString() });
+    const b = boot(seed); // fetch stays at its default: always rejects (offline)
+    simSandbox(b);
+    await flush(120);
+    const { doc } = b;
+    await openMarketplaceTab(b);
+    const listText = doc.getElementById("marketplace-list").textContent;
+    check("T32: cached plugin renders while offline", listText.includes("Cached One"), listText.slice(0, 200));
+    check("T32: entries badged as offline copy", listText.includes("offline copy"), listText.slice(0, 200));
+    check("T32: status reports the offline cache",
+      /from offline cache/.test(doc.getElementById("marketplace-status").textContent),
+      doc.getElementById("marketplace-status").textContent);
+    check("T32: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T33: directory add validates URLs and persists */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    await openMarketplaceTab(b);
+    const input = doc.getElementById("marketplace-dir-input");
+    const add = doc.getElementById("marketplace-dir-add");
+    const toast = () => doc.getElementById("toast").textContent;
+    typeInto(input, "not a url", win);
+    click(add);
+    check("T33: invalid URL rejected", toast().includes("not a valid URL"), toast());
+    typeInto(input, "http://insecure.example.com/index.json", win);
+    click(add);
+    check("T33: non-https URL rejected", toast().includes("must use https"), toast());
+    typeInto(input, "https://example.com/plugins/index.json", win);
+    click(add);
+    await flush(300);
+    check("T33: valid directory added", toast().includes("Directory added"), toast());
+    const ws = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    check("T33: directory persisted in workspace",
+      (ws.marketplaceDirs || []).includes("https://example.com/plugins/index.json"),
+      JSON.stringify(ws.marketplaceDirs));
+    typeInto(input, "https://example.com/plugins/index.json", win);
+    click(add);
+    check("T33: duplicate directory rejected", toast().includes("already listed"), toast());
+    check("T33: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T34: word-tally polls the real sandbox and updates the status bar */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    await importPackage(b, packOem("word-tally"), "word-tally.xpin.json");
+    await openReview(b, "Review");
+    await approveInModal(b);
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "TallyNote");
+    type(doc.getElementById("note-body"), "one two three four");
+    await flush(2600); // the plugin polls every 2s
+    const statusText = doc.getElementById("editor-status").textContent;
+    check("T34: status bar shows the live word count", /4 words/.test(statusText), statusText.slice(0, 160));
+    check("T34: character count also shown", /chars/.test(statusText), statusText.slice(0, 160));
+    check("T34: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T35: tag-manager census reads real #hashtags end-to-end */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "TaggedDoc");
+    type(doc.getElementById("note-body"), "has #alpha and #beta tags");
+    await importPackage(b, packOem("tag-manager"), "tag-manager.xpin.json");
+    await openReview(b, "Review");
+    await approveInModal(b);
+    check("T35: tag-manager approved with 5 grants",
+      storedExtensions(b)[0].grants.length === 5,
+      JSON.stringify(storedExtensions(b)[0].grants));
+    await runPaletteCommand(b, "Tag census");
+    const toastText = doc.getElementById("toast").textContent;
+    check("T35: census reports the real tags", /#alpha/.test(toastText) && /#beta/.test(toastText), toastText);
+    check("T35: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T36: random-note selects a real note through the sandbox */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "RNote1");
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "RNote2");
+    await importPackage(b, packOem("random-note"), "random-note.xpin.json");
+    await openReview(b, "Review");
+    await approveInModal(b);
+    await runPaletteCommand(b, "Open random note");
+    const toastText = doc.getElementById("toast").textContent;
+    const announced = toastText.match(/🎲 (.+)/);
+    check("T36: random note opened and announced", !!announced, toastText);
+    const openTitle = doc.getElementById("note-title").value;
+    check("T36: editor shows the announced note", !!announced && openTitle === announced[1], openTitle);
+    check("T36: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
   }
 
   /* report */

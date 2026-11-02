@@ -125,13 +125,63 @@ loudly at runtime instead of silently.
 
 ### Approval expectations
 
-There is no remote marketplace and no publisher signing. Approval is the
-workspace owner's review on their own device: a package is inert until reviewed,
-and rejecting it (with a reason) keeps it inert. The SHA-256 fingerprint shown
-during review proves the package hasn't changed since you looked at it — any
-change sends it back to pending. The manifest author is self-reported; if you
-share a plugin, distribute the `.xpin.json` alongside your name and contact so
-reviewers know who wrote it.
+Approval is the workspace owner's review on their own device: a package is
+inert until reviewed, and rejecting it (with a reason) keeps it inert. The
+SHA-256 fingerprint shown during review proves the package hasn't changed
+since you looked at it — any change sends it back to pending. The manifest
+author is self-reported; if you share a plugin, distribute the `.xpin.json`
+alongside your name and contact so reviewers know who wrote it.
+
+### Plugin templates
+
+Three working templates ship with the repo — copy the folder, change the
+`id` in `manifest.json`, pack it, and you have a real starting point:
+
+- `plugins/starter/` — **command-palette plugin.** Three working commands
+  demonstrating `ui:notify`, `notes:read`/`notes:create`, error handling,
+  and the optional status-bar pattern.
+- `plugins/templates/statusbar/` — **status-bar plugin.** The approved
+  polling pattern: `setInterval` at 2 s, read `api.notes.current()`, push
+  with `api.ui.setStatus()`, return a cleanup function. (Plugins can't
+  subscribe to editor events; 0.5 Hz is comfortably inside the sandbox
+  message budget.)
+- `plugins/templates/note-processor/` — **batch processor.** Read all notes
+  with `api.notes.list()`, transform, and `api.notes.update()` only what
+  changed — with the safety rules (conservative, reversible, always report
+  counts) baked in as comments.
+
+### Marketplace
+
+The plugin directory is a static site generated from the OEM sources:
+
+- Source of truth: `plugins/oem/<id>/` in this repo.
+- Build it: `node marketplace/build.mjs` — packs every OEM plugin,
+  verifies each with `pack.mjs`, copies the `.xpin.json` packages into
+  `marketplace/packages/`, and generates `marketplace/index.json` (the
+  machine-readable catalogue) and `marketplace/index.html` (the browsable,
+  planet.X-branded directory with search and download buttons).
+- Deploy `marketplace/` to any static host (Vercel, GitHub Pages) as-is.
+
+**In-app browser:** xPin's Plugins dialog has a **Marketplace** tab. It
+fetches `index.json` from a configurable list of directory URLs (default:
+the hosted directory's raw `index.json`; add your own directories, any
+`https://` URL serving the same schema). Plugins list with an **Install**
+button; one click downloads the package and drops it into the existing
+**Pending** review queue — nothing runs before you approve it.
+
+**`index.json` schema:**
+`{ name, version, updated, plugins: [{ id, name, version, description,
+author, capabilities[], downloadUrl, sha256, updated }] }`.
+`downloadUrl` may be relative (resolved against the directory URL).
+
+**Offline/unreachable:** the last successfully fetched index is cached in
+the workspace, so previously listed plugins remain browsable offline;
+a refresh failure shows a friendly message instead of a stack trace.
+
+**Security note:** fetching a directory only downloads JSON, which is
+schema-validated before display — the actual plugin code still travels
+the exact same import → review → approve path as a local file, sandboxed
+in the Worker with only the capabilities you grant.
 
 ## Canvas and code
 

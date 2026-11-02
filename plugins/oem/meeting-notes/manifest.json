@@ -1,0 +1,1 @@
+{"author": "xPin OEM", "description": "Creates a dated meeting note with attendees, agenda, notes and action items sections, then opens it.", "id": "meeting-notes", "name": "Meeting Notes", "permissions": ["commands:register", "notes:create", "notes:select", "ui:notify"], "version": "1.0.0"}

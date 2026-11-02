@@ -1,0 +1,18 @@
+{
+  "manifest": {
+    "id": "backlinks-quick",
+    "name": "Backlinks Quick",
+    "version": "1.0.0",
+    "description": "Work with backlinks to the current note: count them, or cycle through them one at a time.",
+    "author": "xPin OEM",
+    "permissions": [
+      "commands:register",
+      "notes:read",
+      "notes:select",
+      "ui:notify",
+      "settings:read",
+      "settings:write"
+    ]
+  },
+  "source": "/* backlinks-quick — xPin OEM plugin\n *\n * Two commands that work on the note you have open right now:\n *   1. \"Count backlinks\" — toast \"N notes link here\".\n *   2. \"Jump to next backlink\" — open the next note whose body contains\n *      [[<current title>]], cycling through them and wrapping around.\n *\n * The cycle position is stored in the plugin's settings (per note id) so it\n * persists across sessions. Settings values must be JSON under 16 KB.\n */\n\nxPinPlugin.register({\n  activate(api) {\n    // Find every note whose body contains [[title]] — literal substring\n    // match, not a regex. Excludes the note itself.\n    const findBacklinks = async (note) => {\n      const all = await api.notes.list();\n      const marker = `[[${note.title}]]`;\n      return all\n        .filter((n) => n.id !== note.id && typeof n.body === \"string\" && n.body.includes(marker))\n        // Sort by updatedAt for a stable, sensible cycle order.\n        .sort((a, b) => b.updatedAt - a.updatedAt);\n    };\n\n    // --- \"Count backlinks\"\n    api.commands.add({\n      id: \"count-backlinks\",\n      name: \"Count backlinks\",\n      description: \"Show how many notes link to the current note.\",\n      run: async () => {\n        try {\n          const current = await api.notes.current();\n          if (!current) {\n            await api.ui.notify(\"Open a note first.\");\n            return;\n          }\n          const backlinks = await findBacklinks(current);\n          const word = backlinks.length === 1 ? \"note\" : \"notes\";\n          await api.ui.notify(`${backlinks.length} ${word} link here.`);\n        } catch (err) {\n          await api.ui.notify(`Backlink count failed: ${err.message || err}`);\n        }\n      },\n    });\n\n    // --- \"Jump to next backlink\"\n    api.commands.add({\n      id: \"jump-next-backlink\",\n      name: \"Jump to next backlink\",\n      description: \"Open the next note that links to the current note.\",\n      run: async () => {\n        try {\n          const current = await api.notes.current();\n          if (!current) {\n            await api.ui.notify(\"Open a note first.\");\n            return;\n          }\n          const backlinks = await findBacklinks(current);\n          if (backlinks.length === 0) {\n            await api.ui.notify(\"No notes link here.\");\n            return;\n          }\n\n          // Read the persisted cycle position for this note.\n          const key = `backlinkIndex:${current.id}`;\n          const stored = await api.settings.get(key, 0);\n          // Guard against stale/invalid values (e.g. notes were deleted).\n          const index = Number.isInteger(stored) && stored >= 0 ? stored % backlinks.length : 0;\n\n          const target = backlinks[index];\n          await api.notes.select(target.id);\n          await api.ui.notify(`🔗 ${index + 1}/${backlinks.length}: ${target.title}`);\n\n          // Persist the NEXT position so repeated runs keep cycling.\n          await api.settings.set(key, (index + 1) % backlinks.length);\n        } catch (err) {\n          await api.ui.notify(`Backlink jump failed: ${err.message || err}`);\n        }\n      },\n    });\n  },\n});\n"
+}

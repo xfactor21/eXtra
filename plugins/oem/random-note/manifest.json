@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Jump to a uniformly random note with a single command — serendipitous rediscovery for your note collection.","id":"random-note","name":"Random Note","permissions":["commands:register","notes:read","notes:select","ui:notify"],"version":"1.0.0"}

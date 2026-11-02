@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Tracks words written today across all notes and cheers when you hit your daily goal.","id":"daily-goal","name":"Daily Word Goal","permissions":["commands:register","notes:read","ui:status","ui:notify","settings:read","settings:write"],"version":"1.0.0"}

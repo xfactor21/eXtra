@@ -1,0 +1,16 @@
+{
+  "manifest": {
+    "id": "random-note",
+    "name": "Random Note",
+    "version": "1.0.0",
+    "description": "Jump to a uniformly random note with a single command — serendipitous rediscovery for your note collection.",
+    "author": "xPin OEM",
+    "permissions": [
+      "commands:register",
+      "notes:read",
+      "notes:select",
+      "ui:notify"
+    ]
+  },
+  "source": "/* random-note — xPin OEM plugin\n *\n * One command: pick a note uniformly at random from the whole collection and\n * open it in the editor, telling you its title in a toast.\n *\n * Everything happens through the sandboxed `api` object; every api call is\n * async and must be awaited because it crosses the worker boundary.\n */\n\nxPinPlugin.register({\n  activate(api) {\n    // \"Open random note\" — needs \"commands:register\".\n    api.commands.add({\n      id: \"open-random-note\",\n      name: \"Open random note\",\n      description: \"Open a uniformly random note from your collection.\",\n      run: async () => {\n        // Never fail silently: report problems to the user instead.\n        try {\n          // Needs \"notes:read\". Returns up to 500 notes.\n          const notes = await api.notes.list();\n\n          if (notes.length === 0) {\n            // Needs \"ui:notify\". Messages are capped at 200 chars — keep short.\n            await api.ui.notify(\"No notes yet — create one first.\");\n            return;\n          }\n\n          // Uniform draw: every index in [0, notes.length) is equally likely.\n          const pick = notes[Math.floor(Math.random() * notes.length)];\n\n          // Needs \"notes:select\". Opens the note in the editor.\n          await api.notes.select(pick.id);\n\n          // The title is the most useful thing to announce.\n          await api.ui.notify(`🎲 ${pick.title}`);\n        } catch (err) {\n          await api.ui.notify(`Random note failed: ${err.message || err}`);\n        }\n      },\n    });\n  },\n});\n"
+}

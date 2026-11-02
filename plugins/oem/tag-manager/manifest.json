@@ -1,0 +1,1 @@
+{"author": "xPin OEM", "description": "Tag census report plus a generated tag index note, from your #hashtags.", "id": "tag-manager", "name": "Tag Manager", "permissions": ["commands:register", "notes:create", "notes:read", "notes:select", "ui:notify"], "version": "1.0.1"}

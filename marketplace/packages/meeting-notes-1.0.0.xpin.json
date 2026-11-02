@@ -1,0 +1,16 @@
+{
+  "manifest": {
+    "id": "meeting-notes",
+    "name": "Meeting Notes",
+    "version": "1.0.0",
+    "description": "Creates a dated meeting note with attendees, agenda, notes and action items sections, then opens it.",
+    "author": "xPin OEM",
+    "permissions": [
+      "commands:register",
+      "notes:create",
+      "notes:select",
+      "ui:notify"
+    ]
+  },
+  "source": "/* xPin OEM plugin: meeting-notes\n *\n * One command — \"New meeting note\" — that creates a dated meeting note\n * (\"Meeting — 2026-11-01\") with Attendees / Agenda / Notes / Action items\n * sections, opens it in the editor, and confirms with a toast. It is the\n * fastest path from \"meeting starting\" to \"ready to take notes\".\n *\n * Permissions are minimal on purpose: `commands:register` for the palette\n * entry, `notes:create` for the note, `ui:notify` for the confirmation.\n */\n\nxPinPlugin.register({\n  activate: async (api) => {\n    // Local \"YYYY-MM-DD\" for the note title and body stamp.\n    const today = () => {\n      const d = new Date();\n      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, \"0\")}-${String(\n        d.getDate()\n      ).padStart(2, \"0\")}`;\n    };\n\n    await api.commands.add({\n      id: \"new-meeting-note\",\n      name: \"New meeting note\",\n      description: \"Create and open a dated meeting note.\",\n      run: async () => {\n        try {\n          const date = today();\n          const note = await api.notes.create({\n            // Title is well under the 120-char limit.\n            title: `Meeting — ${date}`,\n            body: `# Meeting — ${date}\n\n## Attendees\n-\n\n## Agenda\n-\n\n## Notes\n-\n\n## Action items\n- [ ]\n`,\n          });\n          await api.notes.select(note.id); // open it in the editor\n          await api.ui.notify(\"Meeting note created.\");\n        } catch (err) {\n          // Failures surface as a toast, never silently.\n          await api.ui.notify(\n            `Couldn't create the note: ${err && err.message ? err.message : err}`\n          );\n        }\n      },\n    });\n\n    // No timers, no intervals — nothing to clean up.\n  },\n});\n"
+}

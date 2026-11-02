@@ -1,0 +1,16 @@
+{
+  "manifest": {
+    "id": "case-converter",
+    "name": "Case Converter",
+    "version": "1.0.0",
+    "description": "Convert the current note's title and body to UPPERCASE, lowercase, or Title Case via three commands.",
+    "author": "xPin OEM",
+    "permissions": [
+      "notes:read",
+      "notes:update",
+      "commands:register",
+      "ui:notify"
+    ]
+  },
+  "source": "// case-converter — UPPERCASE / lowercase / Title Case for the current note.\n//\n// TEACHING NOTES:\n// - The plugin reads the current note with `notes:read` (via current())\n//   and writes the transformed title+body back with `notes:update`.\n//   Both permissions must be declared because we touch the note store.\n// - `notes:update` requires at least one of {title, body}; we always\n//   send both since the transform applies to both.\n// - Each `run` is wrapped in try/catch and the user is told what happened\n//   with a short toast — no silent failures.\n\nxPinPlugin.register({\n  async activate(api) {\n    // Title Case: capitalize the first letter of every word, lowercase\n    // the rest. Simple heuristic — fine for note titles and prose.\n    function toTitleCase(text) {\n      return text\n        .toLowerCase()\n        .replace(/(^|\\s|[(\"'\\-–—])(\\p{L})/gu, (m, boundary, letter) =>\n          boundary + letter.toUpperCase()\n        );\n    }\n\n    const transforms = [\n      {\n        id: \"uppercase-note\",\n        name: \"UPPERCASE note\",\n        description: \"Convert the current note's title and body to UPPERCASE.\",\n        fn: (t) => t.toUpperCase(),\n        label: \"UPPERCASE\",\n      },\n      {\n        id: \"lowercase-note\",\n        name: \"lowercase note\",\n        description: \"Convert the current note's title and body to lowercase.\",\n        fn: (t) => t.toLowerCase(),\n        label: \"lowercase\",\n      },\n      {\n        id: \"title-case-note\",\n        name: \"Title Case note\",\n        description: \"Convert the current note's title and body to Title Case.\",\n        fn: toTitleCase,\n        label: \"Title Case\",\n      },\n    ];\n\n    for (const t of transforms) {\n      api.commands.add({\n        id: t.id,\n        name: t.name,\n        description: t.description,\n        run: async () => {\n          try {\n            const note = await api.notes.current();\n            if (!note) {\n              await api.ui.notify(\"No note is open.\");\n              return;\n            }\n            const newTitle = t.fn(note.title || \"\");\n            const newBody = t.fn(note.body || \"\");\n            await api.notes.update(note.id, { title: newTitle, body: newBody });\n            await api.ui.notify(`Converted to ${t.label}.`);\n          } catch (e) {\n            await api.ui.notify(`Case conversion failed: ${e.message || e}`);\n          }\n        },\n      });\n    }\n  },\n});\n"
+}

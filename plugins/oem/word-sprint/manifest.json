@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Timed writing sprints: hit a word-count target in the open note before the clock runs out.","id":"word-sprint","name":"Word Sprint","permissions":["commands:register","notes:read","ui:status","ui:notify","settings:read","settings:write"],"version":"1.0.0"}

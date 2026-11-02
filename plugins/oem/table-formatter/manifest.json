@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Align markdown pipe tables in the current note by padding cells to equal column widths.","id":"table-formatter","name":"Table Formatter","permissions":["notes:read","notes:update","commands:register","ui:notify"],"version":"1.0.0"}

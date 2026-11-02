@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Scan all notes for duplicate titles and report the count and duplicated titles in a toast.","id":"duplicate-titles","name":"Duplicate Titles","permissions":["notes:read","commands:register","ui:notify"],"version":"1.0.0"}

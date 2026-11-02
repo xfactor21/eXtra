@@ -1,0 +1,1 @@
+{"author": "xPin OEM", "description": "Insert ready-made markdown skeletons \u2014 meeting, daily log, decision record, book notes \u2014 at the cursor.", "id": "template-inserter", "name": "Template Inserter", "permissions": ["commands:register", "editor:write", "ui:notify"], "version": "1.0.0"}

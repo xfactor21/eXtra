@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Pomodoro focus and break timers with status-bar countdown and adjustable durations.","id":"pomodoro-focus","name":"Pomodoro Focus Timer","permissions":["commands:register","ui:status","ui:notify","settings:read","settings:write"],"version":"1.0.0"}

@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Convert the current note's title and body to UPPERCASE, lowercase, or Title Case via three commands.","id":"case-converter","name":"Case Converter","permissions":["notes:read","notes:update","commands:register","ui:notify"],"version":"1.0.0"}

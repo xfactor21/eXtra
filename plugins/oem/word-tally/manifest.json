@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Shows live word and character counts of the current note in the status bar, updating every 2 seconds.","id":"word-tally","name":"Word Tally","permissions":["notes:read","ui:status"],"version":"1.0.0"}

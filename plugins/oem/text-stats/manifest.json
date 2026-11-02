@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Two commands: a one-line text statistics summary as a toast, and a full markdown statistics report inserted at the cursor.","id":"text-stats","name":"Text Statistics","permissions":["notes:read","commands:register","ui:notify","editor:write"],"version":"1.0.0"}

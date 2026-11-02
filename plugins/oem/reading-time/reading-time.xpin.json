@@ -1,0 +1,14 @@
+{
+  "manifest": {
+    "id": "reading-time",
+    "name": "Reading Time",
+    "version": "1.0.0",
+    "description": "Shows a live reading-time estimate (200 words per minute) for the current note in the status bar.",
+    "author": "xPin OEM",
+    "permissions": [
+      "notes:read",
+      "ui:status"
+    ]
+  },
+  "source": "// reading-time — live \"N min read\" estimate in the status bar.\n//\n// Same live-update pattern as the word-count plugin: poll every 2s,\n// update a status-bar item, clear it when no note is open, and return\n// a cleanup function that clears the interval.\n\nxPinPlugin.register({\n  async activate(api) {\n    const WORDS_PER_MINUTE = 200; // standard \"medium\" reading speed\n\n    function countWords(text) {\n      const trimmed = text.trim();\n      if (!trimmed) return 0;\n      return trimmed.split(/\\s+/).length;\n    }\n\n    const timer = setInterval(async () => {\n      try {\n        const note = await api.notes.current();\n\n        if (!note) {\n          await api.ui.clearStatus(\"reading-time\");\n          return;\n        }\n\n        const words = countWords(note.body || \"\");\n\n        // Always show at least \"1 min read\" for a non-empty note so a\n        // short note never reads as \"0 min\". Under a minute rounds up.\n        const minutes = words === 0 ? 0 : Math.max(1, Math.ceil(words / WORDS_PER_MINUTE));\n\n        await api.ui.setStatus({\n          id: \"reading-time\",\n          text: minutes === 1 ? \"1 min read\" : `${minutes} min read`,\n        });\n      } catch (e) {\n        // Transient failure: stay silent, retry on the next tick.\n      }\n    }, 2000);\n\n    return () => clearInterval(timer);\n  },\n});\n"
+}

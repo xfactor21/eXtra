@@ -1,0 +1,15 @@
+{
+  "manifest": {
+    "id": "link-checker",
+    "name": "Link Checker",
+    "version": "1.0.0",
+    "description": "Scan every note for [[wiki-links]] whose target title doesn't exist, and report the broken ones.",
+    "author": "xPin OEM",
+    "permissions": [
+      "commands:register",
+      "notes:read",
+      "ui:notify"
+    ]
+  },
+  "source": "/* link-checker — xPin OEM plugin\n *\n * One command: \"Find broken links\". Scans every note's body for [[wiki-link]]\n * targets and reports any target that does not exactly match the title of an\n * existing note. The toast shows the count plus the first 2–3 broken\n * targets, all within the 200-char toast limit.\n */\n\nxPinPlugin.register({\n  activate(api) {\n    // Extract all [[...]] link targets from a body. Simple regex — wiki-link\n    // targets never contain brackets or newlines in xPin.\n    const extractTargets = (body) => {\n      const targets = [];\n      const re = /\\[\\[([^\\][]+)\\]\\]/g;\n      let match;\n      while ((match = re.exec(body)) !== null) {\n        const target = match[1].trim();\n        if (target) targets.push(target);\n      }\n      return targets;\n    };\n\n    api.commands.add({\n      id: \"find-broken-links\",\n      name: \"Find broken links\",\n      description: \"Report [[wiki-links]] with no matching note title.\",\n      run: async () => {\n        try {\n          const notes = await api.notes.list();\n\n          // Exact, case-sensitive title match, as xPin resolves links.\n          const titles = new Set(notes.map((n) => n.title));\n\n          // Collect each broken target once, in first-seen order.\n          const seen = new Set();\n          const broken = [];\n          for (const note of notes) {\n            if (typeof note.body !== \"string\") continue;\n            for (const target of extractTargets(note.body)) {\n              if (!titles.has(target) && !seen.has(target)) {\n                seen.add(target);\n                broken.push(target);\n              }\n            }\n          }\n\n          if (broken.length === 0) {\n            await api.ui.notify(\"✅ No broken links found.\");\n            return;\n          }\n\n          const word = broken.length === 1 ? \"link\" : \"links\";\n          // Show the first 3 targets; keep the toast under 200 chars.\n          let message = `🔗 ${broken.length} broken ${word}: ${broken.slice(0, 3).join(\", \")}`;\n          if (broken.length > 3) message += \", …\";\n          await api.ui.notify(message.slice(0, 195));\n        } catch (err) {\n          await api.ui.notify(`Link check failed: ${err.message || err}`);\n        }\n      },\n    });\n  },\n});\n"
+}

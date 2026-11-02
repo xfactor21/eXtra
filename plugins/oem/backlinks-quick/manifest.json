@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Work with backlinks to the current note: count them, or cycle through them one at a time.","id":"backlinks-quick","name":"Backlinks Quick","permissions":["commands:register","notes:read","notes:select","ui:notify","settings:read","settings:write"],"version":"1.0.0"}

@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Template: status-bar plugin with the approved 2s polling pattern. Shows live word/char counts.","id":"template-statusbar","name":"Status bar template","permissions":["commands:register","notes:read","ui:status"],"version":"1.0.0"}

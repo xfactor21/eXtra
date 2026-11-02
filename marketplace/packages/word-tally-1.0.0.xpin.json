@@ -1,0 +1,14 @@
+{
+  "manifest": {
+    "id": "word-tally",
+    "name": "Word Tally",
+    "version": "1.0.0",
+    "description": "Shows live word and character counts of the current note in the status bar, updating every 2 seconds.",
+    "author": "xPin OEM",
+    "permissions": [
+      "notes:read",
+      "ui:status"
+    ]
+  },
+  "source": "// word-tally — live word + character count in the status bar.\n//\n// TEACHING NOTE: this is the canonical \"live-update\" plugin. Because the\n// worker has no event subscription API, plugins poll on a timer. A 2-second\n// interval (0.5 Hz) is inside the sandbox message budget, and `activate`\n// returns a cleanup function so the host can stop the timer when the\n// plugin is disabled or the workspace closes.\n\nxPinPlugin.register({\n  // activate runs once when the plugin is loaded. It may be async.\n  async activate(api) {\n    // Count \"words\" the way a writer would: split on any whitespace run.\n    // Returns 0 for empty/blank text instead of counting a phantom word.\n    function countWords(text) {\n      const trimmed = text.trim();\n      if (!trimmed) return 0;\n      return trimmed.split(/\\s+/).length;\n    }\n\n    // Poll every 2 seconds: read the current note, then update the\n    // status-bar item. The try/catch keeps one transient failure from\n    // killing the interval (uncaught rejections in timers are silent).\n    const timer = setInterval(async () => {\n      try {\n        const note = await api.notes.current();\n\n        // No note open (or note closed while polling): clear our item so\n        // stale counts don't linger in the status bar.\n        if (!note) {\n          await api.ui.clearStatus(\"word-tally\");\n          return;\n        }\n\n        const body = note.body || \"\";\n        const words = countWords(body);\n        const chars = body.length;\n\n        // status text must be ≤ 80 chars; this is far under.\n        await api.ui.setStatus({\n          id: \"word-tally\",\n          text: `${words} words · ${chars} chars`,\n        });\n      } catch (e) {\n        // Swallow poll errors deliberately — a busy host shouldn't\n        // spam toasts every 2 seconds. Next tick retries.\n      }\n    }, 2000);\n\n    // Returning a function registers it as the plugin's cleanup hook.\n    // The host calls it on disable/unload — always clear your intervals.\n    return () => clearInterval(timer);\n  },\n});\n"
+}

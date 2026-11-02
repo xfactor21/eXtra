@@ -1,0 +1,1 @@
+{"author": "xPin OEM", "description": "Find notes with no tags: count them, or cycle through them one at a time for tagging.", "id": "untagged-finder", "name": "Untagged Finder", "permissions": ["commands:register", "notes:read", "notes:select", "ui:notify", "settings:read", "settings:write"], "version": "1.0.1"}

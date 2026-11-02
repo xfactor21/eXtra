@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#07151d">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self'; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https:; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
     <title>xPin — a place for your thoughts</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -125,6 +125,11 @@
           <header class="dialog-header"><div><div class="dialog-kicker">MAKE IT YOURS</div><h2 id="plugins-title">Plugins<span class="title-period">.</span></h2></div><button class="icon-button dialog-close" data-close-dialog type="button" aria-label="Close plugins">×</button></header>
           <p class="dialog-description">Small, focused features that work together. Your settings stay on this device.</p>
           <div class="plugin-safety"><span aria-hidden="true">◇</span><span>Built-ins are reviewed. Imported plugins run in an isolated, network-restricted worker and receive only the permissions you grant.</span></div>
+          <div class="plugin-tabs" role="tablist" aria-label="Plugin views">
+            <button class="plugin-tab is-active" id="plugin-tab-catalogue-btn" role="tab" aria-selected="true" aria-controls="plugin-tab-catalogue" data-ptab="catalogue" type="button">Catalogue</button>
+            <button class="plugin-tab" id="plugin-tab-marketplace-btn" role="tab" aria-selected="false" aria-controls="plugin-tab-marketplace" data-ptab="marketplace" type="button">Marketplace</button>
+          </div>
+          <div id="plugin-tab-catalogue" role="tabpanel" aria-labelledby="plugin-tab-catalogue-btn">
           <div class="plugin-upload">
             <div><strong>Add a plugin package</strong><small>Import a local JSON manifest and JavaScript bundle. Nothing is fetched from the web.</small></div>
             <button class="editor-tool-button" id="import-plugin" type="button">Choose package</button>
@@ -144,6 +149,23 @@
             </select>
           </div>
           <div id="plugin-list" class="plugin-list"></div>
+          </div>
+          <div id="plugin-tab-marketplace" role="tabpanel" aria-labelledby="plugin-tab-marketplace-btn" hidden>
+            <div class="marketplace-dirs">
+              <div><strong>Plugin directories</strong><small>Indexes are JSON files listing plugin packages. Packages still go through your normal review before they can run.</small></div>
+              <div class="marketplace-dir-add">
+                <input id="marketplace-dir-input" type="url" placeholder="https://example.com/plugins/index.json" autocomplete="off" aria-label="Directory index URL">
+                <button class="editor-tool-button" id="marketplace-dir-add" type="button">Add directory</button>
+              </div>
+              <div id="marketplace-dir-list" class="marketplace-dir-list"></div>
+            </div>
+            <div class="marketplace-toolbar">
+              <input id="marketplace-search" type="search" placeholder="Search the marketplace..." autocomplete="off" aria-label="Search marketplace plugins">
+              <button class="editor-tool-button" id="marketplace-refresh" type="button">Refresh</button>
+            </div>
+            <div id="marketplace-status" class="marketplace-status" role="status"></div>
+            <div id="marketplace-list" class="marketplace-list"></div>
+          </div>
           <footer class="dialog-footer"><span id="plugin-count">0 features enabled</span><button class="dialog-done" data-close-dialog type="button">Done</button></footer>
         </section>
       </div>

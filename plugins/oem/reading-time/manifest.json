@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Shows a live reading-time estimate (200 words per minute) for the current note in the status bar.","id":"reading-time","name":"Reading Time","permissions":["notes:read","ui:status"],"version":"1.0.0"}

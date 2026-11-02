@@ -44,6 +44,7 @@
     collapsed: [],
     plugins: { enabled: {}, settings: {} },
     extensions: [],
+    marketplaceDirs: [],
     templates: seedTemplates(),
     features: window.xPinFeatures.initialState(),
     selectedCanvasId: "canvas-main",
@@ -2288,6 +2289,13 @@
     } catch (error) {
       throw new TypeError(`"${file.name}" is not valid JSON, so it can't be a plugin package.`);
     }
+    await importPluginPackage(parsed, file.name);
+  }
+
+  // Shared core for local file imports AND marketplace installs: validate a
+  // parsed package and stage it in the Pending review queue. Nothing runs
+  // until the owner reviews and approves it in the Plugins catalogue.
+  async function importPluginPackage(parsed, fileName, provenance) {
     const plugin = window.xPinSandbox.validatePackage(parsed);
     const clash = state.extensions.find((item) => item.manifest.id === plugin.manifest.id);
     if (pluginManager.plugins().some((item) => item.id === plugin.manifest.id)) {
@@ -2300,9 +2308,10 @@
     if (!sha256) throw new Error("This browser cannot calculate a package fingerprint, so the plugin was not installed.");
     state.extensions.push({
       ...plugin,
-      fileName: file.name,
+      fileName,
       sha256,
       installedAt: new Date().toISOString(),
+      installedFrom: provenance ?? "local file",
       enabled: false,
       approvedHash: null,
       grants: [],
@@ -2314,6 +2323,244 @@
     persistWorkspace();
     renderPluginManager();
     showToast(`${plugin.manifest.name} was imported and is waiting for your review.`);
+  }
+
+  /* ---------------- Marketplace browser ----------------
+     Directories are JSON indexes (see marketplace/index.json). Packages are
+     fetched as JSON and staged through importPluginPackage(), so every
+     marketplace install lands in the Pending review queue — nothing runs
+     until the owner reviews and approves it, exactly like a local import. */
+  const MARKETPLACE_DEFAULT_DIR = "https://raw.githubusercontent.com/xfactor21/eXtra/main/marketplace/index.json";
+  const MARKETPLACE_CACHE_PREFIX = "xpin.marketplace.cache.";
+  let marketplaceEntries = [];
+  let marketplaceNotice = "";
+
+  function marketplaceDirList() {
+    if (Array.isArray(state.marketplaceDirs) && state.marketplaceDirs.length) return state.marketplaceDirs;
+    return [MARKETPLACE_DEFAULT_DIR];
+  }
+
+  function setMarketplaceDirs(dirs) {
+    state.marketplaceDirs = dirs;
+    persistWorkspace();
+    renderMarketplaceDirs();
+    renderMarketplace();
+  }
+
+  function switchPluginTab(tab) {
+    const isMarketplace = tab === "marketplace";
+    byId("plugin-tab-catalogue").hidden = isMarketplace;
+    byId("plugin-tab-marketplace").hidden = !isMarketplace;
+    document.querySelectorAll(".plugin-tab").forEach((button) => {
+      const active = button.dataset.ptab === tab;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    if (isMarketplace) renderMarketplace();
+  }
+
+  function marketplaceCacheKey(url) {
+    let hash = 0;
+    for (let i = 0; i < url.length; i += 1) hash = (hash * 31 + url.charCodeAt(i)) | 0;
+    return `${MARKETPLACE_CACHE_PREFIX}${(hash >>> 0).toString(36)}`;
+  }
+
+  function readMarketplaceCache(url) {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(marketplaceCacheKey(url)));
+      if (!parsed || !Array.isArray(parsed.plugins)) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeMarketplaceCache(url, index) {
+    try {
+      localStorage.setItem(marketplaceCacheKey(url), JSON.stringify({ ...index, _cachedAt: new Date().toISOString() }));
+    } catch {
+      /* cache is best-effort */
+    }
+  }
+
+  async function fetchMarketplaceIndex(url) {
+    let response;
+    try {
+      response = await fetch(url, { headers: { Accept: "application/json" } });
+    } catch {
+      throw new Error("unreachable");
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    let index;
+    try {
+      index = await response.json();
+    } catch {
+      throw new Error("invalid JSON");
+    }
+    if (!index || !Array.isArray(index.plugins)) throw new Error("not a plugin index");
+    writeMarketplaceCache(url, index);
+    return index;
+  }
+
+  function resolveMarketplaceUrl(dirUrl, downloadUrl) {
+    try {
+      return new URL(downloadUrl, dirUrl).toString();
+    } catch {
+      return downloadUrl;
+    }
+  }
+
+  function renderMarketplaceDirs() {
+    const list = byId("marketplace-dir-list");
+    list.replaceChildren();
+    marketplaceDirList().forEach((url) => {
+      const row = document.createElement("div");
+      row.className = "marketplace-dir-row";
+      const label = document.createElement("code");
+      label.textContent = url;
+      label.title = url;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "plugin-remove";
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", `Remove directory ${url}`);
+      remove.addEventListener("click", () => {
+        const next = marketplaceDirList().filter((item) => item !== url);
+        setMarketplaceDirs(next.length ? next : [MARKETPLACE_DEFAULT_DIR]);
+        showToast("Directory removed.");
+      });
+      row.append(label, remove);
+      list.append(row);
+    });
+  }
+
+  async function renderMarketplace(forceRefresh = false) {
+    const status = byId("marketplace-status");
+    const list = byId("marketplace-list");
+    const query = byId("marketplace-search").value.trim().toLocaleLowerCase();
+    renderMarketplaceDirs();
+    status.textContent = "Loading directories…";
+    list.replaceChildren();
+    marketplaceEntries = [];
+    const problems = [];
+    for (const dirUrl of marketplaceDirList()) {
+      let index = null;
+      let cached = false;
+      const cachedIndex = readMarketplaceCache(dirUrl);
+      if (!forceRefresh && cachedIndex) {
+        // Tab switches and searches reuse the cache without hitting the
+        // network; the refresh button always tries the network first.
+        index = cachedIndex;
+        cached = true;
+      } else {
+        try {
+          index = await fetchMarketplaceIndex(dirUrl);
+        } catch (error) {
+          // Offline or unreachable: fall back to the last good index so the
+          // directory stays browsable. The problem is reported in the status
+          // line and each entry is badged as an offline copy.
+          if (cachedIndex) {
+            index = cachedIndex;
+            cached = true;
+          } else {
+            problems.push(`${dirUrl} (${error.message})`);
+            continue;
+          }
+        }
+      }
+      for (const plugin of index.plugins) {
+        if (!plugin || typeof plugin.id !== "string") continue;
+        marketplaceEntries.push({ ...plugin, dirUrl, cached });
+      }
+    }
+    const installed = new Map(state.extensions.map((item) => [item.manifest.id, item.manifest.version]));
+    const matches = marketplaceEntries.filter((entry) =>
+      !query || `${entry.name} ${entry.description ?? ""} ${entry.id}`.toLocaleLowerCase().includes(query)
+    );
+    if (problems.length) {
+      status.textContent = `Some directories could not be reached: ${problems.join("; ")}.`;
+    } else if (matches.length === 0) {
+      status.textContent = query ? "No plugins match your search." : "No plugins listed in these directories yet.";
+    } else {
+      const cachedCount = matches.filter((entry) => entry.cached).length;
+      status.textContent = `${matches.length} plugin${matches.length === 1 ? "" : "s"}${cachedCount ? ` (${cachedCount} from offline cache)` : ""}. Every install waits for your review before it can run.`;
+    }
+    const seen = new Set();
+    for (const entry of matches) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+      const card = document.createElement("article");
+      card.className = "marketplace-card";
+      const head = document.createElement("div");
+      head.className = "marketplace-card-head";
+      const name = document.createElement("strong");
+      name.textContent = entry.name || entry.id;
+      const version = document.createElement("span");
+      version.className = "marketplace-version";
+      version.textContent = `v${entry.version || "?"}`;
+      head.append(name, version);
+      const description = document.createElement("p");
+      description.textContent = entry.description || "No description.";
+      const meta = document.createElement("small");
+      meta.className = "marketplace-meta";
+      meta.textContent = `${entry.author || "Unknown author"}${entry.cached ? " · offline copy" : ""}`;
+      const caps = document.createElement("div");
+      caps.className = "marketplace-caps";
+      for (const cap of entry.capabilities ?? []) {
+        const badge = document.createElement("span");
+        badge.className = "marketplace-cap";
+        badge.textContent = cap;
+        caps.append(badge);
+      }
+      const actions = document.createElement("div");
+      actions.className = "marketplace-card-actions";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "editor-tool-button";
+      const installedVersion = installed.get(entry.id);
+      if (installedVersion) {
+        button.disabled = true;
+        button.textContent = `Installed (v${installedVersion})`;
+      } else {
+        button.textContent = "Install";
+        button.addEventListener("click", () => installMarketplacePlugin(entry));
+      }
+      actions.append(button);
+      card.append(head, description, meta, caps, actions);
+      list.append(card);
+    }
+    marketplaceNotice = problems.join("; ");
+  }
+
+  async function installMarketplacePlugin(entry) {
+    const url = resolveMarketplaceUrl(entry.dirUrl, entry.downloadUrl);
+    showToast(`Downloading ${entry.name}…`);
+    let response;
+    try {
+      response = await fetch(url, { headers: { Accept: "application/json" } });
+    } catch {
+      showToast("Download failed — check your connection.");
+      return;
+    }
+    if (!response.ok) {
+      showToast(`Download failed (HTTP ${response.status}).`);
+      return;
+    }
+    let parsed;
+    try {
+      parsed = await response.json();
+    } catch {
+      showToast("Downloaded file is not valid JSON.");
+      return;
+    }
+    try {
+      const fileName = url.split("/").pop() || `${entry.id}.xpin.json`;
+      await importPluginPackage(parsed, fileName, `marketplace: ${entry.dirUrl}`);
+      switchPluginTab("catalogue");
+    } catch (error) {
+      console.error("Could not install marketplace plugin.", error);
+      showToast(error.message || "Plugin could not be installed.");
+    }
   }
 
   function openPluginConsent(plugin) {
@@ -2518,7 +2765,7 @@
       const description = document.createElement("p");
       description.textContent = plugin.description;
       const provenance = document.createElement("small");
-      provenance.textContent = `LOCAL UPLOAD · v${sourcePlugin.manifest.version} · ${sourcePlugin.manifest.author} · SHA-256 ${sourcePlugin.sha256.slice(0, 12)}…`;
+      provenance.textContent = `${(sourcePlugin.installedFrom ?? "local file").toUpperCase()} · v${sourcePlugin.manifest.version} · ${sourcePlugin.manifest.author} · SHA-256 ${sourcePlugin.sha256.slice(0, 12)}…`;
       const permissions = document.createElement("small");
       permissions.className = "plugin-permissions-summary";
       permissions.textContent = active
@@ -3709,6 +3956,35 @@
     ui.pluginSearch.addEventListener("input", renderPluginManager);
     ui.pluginCategory.addEventListener("change", renderPluginManager);
     byId("import-plugin").addEventListener("click", () => ui.pluginFileInput.click());
+    document.querySelectorAll(".plugin-tab").forEach((button) => {
+      button.addEventListener("click", () => switchPluginTab(button.dataset.ptab));
+    });
+    byId("marketplace-dir-add").addEventListener("click", () => {
+      const input = byId("marketplace-dir-input");
+      const url = input.value.trim();
+      if (!url) return;
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        showToast("That is not a valid URL.");
+        return;
+      }
+      if (parsed.protocol !== "https:") {
+        showToast("Directory URLs must use https.");
+        return;
+      }
+      const dirs = marketplaceDirList();
+      if (dirs.includes(parsed.toString())) {
+        showToast("That directory is already listed.");
+        return;
+      }
+      input.value = "";
+      setMarketplaceDirs([...dirs, parsed.toString()]);
+      showToast("Directory added.");
+    });
+    byId("marketplace-refresh").addEventListener("click", () => renderMarketplace(true));
+    byId("marketplace-search").addEventListener("input", () => renderMarketplace());
     ui.pluginFileInput.addEventListener("change", async () => {
       const [file] = ui.pluginFileInput.files ?? [];
       ui.pluginFileInput.value = "";

@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Shows your consecutive-days note-writing streak in the status bar.","id":"note-streak","name":"Note Streak","permissions":["notes:read","ui:status","commands:register","ui:notify"],"version":"1.0.0"}

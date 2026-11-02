@@ -1,0 +1,1 @@
+{"author":"xPin OEM","description":"Scan every note for [[wiki-links]] whose target title doesn't exist, and report the broken ones.","id":"link-checker","name":"Link Checker","permissions":["commands:register","notes:read","ui:notify"],"version":"1.0.0"}

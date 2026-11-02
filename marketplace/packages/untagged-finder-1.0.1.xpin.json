@@ -1,0 +1,18 @@
+{
+  "manifest": {
+    "id": "untagged-finder",
+    "name": "Untagged Finder",
+    "version": "1.0.1",
+    "description": "Find notes with no tags: count them, or cycle through them one at a time for tagging.",
+    "author": "xPin OEM",
+    "permissions": [
+      "commands:register",
+      "notes:read",
+      "notes:select",
+      "ui:notify",
+      "settings:read",
+      "settings:write"
+    ]
+  },
+  "source": "/* untagged-finder — xPin OEM plugin\n *\n * Two commands to help you tag the notes that slipped through:\n *   1. \"Count untagged notes\" — toast how many notes have no #hashtags.\n *   2. \"Open next untagged note\" — open the next untagged note, cycling\n *      through them and wrapping around, so you can tag them one at a time.\n *\n * xPin tags are inline #hashtags in the title/body text (there is no tags\n * field), so \"untagged\" means the text contains no #tag. The cycle position\n * lives in settings so it persists across sessions.\n */\n\nxPinPlugin.register({\n  activate(api) {\n    const SETTING_KEY = \"untaggedIndex\";\n\n    // A note is untagged when its title+body contain no #hashtags.\n    // (xPin tags are inline #tags in the text — there is no tags field.)\n    const extractTags = (note) => {\n      const text = `${note.title || \"\"}\\n${note.body || \"\"}`;\n      const tags = new Set();\n      for (const match of text.matchAll(/(?:^|\\s)#([a-z0-9][a-z0-9/_-]*)/gi)) {\n        tags.add(`#${match[1].toLowerCase()}`);\n      }\n      return [...tags];\n    };\n    const findUntagged = async () => {\n      const all = await api.notes.list();\n      return all\n        .filter((n) => extractTags(n).length === 0)\n        // newest first; Date.parse because updatedAt is an ISO string\n        // (string subtraction would be NaN and silently not sort)\n        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));\n    };\n\n    // --- \"Count untagged notes\"\n    api.commands.add({\n      id: \"count-untagged-notes\",\n      name: \"Count untagged notes\",\n      description: \"Show how many notes have no tags.\",\n      run: async () => {\n        try {\n          const untagged = await findUntagged();\n          const word = untagged.length === 1 ? \"note\" : \"notes\";\n          await api.ui.notify(`${untagged.length} untagged ${word}.`);\n        } catch (err) {\n          await api.ui.notify(`Untagged count failed: ${err.message || err}`);\n        }\n      },\n    });\n\n    // --- \"Open next untagged note\"\n    api.commands.add({\n      id: \"open-next-untagged-note\",\n      name: \"Open next untagged note\",\n      description: \"Cycle through notes that have no tags.\",\n      run: async () => {\n        try {\n          const untagged = await findUntagged();\n          if (untagged.length === 0) {\n            await api.ui.notify(\"🎉 Every note is tagged.\");\n            return;\n          }\n\n          // Read the persisted index; modulo keeps stale values safe\n          // when notes are tagged or deleted between runs.\n          const stored = await api.settings.get(SETTING_KEY, 0);\n          const index = Number.isInteger(stored) && stored >= 0 ? stored % untagged.length : 0;\n\n          const target = untagged[index];\n          await api.notes.select(target.id);\n          await api.ui.notify(`🏷️ ${index + 1}/${untagged.length}: ${target.title}`);\n\n          await api.settings.set(SETTING_KEY, (index + 1) % untagged.length);\n        } catch (err) {\n          await api.ui.notify(`Untagged cycle failed: ${err.message || err}`);\n        }\n      },\n    });\n  },\n});\n"
+}
