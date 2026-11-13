@@ -1,0 +1,48 @@
+name: Android debug build
+
+# Builds the xPin Android app (Capacitor + Gradle) and uploads the debug APK.
+# Runs on every push to main and on manual trigger. No signing: the debug
+# APK uses the automatic debug key. A signed release build is a separate
+# step (needs a keystore) and is not done here.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run smoke tests
+        run: npm run test:smoke
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build debug APK
+        run: npm run android:debug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpin-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
