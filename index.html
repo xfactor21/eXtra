@@ -32,6 +32,7 @@
           <button class="nav-item" data-phase2-view="capture" type="button" aria-label="Capture and smarts"><span class="nav-icon" aria-hidden="true">✦</span><span>Capture &amp; smarts</span></button>
           <button class="nav-item" data-phase2-view="readlater" type="button" aria-label="Read later"><span class="nav-icon" aria-hidden="true">◐</span><span>Read later</span><span class="nav-count" id="readlater-count">0</span></button>
           <button class="nav-item" data-phase2-view="flashcards" type="button" aria-label="Flashcards"><span class="nav-icon" aria-hidden="true">▧</span><span>Flashcards</span><span class="nav-count" id="flashcards-due-count">0</span></button>
+          <button class="nav-item" data-phase3-view="power" type="button" aria-label="Power and polish"><span class="nav-icon" aria-hidden="true">⚡</span><span>Power &amp; polish</span></button>
           <button class="nav-item" data-feature-view="settings" type="button" aria-label="Workspace tools"><span class="nav-icon" aria-hidden="true">⚙</span><span>Workspace tools</span></button>
         </nav>
         <div class="daily-strip-wrap"><div class="nav-label">THIS WEEK</div><div class="daily-strip" id="daily-strip" aria-label="Daily notes this week"></div></div>
@@ -87,12 +88,16 @@
                   <input id="attachment-file-input" type="file" multiple hidden>
                   <button class="editor-tool-button" id="export-note-markdown" type="button">Export .md</button>
                   <button class="editor-tool-button" id="toggle-preview" type="button" aria-pressed="false">Preview</button>
+                  <button class="editor-tool-button" id="toggle-split-preview" type="button" aria-pressed="false" title="Side-by-side edit and preview">Split</button>
+                  <button class="editor-tool-button" id="share-note" type="button" title="Share this note">Share</button>
+                  <button class="editor-tool-button" id="voice-capture" type="button" title="Record a quick voice memo into this note">🎙 Voice</button>
                 </div>
                 <label class="sr-only" for="note-body">Note content</label><textarea id="note-body" class="note-body" placeholder="Every good idea starts somewhere..."></textarea>
                 <article id="markdown-preview" class="markdown-preview" aria-label="Markdown preview" hidden></article>
                 <div class="editor-bottom"><span>MARKDOWN FRIENDLY <span class="editor-bottom-dot">·</span> JUST START TYPING</span><span id="editor-status"></span></div>
               </div>
               <div id="plugin-panels" class="plugin-panels"></div>
+              <div id="note-comments" class="note-comments" hidden></div>
             </section>
           </div>
           <section class="canvas-view" id="canvas-view" aria-label="Canvas workspace" hidden>
@@ -128,6 +133,7 @@
             <div class="feature-content" id="feature-content"></div>
           </section>
           <section class="phase2-view" id="phase2-view" aria-label="Capture and smarts" hidden></section>
+          <section class="phase3-view" id="phase3-view" aria-label="Power and polish" hidden></section>
         </section>
       </main>
       <div class="modal-backdrop" id="plugins-modal" hidden>
@@ -211,6 +217,7 @@
     <script src="sync/credentials.js"></script>
     <script src="sync/publish.js"></script>
     <script src="phase2.js"></script>
+    <script src="phase3.js"></script>
     <script src="feature-suite.js"></script>
     <script src="app.js"></script>
   </body>

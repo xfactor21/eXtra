@@ -563,7 +563,7 @@ function boot(seedStorage, opts) {
   const b = buildContext(seedStorage, opts);
   const files = ["plugin-sandbox.js", "plugin-system.js", "plugins.js",
     "sync/sync.js", "sync/transports.js", "sync/credentials.js", "sync/publish.js",
-    "phase2.js", "feature-suite.js", "app.js"];
+    "phase2.js", "phase3.js", "feature-suite.js", "app.js"];
   for (const f of files) {
     const code = fs.readFileSync(REPO + "/" + f, "utf8");
     try {
@@ -903,6 +903,13 @@ async function main() {
     check("T11: backup export button exists", !!expBtn);
     if (expBtn) {
       click(expBtn);
+      await flush(100);
+      // Phase 3: the passphrase now comes from the app's own dialog, not
+      // window.prompt — fill it and confirm like a user would.
+      const passInput = doc.querySelector(".xpin-dialog-input");
+      if (passInput) passInput.value = "smoke-passphrase";
+      const done = doc.querySelector(".xpin-dialog .dialog-done");
+      if (done) click(done);
       await flush(3000); // PBKDF2 310k iterations
       check("T11: export produced a download blob", b.createdURLs.length > 0, `blobs: ${b.createdURLs.length}`);
       const payload = b.createdURLs.length ? String(b.createdURLs[0].parts[0] || "") : "";
@@ -2121,15 +2128,26 @@ async function main() {
     b.win.xPinDomain.on("settings:changed", (d) => seen.push(`settings:changed:${d.section}`));
     b.win.xPinDomain.on("save:completed", () => seen.push("save:completed"));
     b.win.xPinDomain.on("canvas:created", (d) => seen.push(`canvas:created:${d.name}`));
-    // folder via the sidebar button (prompt stub returns "smoke-passphrase")
+    // folder via the sidebar button (Phase 3: the name comes from the
+    // app's own dialog — fill it and confirm like a user would)
+    const confirmDialog = (value) => {
+      const input = doc.querySelector(".xpin-dialog-input");
+      if (input) input.value = value;
+      const done = doc.querySelector(".xpin-dialog .dialog-done");
+      if (done) click(done);
+    };
     click(doc.getElementById("new-folder"));
     await flush(100);
+    confirmDialog("smoke-passphrase");
+    await flush(100);
     check("T46: folder:created fires", seen.some((s) => s === "folder:created:smoke-passphrase"), seen.join(" | "));
-    // database via the Databases view (prompt stub names the table)
+    // database via the Databases view (dialog names the table)
     click(doc.querySelector('[data-feature-view="database"]'));
     await flush(100);
     const addTable = [...doc.querySelectorAll("[data-action]")].find((el) => el.dataset.action === "add-table");
     click(addTable);
+    await flush(100);
+    confirmDialog("smoke-passphrase");
     await flush(100);
     check("T46: database:created fires", seen.some((s) => s === "database:created:smoke-passphrase"), seen.join(" | "));
     // template via the settings view form
@@ -2155,10 +2173,12 @@ async function main() {
     await flush(100);
     check("T46: tag:changed fires", seen.some((s) => s.startsWith("tag:changed:") && s.includes("#t46tag")), seen.join(" | "));
     check("T46: save:completed fires on persist", seen.includes("save:completed"), seen.join(" | "));
-    // canvas via the Canvas view (prompt stub names the board)
+    // canvas via the Canvas view (dialog names the board)
     click(doc.getElementById("canvas-nav"));
     await flush(100);
     click(doc.getElementById("new-canvas"));
+    await flush(100);
+    confirmDialog("smoke-passphrase");
     await flush(100);
     check("T46: canvas:created fires", seen.some((s) => s === "canvas:created:smoke-passphrase"), seen.join(" | "));
     check("T46: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
@@ -2631,6 +2651,361 @@ async function main() {
       meeting.metadata.meetingDate && meeting.metadata.meetingTime === "14:30" && /Ana/.test(meeting.metadata.attendees) && !!meeting.metadata.dailyDate,
       JSON.stringify(meeting.metadata));
     check("T63: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T64 (Phase 3): module loads; phase3 state survives round-trip, unknown keys dropped */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    check("T64: phase3 module loaded", !!win.xPinPhase3, typeof win.xPinPhase3);
+    const state = win.xPinDomain.getState();
+    check("T64: phase3 state exists with defaults", !!state.phase3 && state.phase3.settings.theme === "dark" && state.phase3.settings.font === "system", JSON.stringify(state.phase3?.settings));
+    check("T64: power nav button exists", !!doc.querySelector('[data-phase3-view="power"]'));
+    check("T64: split/share/voice buttons exist", !!doc.getElementById("toggle-split-preview") && !!doc.getElementById("share-note") && !!doc.getElementById("voice-capture"));
+    check("T64: comments container exists", !!doc.getElementById("note-comments"));
+    state.phase3.settings.theme = "light";
+    state.phase3.settings.font = "serif";
+    state.phase3.unknownKey = "drop-me";
+    const raw = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    raw.phase3 = state.phase3;
+    const b2 = boot({ "xPin.workspace.v1": JSON.stringify(raw) });
+    await flush(120);
+    const state2 = b2.win.xPinDomain.getState();
+    check("T64: theme + font survive round-trip", state2.phase3.settings.theme === "light" && state2.phase3.settings.font === "serif", JSON.stringify(state2.phase3.settings));
+    check("T64: unknown phase3 keys dropped", !("unknownKey" in state2.phase3), Object.keys(state2.phase3).join(","));
+    check("T64: no console errors", b.errors.length === 0 && b2.errors.length === 0, [...b.errors, ...b2.errors].slice(0, 3).join(" | "));
+  }
+
+  /* T65 (Phase 3, Item 1): scripts need approval; approved scripts run in the sandbox worker */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const P = win.xPinPhase3;
+    const body = "Intro\n\n```xpin-script\n// hello\n```\n\nDone";
+    const scripts = P.extractScripts(body);
+    check("T65: script block extracted", scripts.length === 1 && scripts[0].source === "// hello", JSON.stringify(scripts));
+    check("T65: no script in plain note", P.extractScripts("just text").length === 0);
+    let refused = "";
+    try { P.wrapScriptAsPackage({ source: "x", name: "bad", permissions: ["network:fetch"] }); } catch (e) { refused = e.message; }
+    check("T65: connector permission refused for scripts", /cannot use/.test(refused) && /Network/.test(refused), refused);
+    const hash = await P.scriptDigest("// hello");
+    const phase3 = win.xPinDomain.getState().phase3;
+    check("T65: unapproved script is not approved", !P.isScriptApproved(phase3, hash));
+    P.approveScriptRecord(phase3, { hash, name: "T65", source: "// hello", permissions: ["ui:notify"] });
+    check("T65: approval recorded", P.isScriptApproved(phase3, hash));
+    check("T65: changed source is not covered by the old approval", !P.isScriptApproved(phase3, await P.scriptDigest("// hello!")));
+    check("T65: revoke removes approval", P.revokeScript(phase3, hash) && !P.isScriptApproved(phase3, hash));
+    // Real sandboxed execution: the script notifies through the host RPC.
+    const notified = [];
+    const host = {
+      scriptRequest: async (capability, payload) => {
+        if (capability === "ui:notify") { notified.push(payload.message); return true; }
+        throw new Error(`not granted: ${capability}`);
+      },
+      notify: (m) => notified.push(m)
+    };
+    await P.runScript({
+      source: `xPinPlugin.register({ activate: async (api) => { await api.ui.notify("script-hello"); } });`,
+      name: "T65 run", permissions: ["ui:notify"], host, noteId: null, eventDetail: { type: "manual", noteId: null }
+    });
+    check("T65: approved script ran in the sandbox worker and notified", notified.includes("script-hello"), notified.join(" | "));
+    check("T65: hooks match by event only", P.matchHooks({ hooks: [{ id: "h1", event: "note:created", scriptId: "s1", enabled: true }] }, "note:created").length === 1
+      && P.matchHooks({ hooks: [{ id: "h1", event: "note:created", scriptId: "s1", enabled: true }] }, "note:deleted").length === 0);
+    check("T65: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T66 (Phase 3, Item 2): typed blocks parse, validate, and feed a database */
+  {
+    const b = boot(null);
+    await flush(120);
+    const P = b.win.xPinPhase3;
+    const body = "```xpin-task\n{\"title\":\"Ship it\",\"status\":\"open\",\"due\":\"2026-11-20\",\"priority\":\"high\"}\n```";
+    const blocks = P.parseTypedBlocks(body);
+    check("T66: task block parsed", blocks.length === 1 && blocks[0].fields.title === "Ship it" && blocks[0].fields.priority === "high", JSON.stringify(blocks));
+    check("T66: unknown type rejected at serialize", (() => { try { P.serializeTypedBlock("widget", {}); return false; } catch { return true; } })());
+    check("T66: bad status rejected", (() => { try { P.serializeTypedBlock("task", { title: "x", status: "banana" }); return false; } catch { return true; } })());
+    check("T66: bad date rejected", (() => { try { P.serializeTypedBlock("task", { title: "x", due: "tomorrow" }); return false; } catch { return true; } })());
+    const round = P.serializeTypedBlock("person", { name: "Ada", role: "Dev", contact: "ada@x.co" });
+    check("T66: serialize round-trips", P.parseTypedBlocks(round)[0].fields.name === "Ada", round);
+    const table = { id: "t1", columns: [{ id: "c1", name: "Title" }, { id: "c2", name: "Due" }, { id: "c3", name: "Unrelated" }] };
+    const row = P.typedBlockToRow(blocks[0], table);
+    check("T66: block feeds a database row by column name", row.c1 === "Ship it" && row.c2 === "2026-11-20" && !("c3" in row), JSON.stringify(row));
+    check("T66: five fixed types only", Object.keys(P.TYPED_BLOCK_TYPES).join(",") === "task,person,project,book,idea");
+    check("T66: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T67 (Phase 3, Item 3): query v2 — AND/OR, ORDER BY, LIMIT, saved views */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const P = win.xPinPhase3;
+    const state = win.xPinDomain.getState();
+    const extractTags = (t) => (t.match(/#[A-Za-z0-9_-]+/g) || []);
+    const notes = [
+      { id: "q1", title: "Alpha", body: "#work stuff", folderId: null, pinned: true, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-03T00:00:00.000Z" },
+      { id: "q2", title: "Beta", body: "plain", folderId: null, pinned: false, createdAt: "2026-01-02T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z" },
+      { id: "q3", title: "Gamma", body: "#work more", folderId: null, pinned: false, createdAt: "2026-01-03T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }
+    ];
+    const run = (q) => P.runQueryV2(notes, [], extractTags, q).map((n) => n.title);
+    check("T67: AND narrows", JSON.stringify(run("LIST FROM notes WHERE tag = work AND pinned = true")) === JSON.stringify(["Alpha"]), run("LIST FROM notes WHERE tag = work AND pinned = true").join(","));
+    check("T67: OR widens", run("LIST FROM notes WHERE tag = work OR title = Beta").length === 3);
+    check("T67: ORDER BY + LIMIT", JSON.stringify(run("LIST FROM notes ORDER BY updated DESC LIMIT 2")) === JSON.stringify(["Alpha", "Beta"]), run("LIST FROM notes ORDER BY updated DESC LIMIT 2").join(","));
+    check("T67: date comparison", JSON.stringify(run("LIST FROM notes WHERE created >= 2026-01-02")) === JSON.stringify(["Beta", "Gamma"]));
+    check("T67: attached operator (tag=work) parses", run("LIST FROM notes WHERE tag=work").length === 2);
+    check("T67: invalid query rejected, not eval'd", (() => { try { P.parseQueryV2("DROP TABLE notes"); return false; } catch { return true; } })());
+    const saved = P.saveQueryRecord(state.phase3, { name: "Work notes", query: "LIST FROM notes WHERE tag = work" });
+    check("T67: query saved", state.phase3.savedQueries.length === 1 && saved.query.includes("tag = work"));
+    // Saving from the power view re-renders the sidebar on the next render;
+    // creating a note triggers one.
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.getElementById("new-note"));
+    await flush(80);
+    check("T67: saved query shows in the sidebar", !!doc.querySelector("#p3-sidebar") && doc.querySelector("#p3-sidebar").textContent.includes("Work notes"), doc.querySelector("#p3-sidebar")?.textContent.slice(0, 120));
+    check("T67: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T68 (Phase 3, Item 4): task scores + calendar assignment */
+  {
+    const b = boot(null);
+    await flush(120);
+    const P = b.win.xPinPhase3;
+    const now = new Date("2026-11-13T12:00:00.000Z");
+    const overdue = { done: false, due: "2026-11-10", priority: "high", createdAt: "2026-10-01T00:00:00.000Z" };
+    const future = { done: false, due: "2027-06-01", priority: "low", createdAt: "2026-11-13T00:00:00.000Z" };
+    const done = { done: true, due: "2026-11-10", priority: "high", createdAt: "2026-10-01T00:00:00.000Z" };
+    check("T68: overdue high-priority outscores distant low-priority", P.taskScore(overdue, now) > P.taskScore(future, now), `${P.taskScore(overdue, now)} vs ${P.taskScore(future, now)}`);
+    check("T68: done tasks score 0", P.taskScore(done, now) === 0);
+    check("T68: score is bounded 0–100", P.taskScore(overdue, now) <= 100 && P.taskScore(future, now) >= 0);
+    check("T68: formula is documented in the UI", P.TASK_SCORE_FORMULA.includes("urgency") && P.TASK_SCORE_FORMULA.includes("importance"));
+    const notes = [{ id: "n1", title: "Day", body: "- [ ] Buy milk due:2026-11-14 p:high\n- [x] Done thing\n- [ ] No date task", createdAt: "2026-11-01T00:00:00.000Z" }];
+    const tasks = P.extractTasks(notes, now);
+    check("T68: checklist tasks extracted with due + priority", tasks.length === 3 && tasks[0].due === "2026-11-14" && tasks[0].priority === "high", JSON.stringify(tasks.map((t) => [t.text, t.due, t.priority])));
+    check("T68: tasks sort by score", tasks.filter((t) => !t.done).sort((a, c) => c.score - a.score)[0].text === "Buy milk");
+    const task = tasks[0];
+    const moved = P.setTaskDueInBody(notes[0].body, { ...task, due: "2026-11-20" });
+    check("T68: drag-to-calendar rewrites the due date", moved.includes("due:2026-11-20") && !moved.includes("due:2026-11-14"), moved);
+    const grid = P.monthGrid(2026, 10);
+    check("T68: month grid covers November 2026", grid.flat().some((d) => d.dateKey === "2026-11-13") && grid.flat().some((d) => d.dateKey === "2026-11-30"));
+    check("T68: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T69 (Phase 3, Item 5): formulas + per-view sort/filter/group */
+  {
+    const b = boot(null);
+    await flush(120);
+    const P = b.win.xPinPhase3;
+    const columns = [
+      { id: "price", name: "Price", type: "number" },
+      { id: "qty", name: "Qty", type: "number" },
+      { id: "due", name: "Due", type: "date" },
+      { id: "total", name: "Total", type: "formula", expression: "= price * qty" }
+    ];
+    const row = { values: { price: 3, qty: 4 } };
+    const total = P.evaluateFormula("= price * qty", row, columns);
+    check("T69: formula multiplies fields", total.ok && total.value === 12, JSON.stringify(total));
+    check("T69: days(due, today()) works", P.evaluateFormula("= days(due, today())", { values: { due: "2026-11-20" } }, columns, "2026-11-13").value === 7);
+    check("T69: formula never evals — injection rejected", !P.evaluateFormula("= price; alert(1)", row, columns).ok);
+    check("T69: unknown field is an error, not a crash", !P.evaluateFormula("= nope * 2", row, columns).ok);
+    check("T69: divide by zero is an error", !P.evaluateFormula("= price / 0", row, columns).ok);
+    const rows = [
+      { id: "r1", values: { price: 10, qty: 1, due: "2026-11-20" } },
+      { id: "r2", values: { price: 5, qty: 3, due: "2026-11-21" } },
+      { id: "r3", values: { price: 20, qty: 1, due: "2026-11-22" } }
+    ];
+    const sorted = P.applyDatabaseView(rows, columns, { sortColumnId: "total", sortDir: "desc" });
+    check("T69: view sorts by formula column", sorted.rows[0].id === "r3" && sorted.rows[1].id === "r2" && sorted.rows[2].id === "r1", sorted.rows.map((r) => r.id).join(","));
+    const filtered = P.applyDatabaseView(rows, columns, { filterColumnId: "price", filterOp: ">", filterValue: "9" });
+    check("T69: view filters rows", filtered.rows.length === 2 && filtered.rows.every((r) => Number(r.values.price) > 9));
+    const grouped = P.applyDatabaseView(rows, columns, { groupByColumnId: "qty" });
+    check("T69: view groups rows", grouped.groups.length === 2 && grouped.groups.find((g) => g.key === "1").rows.length === 2, JSON.stringify(grouped.groups.map((g) => [g.key, g.rows.length])));
+    const phase3 = b.win.xPinDomain.getState().phase3;
+    const reminder = P.createReminder(phase3, { tableId: "t1", rowId: "r1", date: "2026-11-20", label: "Ship it" });
+    check("T69: reminder created + surfaces on its day", P.remindersForDate(phase3, "2026-11-20").length === 1 && P.remindersForDate(phase3, "2026-11-21").length === 0, JSON.stringify(reminder));
+    check("T69: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T70 (Phase 3, Item 6): side-by-side preview + block move */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const P = win.xPinPhase3;
+    const text = "First para.\n\nSecond para.\n\n- one\n- two\n- three";
+    const blocks = P.splitBlocks(text);
+    check("T70: blocks split (paras + list items)", blocks.length === 5, JSON.stringify(blocks.map((x) => x.text)));
+    const moved = P.moveBlock(text, 2, 1);
+    check("T70: Alt+Arrow moves the current block down", moved.moved && moved.text.startsWith("Second para."), moved.text.slice(0, 60));
+    const reordered = P.reorderBlocks(text, 0, 2);
+    check("T70: drag reorder moves a block", reordered.moved && reordered.text.split("\n\n")[2].startsWith("First"), reordered.text.slice(0, 80));
+    check("T70: moving past the edge is a no-op", !P.moveBlock(text, 2, -1).moved);
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.getElementById("toggle-split-preview"));
+    const fields = doc.querySelector(".editor-fields");
+    check("T70: split toggle adds the split layout", !!fields && fields.classList.contains("editor-split"));
+    check("T70: split shows editor and preview together", !doc.getElementById("note-body").hidden && !doc.getElementById("markdown-preview").hidden);
+    click(doc.getElementById("toggle-split-preview"));
+    check("T70: split toggle exits back to edit", !fields.classList.contains("editor-split"));
+    check("T70: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T71 (Phase 3, Item 7): graph v2 — local graph, orphans, controls */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const P = win.xPinPhase3;
+    const notes = [
+      { id: "g1", title: "A", body: "see [[B]]", folderId: null, parentNoteId: null },
+      { id: "g2", title: "B", body: "see [[C]]", folderId: null, parentNoteId: null },
+      { id: "g3", title: "C", body: "", folderId: null, parentNoteId: null },
+      { id: "g4", title: "Lonely", body: "nothing links here", folderId: null, parentNoteId: null }
+    ];
+    const full = P.buildGraph(notes);
+    check("T71: full graph has edges", full.edges.length === 2, JSON.stringify(full.edges));
+    const local = P.localGraph(notes, "g1", 1);
+    check("T71: local graph 1 hop is just A+B", local.nodes.length === 2 && local.edges.length === 1, JSON.stringify(local.nodes.map((n) => n.id)));
+    const local2 = P.localGraph(notes, "g1", 2);
+    check("T71: local graph 2 hops reaches C", local2.nodes.length === 3, JSON.stringify(local2.nodes.map((n) => n.id)));
+    const orphans = P.findOrphans(notes);
+    check("T71: orphan detection finds the unlinked note", orphans.length === 1 && orphans[0].id === "g4", JSON.stringify(orphans.map((n) => n.id)));
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.querySelector('[data-feature-view="graph"]'));
+    await flush(80);
+    const content = doc.getElementById("feature-content");
+    check("T71: graph controls render (scope, zoom, filters, orphans)", !!content.querySelector(".graph-controls") && content.textContent.includes("Local graph") && content.textContent.includes("Orphans only"), content.textContent.slice(0, 200));
+    check("T71: zoom label present", !!content.querySelector(".graph-zoom"));
+    check("T71: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T72 (Phase 3, Item 8): comments sync round-trip + mention notification */
+  {
+    const b = boot(null);
+    await flush(120);
+    const P = b.win.xPinPhase3;
+    const S = b.win.xPinSync;
+    const phase3 = b.win.xPinDomain.getState().phase3;
+    const comment = P.createComment(phase3, { noteId: "n1", deviceId: "xpin-aaa", author: "You", body: "Nice note @xpin-bbb, see you soon" });
+    check("T72: comment created", phase3.comments.length === 1 && comment.body.includes("@xpin-bbb"));
+    check("T72: mention extracted", P.extractMentions(comment.body).join(",") === "xpin-bbb");
+    check("T72: mention recorded unread", P.unreadMentions(phase3).length === 1);
+    const space = P.createSpace(phase3, { name: "Team", memberDeviceIds: ["xpin-aaa", "xpin-bbb"] });
+    P.shareNoteToSpace(phase3, "n1", space.id);
+    check("T72: note shared to space", P.spacesForNote(phase3, "n1").length === 1);
+    const key = await S.deriveSyncKey("comment-passphrase-123", S.newSalt());
+    const env = await S.makeRecordEnvelope({ key, deviceId: "xpin-aaa", lamport: 1, record: comment, op: "comment" });
+    check("T72: comment envelope validates", S.validateEnvelope(env).op === "comment");
+    const local = { notes: [], trash: [], comments: [], spaces: [] };
+    const applied = await S.applyEnvelope(env, local, key, []);
+    check("T72: comment envelope applies on another device", applied.applied && local.comments.length === 1 && local.comments[0].body === comment.body, JSON.stringify(applied));
+    const again = await S.applyEnvelope(env, local, key, [env.id]);
+    check("T72: re-applying the same envelope is a no-op (idempotent)", !again.applied, JSON.stringify(again));
+    const spaceEnv = await S.makeRecordEnvelope({ key, deviceId: "xpin-aaa", lamport: 2, record: space, op: "space" });
+    const appliedSpace = await S.applyEnvelope(spaceEnv, local, key, []);
+    check("T72: space envelope applies", appliedSpace.applied && local.spaces.length === 1 && local.spaces[0].name === "Team", JSON.stringify(appliedSpace));
+    let wrongKeyThrows = false;
+    const otherKey = await S.deriveSyncKey("different-passphrase-1", S.newSalt());
+    try { await S.applyEnvelope(env, { notes: [], trash: [], comments: [], spaces: [] }, otherKey, []); } catch { wrongKeyThrows = true; }
+    check("T72: comment from another key cannot be decrypted", wrongKeyThrows);
+    check("T72: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T73 (Phase 3, Item 9): back-button logic, theme/font, real dialogs, share text */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const P = win.xPinPhase3;
+    check("T73: back closes a dialog first", P.backButtonAction({ dialogOpen: true, viewActive: true }) === "close-dialog");
+    check("T73: back goes back from a view", P.backButtonAction({ dialogOpen: false, viewActive: true }) === "go-back");
+    check("T73: back exits only at the top level", P.backButtonAction({ dialogOpen: false, viewActive: false }) === "exit");
+    P.applyThemeSettings(doc, { theme: "light", font: "mono" });
+    check("T73: light theme + mono font applied to the document", doc.documentElement.dataset.xPinTheme === "light" && doc.documentElement.dataset.xPinFont === "mono");
+    P.applyThemeSettings(doc, { theme: "dark", font: "system" });
+    check("T73: theme resets to dark/system", doc.documentElement.dataset.xPinTheme === "dark" && doc.documentElement.dataset.xPinFont === "system");
+    check("T73: share text is title + body", P.shareTextForNote({ title: "Hi", body: "there" }) === "Hi\n\nthere");
+    check("T73: shared text captures to an Inbox note", JSON.stringify(P.captureSharedText("hello world\nsecond line", "Other app")).includes("hello world"));
+    check("T73: empty shared text captures nothing", P.captureSharedText("   ") === null);
+    // Real dialog: resolves with the typed value, no window.prompt involved.
+    const pending = P.showDialog(doc, { title: "Test dialog", label: "Name", value: "initial" });
+    const input = doc.querySelector(".xpin-dialog-input");
+    check("T73: dialog renders with the initial value", !!input && input.value === "initial");
+    if (input) input.value = "typed-name";
+    const doneBtn = doc.querySelector(".xpin-dialog .dialog-done");
+    if (doneBtn) doneBtn.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const resolved = await pending;
+    check("T73: dialog resolves with the typed value", resolved === "typed-name", String(resolved));
+    check("T73: dialog is removed after confirm", !doc.querySelector(".xpin-dialog"));
+    check("T73: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T74 (Phase 3, Item 9): storage display stays accurate with attachments; no window.prompt remains */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const state = win.xPinDomain.getState();
+    state.attachments.push({ id: "att-t74", noteId: null, name: "pic.png", mime: "image/png", size: 2048, createdAt: new Date().toISOString(), data: null, synced: false });
+    const info = win.xPinDomain.getState();
+    check("T74: attachment counted in state", info.attachments.length === 1 && info.attachments[0].size === 2048);
+    // The Workspace tools storage section must show the attachment bytes.
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.querySelector('[data-feature-view="settings"]'));
+    await flush(80);
+    const settingsText = doc.getElementById("feature-content").textContent;
+    check("T74: storage display includes the attachment", /1 attachment/.test(settingsText), settingsText.slice(0, 300));
+    const fs = require("fs");
+    const appSrc = fs.readFileSync(REPO + "/app.js", "utf8");
+    const featSrc = fs.readFileSync(REPO + "/feature-suite.js", "utf8");
+    check("T74: no window.prompt left in app.js", !appSrc.includes("window.prompt"));
+    check("T74: no window.prompt left in feature-suite.js", !featSrc.includes("window.prompt"));
+    check("T74: no eval/Function in phase3.js", !/[^a-zA-Z]eval\s*\(|new Function/.test(fs.readFileSync(REPO + "/phase3.js", "utf8")));
+    check("T74: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T75 (Phase 3): power view opens clean; tasks + calendar render */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Task note");
+    type(doc.getElementById("note-body"), "- [ ] Buy milk due:2026-11-20 p:high\n\n```xpin-task\n{\"title\":\"Ship it\",\"status\":\"open\",\"due\":\"2026-11-20\",\"priority\":\"high\"}\n```");
+    click(doc.querySelector('[data-phase3-view="power"]'));
+    await flush(80);
+    const view = doc.getElementById("phase3-view");
+    check("T75: power view opens", !view.hidden, `hidden=${view.hidden}`);
+    check("T75: task list shows the scored task", view.textContent.includes("Buy milk"), view.textContent.slice(0, 300));
+    check("T75: scoring formula is shown", view.textContent.includes("Score = urgency"));
+    check("T75: calendar grid renders", !!view.querySelector(".p3-calendar") && view.querySelectorAll(".p3-cal-day").length >= 28, `days=${view.querySelectorAll(".p3-cal-day").length}`);
+    check("T75: scripts section renders", view.textContent.includes("Scripts in notes"));
+    check("T75: saved queries section renders", view.textContent.includes("Saved queries"));
+    check("T75: sharing section renders", view.textContent.includes("Sharing & spaces"));
+    check("T75: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T76 (Phase 3, Items 1–2): typed + script blocks render as cards in preview */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Blocks note");
+    type(doc.getElementById("note-body"), "```xpin-task\n{\"title\":\"Ship it\",\"status\":\"open\",\"due\":\"2026-11-20\",\"priority\":\"high\"}\n```\n\n```xpin-script\n// do nothing\n```");
+    click(doc.getElementById("toggle-preview"));
+    await flush(80);
+    const preview = doc.getElementById("markdown-preview");
+    check("T76: typed block renders as an editable card", !!preview.querySelector(".p3-typed-block") && preview.textContent.includes("Ship it"), preview.textContent.slice(0, 200));
+    check("T76: typed block shows its type chip", !!preview.querySelector(".p3-type-chip"));
+    check("T76: script block renders with a Run button", !!preview.querySelector(".p3-script-block") && preview.textContent.includes("Run script"), preview.textContent.slice(0, 200));
+    check("T76: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
   }
 
   /* report */

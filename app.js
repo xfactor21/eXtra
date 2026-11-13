@@ -90,6 +90,8 @@
     // loadWorkspace); keys live in the plaintext workspace blob EXCEPT AI
     // keys, which stay in connectorCredentials above.
     settings: { dailyLanding: true, ai: { enabled: false, provider: "claude", baseUrl: "", embeddingsEnabled: false, embeddingsBaseUrl: "" } },
+    // Phase 3 — Power & polish state (sanitized on load by xPinPhase3).
+    phase3: window.xPinPhase3?.defaultPhase3State?.() ?? { settings: { theme: "dark", font: "system", splitPreview: false }, scripts: { approved: [] }, hooks: [], savedQueries: [], spaces: [], comments: [], mentions: [], reminders: [], dbViews: {} },
     attachments: [], // {id, noteId, name, mime, size, createdAt, data?, synced} — blobs in phase2 IndexedDB
     readLater: [], // {id, url, title, text, fetchedText, fetchedAt, fetchStatus, savedAt, read}
     highlights: [], // {id, quote, sourceId, sourceTitle, sourceUrl, createdAt, dismissedAt, shownCount}
@@ -224,6 +226,8 @@
   let featureSuite = null;
   // Phase 2 — Capture & smarts UI controller (created at boot).
   let phase2UI = null;
+  // Phase 3 — Power & polish UI controller (created at boot).
+  let phase3UI = null;
   // Phase 1 — sync session state (in-memory only; never persisted).
   let syncSessionKey = null;
   let captureTokenVisibleOnce = null; // token text shown once after generation
@@ -598,6 +602,11 @@
         ...(window.xPinPhase2?.sanitizePhase2State
           ? window.xPinPhase2.sanitizePhase2State(parsed)
           : { settings: { dailyLanding: true, ai: { enabled: false, provider: "claude", baseUrl: "", embeddingsEnabled: false, embeddingsBaseUrl: "" } }, attachments: [], readLater: [], highlights: [], flashcards: [] }),
+        // Phase 3 — Power & polish state (sanitized by the phase3 module;
+        // unknown keys are dropped, known ones survive the round-trip).
+        ...(window.xPinPhase3?.sanitizePhase3State
+          ? window.xPinPhase3.sanitizePhase3State(parsed)
+          : { phase3: window.xPinPhase3?.defaultPhase3State?.() ?? { settings: { theme: "dark", font: "system", splitPreview: false }, scripts: { approved: [] }, hooks: [], savedQueries: [], spaces: [], comments: [], mentions: [], reminders: [], dbViews: {} } }),
         features: window.xPinFeatures.sanitizeState(parsed.features, notes),
         plugins: parsed.plugins && typeof parsed.plugins === "object"
           ? {
@@ -1528,6 +1537,7 @@
     featureSuite?.deactivate();
     hideEdgeEditor();
     hidePhase2View();
+    hidePhase3View();
     state.view = view === "canvas" ? "canvas" : "notes";
     const isCanvas = state.view === "canvas";
     ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : state.filter === "trash" ? "Trash" : "Recent notes");
@@ -1644,11 +1654,13 @@
     saveCanvasSoon();
   }
 
-  function renameCanvasBoard() {
+  async function renameCanvasBoard() {
     const board = currentCanvas();
     if (!board) return;
-    const name = window.prompt("Rename this board:", board.name);
-    if (name === null) return;
+    const name = await window.xPinPhase3?.showDialog(document, {
+      title: "Rename board", label: "Board name", value: board.name, confirmLabel: "Rename"
+    });
+    if (name === null || name === undefined) return;
     const cleanName = name.trim().slice(0, 100);
     if (!cleanName) return showToast("Board names cannot be empty.");
     board.name = cleanName;
@@ -2257,6 +2269,9 @@
         header.append(language, copy);
         const pre = document.createElement("pre");
         const codeElement = document.createElement("code");
+        // Phase 3 — tag the code element with its fence language so the
+        // preview enhancer can find xpin-task / xpin-script blocks.
+        codeElement.className = `language-${(fence[2] || "text").toLocaleLowerCase()}`;
         codeElement.innerHTML = highlightCode(code.join("\n"), fence[2]?.toLocaleLowerCase() || "text");
         pre.append(codeElement);
         block.append(header, pre);
@@ -2407,6 +2422,8 @@
         console.error("Could not resolve note attachments.", error);
       });
     }
+    // Phase 3 — typed blocks and script blocks render as cards in preview.
+    phase3UI?.enhancePreview(ui.markdownPreview, currentNote());
   }
 
   function setPreviewMode(enabled) {
@@ -4584,6 +4601,8 @@
     renderCoreToolsSections();
     // Phase 2 — week strip + sidebar counts (read-later unread, due cards).
     phase2UI?.renderDailyStrip();
+    // Phase 3 — sidebar sections, comments, reminders, power view.
+    phase3UI?.renderAll();
     const unread = state.readLater.filter((item) => !item.read).length;
     const readLaterCount = byId("readlater-count");
     if (readLaterCount) readLaterCount.textContent = String(unread);
@@ -4598,6 +4617,7 @@
   function openPhase2View(tab = "capture") {
     featureSuite?.deactivate();
     hideEdgeEditor();
+    hidePhase3View();
     byId("notes-toolbar").hidden = true;
     byId("notes-layout").hidden = true;
     ui.canvasView.hidden = true;
@@ -4617,6 +4637,41 @@
   function hidePhase2View() {
     const view = byId("phase2-view");
     if (view) view.hidden = true;
+  }
+
+  // Phase 3 — Power & polish panel (scripts, typed blocks, live queries,
+  // task scores + calendar, sharing, appearance). A view alongside
+  // notes/canvas, not a modal.
+  function openPhase3View() {
+    featureSuite?.deactivate();
+    hideEdgeEditor();
+    hidePhase2View();
+    byId("notes-toolbar").hidden = true;
+    byId("notes-layout").hidden = true;
+    ui.canvasView.hidden = true;
+    byId("new-folder").hidden = true;
+    const view = byId("phase3-view");
+    if (view) view.hidden = false;
+    document.querySelectorAll(".nav-item").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.phase3View === "power");
+    });
+    ui.currentView.textContent = "Power & polish";
+    ui.pageTitle.innerHTML = `Power &amp; polish<span class="title-period">.</span>`;
+    byId("notes-heading").querySelector(".page-subtitle").textContent = "Scripts, typed blocks, live queries, task scores, sharing.";
+    if (phase3UI) phase3UI.renderPowerView();
+    else if (view) view.replaceChildren();
+  }
+
+  function hidePhase3View() {
+    const view = byId("phase3-view");
+    if (view) view.hidden = true;
+  }
+
+  // Phase 3 (audit D1) — return to the notes list (Android back button).
+  function showNotesView() {
+    hidePhase2View();
+    hidePhase3View();
+    switchView("notes");
   }
 
   // Phase 2 (audit B1) — attach files to the current note. Blobs go to the
@@ -4877,12 +4932,19 @@
   // Phase 2 (research #5) — meeting note from the template, linked to the
   // day via note properties (Phase 0 metadata): date/time/attendees, plus
   // metadata.dailyDate so it shows up on that day.
-  function createMeetingNote() {
-    const title = window.prompt("Meeting title:", "") ?? "";
-    if (title === null) return null;
-    const attendees = window.prompt("Attendees (comma-separated):", "") ?? "";
-    const time = window.prompt("Time (e.g. 14:30):", "") ?? "";
-    if (attendees === null || time === null) return null;
+  async function createMeetingNote() {
+    const title = await window.xPinPhase3?.showDialog(document, {
+      title: "Meeting note", label: "Meeting title", value: "", placeholder: "e.g. Weekly sync", confirmLabel: "Next"
+    });
+    if (title === null || title === undefined) return null;
+    const attendees = await window.xPinPhase3?.showDialog(document, {
+      title: "Meeting note", label: "Attendees (comma-separated)", value: "", placeholder: "Ana, Bo", confirmLabel: "Next"
+    });
+    if (attendees === null || attendees === undefined) return null;
+    const time = await window.xPinPhase3?.showDialog(document, {
+      title: "Meeting note", label: "Time (e.g. 14:30)", value: "", placeholder: "14:30", confirmLabel: "Create"
+    });
+    if (time === null || time === undefined) return null;
     const built = window.xPinPhase2?.buildMeetingNote
       ? window.xPinPhase2.buildMeetingNote({ title, attendees, time })
       : { title: title.trim() || "Meeting notes", body: `# ${title.trim() || "Meeting notes"}\n\nAttendees: ${attendees}\n\n## Notes\n\n- \n\n## Actions\n\n- [ ] `, metadata: { meetingDate: localDateKey(), meetingTime: time, attendees, dailyDate: localDateKey() } };
@@ -6053,9 +6115,11 @@
     return { ...folder, noteCount };
   }
 
-  function createFolder() {
-    const name = window.prompt("Name your new folder:");
-    if (name === null) return;
+  async function createFolder() {
+    const name = await window.xPinPhase3?.showDialog(document, {
+      title: "New folder", label: "Folder name", value: "", placeholder: "e.g. Work", confirmLabel: "Create"
+    });
+    if (name === null || name === undefined) return;
     try {
       const folder = createFolderRecord(name);
       persistWorkspace();
@@ -6066,9 +6130,11 @@
     }
   }
 
-  function renameFolder(folder) {
-    const name = window.prompt("Rename this folder:", folder.name);
-    if (name === null) return;
+  async function renameFolder(folder) {
+    const name = await window.xPinPhase3?.showDialog(document, {
+      title: "Rename folder", label: "Folder name", value: folder.name, confirmLabel: "Rename"
+    });
+    if (name === null || name === undefined) return;
     try {
       renameFolderRecord(folder.id, name);
       persistWorkspace();
@@ -6398,13 +6464,15 @@
     deleteBoardButton.addEventListener("click", deleteCanvasBoard);
     newCanvasButton.insertAdjacentElement("afterend", deleteBoardButton);
     newCanvasButton.insertAdjacentElement("afterend", renameBoardButton);
-    newCanvasButton.addEventListener("click", () => {
+    newCanvasButton.addEventListener("click", async () => {
       if (state.canvases.length >= MAX_CANVASES) {
         showToast(`This workspace can contain at most ${MAX_CANVASES} boards.`);
         return;
       }
-      const name = window.prompt("Name your new board:");
-      if (name === null) return;
+      const name = await window.xPinPhase3?.showDialog(document, {
+        title: "New board", label: "Board name", value: "", placeholder: "e.g. Thinking board", confirmLabel: "Create"
+      });
+      if (name === null || name === undefined) return;
       const cleanName = name.trim();
       if (!cleanName) return showToast("Give your board a name first.");
       const canvas = { id: makeId("canvas"), name: cleanName.slice(0, 100), nodes: [], edges: [] };
@@ -6432,9 +6500,11 @@
       if (!note) return showToast("Open a note first to add it to this board.");
       addCanvasNode("file", { file: `notes/${note.id}.md`, xPinNoteId: note.id });
     });
-    byId("add-link-node").addEventListener("click", () => {
-      const value = window.prompt("Enter an http or https link:");
-      if (value === null) return;
+    byId("add-link-node").addEventListener("click", async () => {
+      const value = await window.xPinPhase3?.showDialog(document, {
+        title: "Add link", label: "Link URL", value: "", placeholder: "https://example.com", confirmLabel: "Add"
+      });
+      if (value === null || value === undefined) return;
       try {
         const url = new URL(value.trim());
         if (!["http:", "https:"].includes(url.protocol)) throw new TypeError("Only web links are supported.");
@@ -6672,6 +6742,9 @@
     // Phase 2 — Capture & smarts nav (Read Later / Flashcards / Capture).
     document.querySelectorAll("[data-phase2-view]").forEach((button) => {
       button.addEventListener("click", () => openPhase2View(button.dataset.phase2View));
+    });
+    document.querySelectorAll("[data-phase3-view]").forEach((button) => {
+      button.addEventListener("click", () => openPhase3View());
     });
     ui.togglePreview.addEventListener("click", () => setPreviewMode(!previewMode));
     ui.noteTitle.addEventListener("input", () => updateSelectedNote({ title: ui.noteTitle.value }));
@@ -6919,6 +6992,45 @@
     phase2UI?.renderDailyStrip();
   } catch (error) {
     console.error("Could not start Capture & smarts.", error);
+  }
+  // Phase 3 — Power & polish UI (scripts, typed blocks, queries, tasks +
+  // calendar, sharing/comments, appearance, Android back button). Guarded:
+  // a UI failure must never break boot.
+  try {
+    phase3UI = window.xPinPhase3?.createPhase3UI({
+      getState: () => state,
+      persist: persistWorkspace,
+      render,
+      toast: showToast,
+      notify: showToast,
+      createNote,
+      updateNote,
+      selectNote,
+      currentNote,
+      openDailyNote,
+      captureToInbox,
+      handleDeepLink,
+      getDeviceId: () => state.sync.deviceId ?? "",
+      emit: (name, detail) => pluginManager?.emit(name, detail),
+      on: (name, callback) => pluginManager?.on(name, callback),
+      openFeatureView: (view) => featureSuite?.open(view),
+      setFeatureQuery: (query) => {
+        state.features.query = String(query ?? "").slice(0, 500);
+        featureSuite?.open("database");
+      },
+      showNotesView,
+      renderPreview: (body) => renderMarkdownPreview(body),
+      insertText(text) {
+        if (!currentNote()) createNote();
+        const start = ui.noteBody.selectionStart;
+        const end = ui.noteBody.selectionEnd;
+        ui.noteBody.setRangeText(text, start, end, "end");
+        ui.noteBody.dispatchEvent(new Event("input", { bubbles: true }));
+        ui.noteBody.focus();
+      }
+    }) ?? null;
+  } catch (error) {
+    console.error("Could not start Power & polish.", error);
   }
   setupEvents();
   render();

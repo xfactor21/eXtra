@@ -3,7 +3,7 @@
 
   const VIEW_NAMES = ["database", "graph", "settings"];
   const DATABASE_VIEWS = ["table", "board", "calendar", "gallery", "timeline"];
-  const COLUMN_TYPES = ["text", "status", "date", "number", "relation", "rollup"];
+  const COLUMN_TYPES = ["text", "status", "date", "number", "relation", "rollup", "formula"];
   const ACCENTS = {
     cyan: ["#54dce8", "#83f0f3"],
     coral: ["#ff755d", "#ff9b86"],
@@ -86,6 +86,12 @@
             // a stale scope cleanly falls back to counting all inbound relations.
             safe.sourceColumnId = column.sourceColumnId;
           }
+        }
+        // Phase 3 (Databases v2) — formula columns keep their expression
+        // (a safe, hand-parsed expression; never eval). Invalid expressions
+        // are kept too and render as an error, never silently dropped.
+        if (column.type === "formula" && typeof column.expression === "string") {
+          safe.expression = column.expression.slice(0, 500);
         }
         return [safe];
       });
@@ -296,6 +302,16 @@
 
     function fieldControl(table, row, column) {
       const value = row.values[column.id] ?? "";
+      // Phase 3 (Databases v2) — formula columns compute live and are
+      // read-only. The expression is parsed by hand, never eval'd.
+      if (column.type === "formula") {
+        const result = window.xPinPhase3?.evaluateFormula(column.expression ?? "", row, table.columns);
+        const badge = el("span", "formula-value", result?.ok
+          ? window.xPinPhase3.formatFormulaValue(result.value)
+          : `⚠ ${result?.error ?? "Invalid formula"}`);
+        badge.title = column.expression ? `Formula: ${column.expression}` : "No formula set for this column.";
+        return badge;
+      }
       if (column.type === "rollup") {
         const badge = el("span", "rollup-value", String(incomingRelations(table.id, row.id, column.sourceColumnId)));
         badge.title = column.sourceColumnId
@@ -361,8 +377,95 @@
       return input;
     }
 
+    // Phase 3 (Databases v2) — per-view sort, filter, and group. The view
+    // state lives in phase3.dbViews[tableId]; the table view is the one
+    // that applies it (board/calendar/gallery/timeline keep their own
+    // shapes and show the unfiltered rows).
+    function dbViewState(tableId) {
+      const phase3 = host.getState().phase3;
+      if (!phase3) return { sortColumnId: "", sortDir: "asc", filterColumnId: "", filterOp: "", filterValue: "", groupByColumnId: "" };
+      if (!phase3.dbViews) phase3.dbViews = {};
+      if (!phase3.dbViews[tableId]) {
+        phase3.dbViews[tableId] = { sortColumnId: "", sortDir: "asc", filterColumnId: "", filterOp: "", filterValue: "", groupByColumnId: "" };
+      }
+      return phase3.dbViews[tableId];
+    }
+
+    function renderViewControls(table) {
+      const view = dbViewState(table.id);
+      const bar = el("div", "database-view-controls");
+      bar.append(el("span", "database-view-label", "View:"));
+      const sort = el("select", "feature-select");
+      sort.dataset.action = "view-sort";
+      sort.setAttribute("aria-label", "Sort by column");
+      const noSort = el("option", "", "No sorting");
+      noSort.value = "";
+      sort.append(noSort);
+      table.columns.forEach((column) => {
+        const option = el("option", "", column.name);
+        option.value = column.id;
+        if (column.id === view.sortColumnId) option.selected = true;
+        sort.append(option);
+      });
+      const dir = el("select", "feature-select");
+      dir.dataset.action = "view-sort-dir";
+      dir.setAttribute("aria-label", "Sort direction");
+      [["asc", "↑ A–Z / low–high"], ["desc", "↓ Z–A / high–low"]].forEach(([value, label]) => {
+        const option = el("option", "", label);
+        option.value = value;
+        if (value === view.sortDir) option.selected = true;
+        dir.append(option);
+      });
+      const filterColumn = el("select", "feature-select");
+      filterColumn.dataset.action = "view-filter-column";
+      filterColumn.setAttribute("aria-label", "Filter by column");
+      const noFilter = el("option", "", "No filter");
+      noFilter.value = "";
+      filterColumn.append(noFilter);
+      table.columns.forEach((column) => {
+        const option = el("option", "", column.name);
+        option.value = column.id;
+        if (column.id === view.filterColumnId) option.selected = true;
+        filterColumn.append(option);
+      });
+      const filterOp = el("select", "feature-select");
+      filterOp.dataset.action = "view-filter-op";
+      filterOp.setAttribute("aria-label", "Filter operator");
+      [["=", "is"], ["contains", "contains"], [">", ">"], ["<", "<"], ["empty", "is empty"], ["not-empty", "is not empty"]].forEach(([value, label]) => {
+        const option = el("option", "", label);
+        option.value = value;
+        if (value === view.filterOp) option.selected = true;
+        filterOp.append(option);
+      });
+      const filterValue = el("input", "feature-input");
+      filterValue.dataset.action = "view-filter-value";
+      filterValue.placeholder = "Filter value";
+      filterValue.value = view.filterValue;
+      filterValue.setAttribute("aria-label", "Filter value");
+      const group = el("select", "feature-select");
+      group.dataset.action = "view-group";
+      group.setAttribute("aria-label", "Group by column");
+      const noGroup = el("option", "", "No grouping");
+      noGroup.value = "";
+      group.append(noGroup);
+      table.columns.forEach((column) => {
+        const option = el("option", "", column.name);
+        option.value = column.id;
+        if (column.id === view.groupByColumnId) option.selected = true;
+        group.append(option);
+      });
+      bar.append(sort, dir, filterColumn, filterOp, filterValue, group);
+      bar.append(el("span", "feature-help", "Sort, filter, and group apply to the table view only."));
+      return bar;
+    }
+
     function renderTable(table) {
       const container = el("div", "database-table-scroll");
+      container.append(renderViewControls(table));
+      const view = dbViewState(table.id);
+      const applied = window.xPinPhase3?.applyDatabaseView
+        ? window.xPinPhase3.applyDatabaseView(table.rows, table.columns, view)
+        : { rows: table.rows, groups: null };
       const tableElement = el("table", "database-table");
       const head = el("thead");
       const headerRow = el("tr");
@@ -370,7 +473,7 @@
       headerRow.append(el("th", "database-row-action-heading", " "));
       head.append(headerRow);
       const body = el("tbody");
-      table.rows.forEach((row) => {
+      const renderRow = (row) => {
         const tr = el("tr");
         table.columns.forEach((column) => {
           const td = el("td");
@@ -378,6 +481,18 @@
           tr.append(td);
         });
         const actionCell = el("td");
+        // Phase 3 — a row with a date field can set a reminder for that day.
+        const dateColumn = table.columns.find((column) => column.type === "date" && row.values[column.id]);
+        if (dateColumn) {
+          const remind = el("button", "database-row-remind", "⏰");
+          remind.type = "button";
+          remind.dataset.action = "remind-row";
+          remind.dataset.rowId = row.id;
+          remind.dataset.date = row.values[dateColumn.id];
+          remind.setAttribute("aria-label", `Remind me on ${row.values[dateColumn.id]}`);
+          remind.title = `Remind me on ${row.values[dateColumn.id]}`;
+          actionCell.append(remind);
+        }
         const remove = el("button", "database-row-remove", "×");
         remove.type = "button";
         remove.dataset.action = "delete-row";
@@ -386,17 +501,31 @@
         actionCell.append(remove);
         tr.append(actionCell);
         body.append(tr);
-      });
-      if (!table.rows.length) {
+      };
+      if (applied.groups) {
+        for (const group of applied.groups) {
+          const groupRow = el("tr");
+          const groupCell = el("td", "database-group-heading", `${group.key} (${group.rows.length})`);
+          groupCell.colSpan = table.columns.length + 1;
+          groupRow.append(groupCell);
+          body.append(groupRow);
+          group.rows.forEach(renderRow);
+        }
+      } else {
+        applied.rows.forEach(renderRow);
+      }
+      if (!applied.rows.length) {
         const tr = el("tr");
-        const td = el("td", "database-empty-cell", "No records yet. Add a row, then connect it to another table.");
+        const td = el("td", "database-empty-cell", table.rows.length ? "No records match this view. Clear the filter to see them all." : "No records yet. Add a row, then connect it to another table.");
         td.colSpan = table.columns.length + 1;
         tr.append(td);
         body.append(tr);
       }
       tableElement.append(head, body);
       container.append(tableElement);
-      const footer = el("div", "database-footer", `${table.rows.length} ${table.rows.length === 1 ? "record" : "records"} · ${table.columns.length} properties`);
+      const footer = el("div", "database-footer", applied.rows.length === table.rows.length
+        ? `${table.rows.length} ${table.rows.length === 1 ? "record" : "records"} · ${table.columns.length} properties`
+        : `${applied.rows.length} of ${table.rows.length} records · ${table.columns.length} properties`);
       const fieldControls = el("div", "database-add-field");
       const name = el("input", "feature-input");
       name.placeholder = "Property name";
@@ -408,7 +537,7 @@
       type.setAttribute("aria-label", "New property type");
       [
         ["text", "Text"], ["status", "Status"], ["date", "Date"], ["number", "Number"],
-        ["relation", "Relation"], ["rollup", "Rollup count"]
+        ["relation", "Relation"], ["rollup", "Rollup count"], ["formula", "Formula"]
       ].forEach(([value, label]) => {
         const option = el("option", "", label);
         option.value = value;
@@ -438,14 +567,22 @@
       });
       target.hidden = type.value !== "relation";
       source.hidden = type.value !== "rollup";
+      // Phase 3 — formula expression input, shown only for formula columns.
+      const expression = el("input", "feature-input");
+      expression.placeholder = "Formula, e.g. = price * qty";
+      expression.maxLength = 500;
+      expression.dataset.role = "new-column-expression";
+      expression.setAttribute("aria-label", "Formula expression (e.g. = price * qty, = days(due, today()))");
+      expression.hidden = type.value !== "formula";
       type.addEventListener("change", () => {
         target.hidden = type.value !== "relation";
         source.hidden = type.value !== "rollup";
+        expression.hidden = type.value !== "formula";
       });
       const add = el("button", "feature-button", "＋ Property");
       add.type = "button";
       add.dataset.action = "add-column";
-      fieldControls.append(name, type, target, source, add);
+      fieldControls.append(name, type, target, source, expression, add);
       const manageControls = el("div", "database-add-field");
       const existing = el("select", "feature-select");
       existing.dataset.role = "manage-column";
@@ -470,6 +607,10 @@
 
     function valueText(table, row, column) {
       const value = row.values[column.id] ?? "";
+      if (column.type === "formula") {
+        const result = window.xPinPhase3?.evaluateFormula(column.expression ?? "", row, table.columns);
+        return result?.ok ? window.xPinPhase3.formatFormulaValue(result.value) : "";
+      }
       if (column.type === "rollup") return `${incomingRelations(table.id, row.id, column.sourceColumnId)} linked`;
       if (column.type === "relation") {
         if (column.targetTableId === "notes") return host.getState().notes.find((note) => note.id === value)?.title ?? "";
@@ -640,21 +781,23 @@
         ["LIST FROM notes WHERE title CONTAINS \"part\"", "Substring match. Also works with folder."],
         ["LIST FROM notes WHERE folder = \"Work\"", "Matches the folder name."],
         ["LIST FROM notes WHERE tag = work", "Matches notes tagged #work (#work works too)."],
-        ["LIST FROM notes WHERE pinned = true", "Pinned notes; use false for the rest."]
+        ["LIST FROM notes WHERE pinned = true", "Pinned notes; use false for the rest."],
+        ["LIST FROM notes WHERE tag = work AND pinned = true", "AND binds tighter than OR; combine several conditions."],
+        ["LIST FROM notes WHERE created >= 2026-11-01 ORDER BY updated DESC LIMIT 10", "Date comparisons, sorting, and a result cap."]
       ];
       examples.forEach(([syntax, meaning]) => {
         const item = el("div", "query-help-item");
         item.append(el("code", "", syntax), el("span", "", meaning));
         panel.append(item);
       });
-      panel.append(el("p", "feature-help", "One WHERE condition per query. Click a result to open the note."));
+      panel.append(el("p", "feature-help", "Combine conditions with AND / OR, sort with ORDER BY field ASC|DESC, cap results with LIMIT n. Click a result to open the note."));
       return panel;
     }
 
     function renderQuery() {
       const sectionEl = el("section", "dataview-panel");
       const intro = el("div");
-      intro.append(el("h3", "", "Note query"), el("p", "", "Read-only grammar: LIST or TABLE fields FROM notes, optionally WHERE title/folder/tag/pinned = value or title CONTAINS value."));
+      intro.append(el("h3", "", "Note query"), el("p", "", "Read-only grammar: LIST or TABLE fields FROM notes, optionally WHERE conditions joined by AND/OR, ORDER BY field ASC|DESC, LIMIT n."));
       const controls = el("div", "query-controls");
       const input = el("input", "feature-input query-input");
       input.value = featureState.query;
@@ -684,6 +827,46 @@
 
     function runQuery() {
       const raw = featureState.query.trim();
+      // Phase 3 (query v2) — AND/OR, ORDER BY, LIMIT, date comparisons.
+      // The grammar stays regex + allowlist; the parser lives in phase3.js.
+      if (window.xPinPhase3?.parseQueryV2 && window.xPinPhase3?.runQueryV2) {
+        let parsed;
+        try {
+          parsed = window.xPinPhase3.parseQueryV2(raw);
+        } catch (error) {
+          throw error;
+        }
+        const notes = window.xPinPhase3.runQueryV2(host.getState().notes, host.getState().folders, host.extractTags, parsed);
+        const mode = parsed.mode;
+        const fields = parsed.fields;
+        const results = el("div", mode === "TABLE" ? "query-table-results" : "query-list-results");
+        notes.forEach((note) => {
+          const row = el("button", "query-result-row");
+          row.type = "button";
+          row.addEventListener("click", () => {
+            deactivate();
+            host.selectNote(note.id);
+          });
+          fields.forEach((field) => {
+            const folder = host.getState().folders.find((item) => item.id === note.folderId)?.name ?? "Unfiled";
+            const values = {
+              title: note.title || "Untitled note",
+              folder,
+              pinned: note.pinned ? "Pinned" : "—",
+              created: formatDate(note.createdAt),
+              updated: formatDate(note.updatedAt),
+              parent: host.getState().notes.find((item) => item.id === note.parentNoteId)?.title ?? "—",
+              tags: host.extractTags(`${note.title}\n${note.body}`).join(", ") || "—"
+            };
+            row.append(el("span", "query-result-field", values[field]));
+          });
+          results.append(row);
+        });
+        if (!notes.length) results.append(el("p", "feature-empty", "No notes match this query."));
+        queryResult = results;
+        render();
+        return;
+      }
       const match = raw.match(/^(LIST|TABLE(?:\s+([a-zA-Z, ]+))?)\s+FROM\s+notes(?:\s+WHERE\s+(title|folder|tag|pinned)\s*(=|CONTAINS)\s*(.+))?$/i);
       if (!match) throw new TypeError("Use LIST FROM notes or TABLE title,folder FROM notes with one supported WHERE condition.");
       const mode = match[1].toLocaleUpperCase().startsWith("TABLE") ? "TABLE" : "LIST";
@@ -747,38 +930,140 @@
       render();
     }
 
+    // Phase 3 (Graph v2) — local-graph view, zoom/pan, tag + folder
+    // filters, orphan detection. The 150-node cap is shown honestly.
+    let graphZoom = 1;
+    let graphPan = { x: 0, y: 0 };
+    let graphScope = "full"; // "full" | "local"
+    let graphHops = 1;
+    let graphTagFilter = "";
+    let graphFolderFilter = "";
+    let graphOrphansOnly = false;
+
     function renderGraph() {
-      const notes = host.getState().notes.slice(0, 150);
+      const allNotes = host.getState().notes;
       const wrapper = el("div", "graph-workspace");
       wrapper.append(el("p", "feature-help", "Links use [[exact note titles]]. Parent-page relationships also create connections."));
-      if (!notes.length) {
+      if (!allNotes.length) {
         wrapper.append(el("p", "feature-empty", "Create a note to add the first node."));
         return wrapper;
       }
+      // Controls: scope, hops, zoom, filters, orphans.
+      const controls = el("div", "graph-controls");
+      const scopeSelect = el("select", "feature-select");
+      scopeSelect.setAttribute("aria-label", "Graph scope");
+      [["full", "Full graph"], ["local", "Local graph (current note)"]].forEach(([value, label]) => {
+        const option = el("option", "", label);
+        option.value = value;
+        if (value === graphScope) option.selected = true;
+        scopeSelect.append(option);
+      });
+      scopeSelect.addEventListener("change", () => { graphScope = scopeSelect.value; render(); });
+      const hopsSelect = el("select", "feature-select");
+      hopsSelect.setAttribute("aria-label", "Local graph hops");
+      [[1, "1 hop"], [2, "2 hops"]].forEach(([value, label]) => {
+        const option = el("option", "", label);
+        option.value = String(value);
+        if (value === graphHops) option.selected = true;
+        hopsSelect.append(option);
+      });
+      hopsSelect.addEventListener("change", () => { graphHops = Number(hopsSelect.value); render(); });
+      hopsSelect.disabled = graphScope !== "local";
+      const zoomOut = el("button", "feature-button", "−");
+      zoomOut.type = "button";
+      zoomOut.setAttribute("aria-label", "Zoom out");
+      zoomOut.addEventListener("click", () => { graphZoom = Math.max(0.25, graphZoom - 0.25); render(); });
+      const zoomLabel = el("output", "graph-zoom", `${Math.round(graphZoom * 100)}%`);
+      const zoomIn = el("button", "feature-button", "＋");
+      zoomIn.type = "button";
+      zoomIn.setAttribute("aria-label", "Zoom in");
+      zoomIn.addEventListener("click", () => { graphZoom = Math.min(3, graphZoom + 0.25); render(); });
+      const zoomReset = el("button", "feature-button", "Reset view");
+      zoomReset.type = "button";
+      zoomReset.addEventListener("click", () => { graphZoom = 1; graphPan = { x: 0, y: 0 }; render(); });
+      const tagSelect = el("select", "feature-select");
+      tagSelect.setAttribute("aria-label", "Filter graph by tag");
+      const allTags = [...new Set(allNotes.flatMap((note) => host.extractTags(`${note.title}\n${note.body}`)))].sort();
+      const noTag = el("option", "", "All tags");
+      noTag.value = "";
+      tagSelect.append(noTag);
+      allTags.forEach((tag) => {
+        const option = el("option", "", tag);
+        option.value = tag;
+        if (tag === graphTagFilter) option.selected = true;
+        tagSelect.append(option);
+      });
+      tagSelect.addEventListener("change", () => { graphTagFilter = tagSelect.value; render(); });
+      const folderSelect = el("select", "feature-select");
+      folderSelect.setAttribute("aria-label", "Filter graph by folder");
+      const noFolder = el("option", "", "All folders");
+      noFolder.value = "";
+      folderSelect.append(noFolder);
+      host.getState().folders.forEach((folder) => {
+        const option = el("option", "", folder.name);
+        option.value = folder.id;
+        if (folder.id === graphFolderFilter) option.selected = true;
+        folderSelect.append(option);
+      });
+      folderSelect.addEventListener("change", () => { graphFolderFilter = folderSelect.value; render(); });
+      const orphanLabel = el("label", "graph-orphan-toggle");
+      const orphanCheck = el("input");
+      orphanCheck.type = "checkbox";
+      orphanCheck.checked = graphOrphansOnly;
+      orphanCheck.addEventListener("change", () => { graphOrphansOnly = orphanCheck.checked; render(); });
+      orphanLabel.append(orphanCheck, el("span", "", "Orphans only"));
+      controls.append(scopeSelect, hopsSelect, zoomOut, zoomLabel, zoomIn, zoomReset, tagSelect, folderSelect, orphanLabel);
+      wrapper.append(controls);
+
+      // Data: full or local graph, then tag/folder/orphan filters.
+      const P3 = window.xPinPhase3;
+      let graph = P3?.buildGraph ? P3.buildGraph(allNotes, 150) : { nodes: allNotes.slice(0, 150).map((n) => ({ id: n.id, title: n.title })), edges: [], capped: allNotes.length > 150, total: allNotes.length };
+      if (graphScope === "local" && host.currentNote?.()?.id && P3?.localGraph) {
+        graph = P3.localGraph(allNotes, host.currentNote().id, graphHops);
+      }
+      let visibleIds = new Set(graph.nodes.map((n) => n.id));
+      if (graphOrphansOnly && P3?.findOrphans) {
+        const orphanIds = new Set(P3.findOrphans(allNotes).map((n) => n.id));
+        visibleIds = new Set([...visibleIds].filter((id) => orphanIds.has(id)));
+      }
+      if (graphTagFilter) {
+        visibleIds = new Set([...visibleIds].filter((id) => {
+          const note = allNotes.find((n) => n.id === id);
+          return note && host.extractTags(`${note.title}\n${note.body}`).includes(graphTagFilter);
+        }));
+      }
+      if (graphFolderFilter) {
+        visibleIds = new Set([...visibleIds].filter((id) => {
+          const note = allNotes.find((n) => n.id === id);
+          return note && note.folderId === graphFolderFilter;
+        }));
+      }
+      const visibleNodes = graph.nodes.filter((n) => visibleIds.has(n.id));
+      const visibleEdges = graph.edges.filter(([a, b]) => visibleIds.has(a) && visibleIds.has(b));
+      if (!visibleNodes.length) {
+        wrapper.append(el("p", "feature-empty", graphScope === "local"
+          ? "The current note has no linked neighbours in this range."
+          : "No notes match these graph filters."));
+        return wrapper;
+      }
       const stage = el("div", "graph-stage");
+      const canvas = el("div", "graph-canvas");
+      canvas.style.transform = `translate(${graphPan.x}px, ${graphPan.y}px) scale(${graphZoom})`;
       const edges = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       edges.classList.add("graph-edges");
       edges.setAttribute("viewBox", "0 0 1000 600");
-      const byTitle = new Map(notes.map((note) => [note.title.trim().toLocaleLowerCase(), note]));
-      const positions = new Map(notes.map((note, index) => {
-        const angle = (Math.PI * 2 * index) / Math.max(1, notes.length);
-        return [note.id, { x: 500 + Math.cos(angle) * Math.min(360, 100 + notes.length * 4), y: 300 + Math.sin(angle) * Math.min(220, 80 + notes.length * 2) }];
+      const positions = new Map(visibleNodes.map((node, index) => {
+        const angle = (Math.PI * 2 * index) / Math.max(1, visibleNodes.length);
+        return [node.id, { x: 500 + Math.cos(angle) * Math.min(360, 100 + visibleNodes.length * 4), y: 300 + Math.sin(angle) * Math.min(220, 80 + visibleNodes.length * 2) }];
       }));
-      const edgesList = [];
       const edgeKeys = new Set();
-      notes.forEach((note) => {
-        if (note.parentNoteId && positions.has(note.parentNoteId)) edgesList.push([note.parentNoteId, note.id]);
-        for (const match of note.body.matchAll(/\[\[([^\]]{1,120})\]\]/g)) {
-          const target = byTitle.get(match[1].trim().toLocaleLowerCase());
-          if (target && target.id !== note.id) edgesList.push([note.id, target.id]);
-        }
-      });
-      edgesList.forEach(([fromId, toId]) => {
+      visibleEdges.forEach(([fromId, toId]) => {
         const key = [fromId, toId].sort().join(":");
         if (edgeKeys.has(key)) return;
         edgeKeys.add(key);
         const from = positions.get(fromId);
         const to = positions.get(toId);
+        if (!from || !to) return;
         const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
         line.setAttribute("x1", String(from.x));
         line.setAttribute("y1", String(from.y));
@@ -786,23 +1071,46 @@
         line.setAttribute("y2", String(to.y));
         edges.append(line);
       });
-      stage.append(edges);
-      notes.forEach((note) => {
-        const point = positions.get(note.id);
-        const button = el("button", "graph-node", note.title.trim() || "Untitled note");
+      canvas.append(edges);
+      visibleNodes.forEach((node) => {
+        const note = allNotes.find((n) => n.id === node.id);
+        const point = positions.get(node.id);
+        const button = el("button", "graph-node", note?.title?.trim() || "Untitled note");
         button.type = "button";
         button.style.left = `${point.x / 10}%`;
         button.style.top = `${point.y / 6}%`;
         button.addEventListener("click", () => {
           deactivate();
-          host.selectNote(note.id);
+          host.selectNote(node.id);
         });
-        stage.append(button);
+        canvas.append(button);
       });
+      stage.append(canvas);
+      // Pan: drag the background. Wheel: zoom.
+      let dragging = null;
+      stage.addEventListener("mousedown", (event) => {
+        if (event.target !== stage && event.target !== canvas && event.target.tagName !== "svg") return;
+        dragging = { x: event.clientX - graphPan.x, y: event.clientY - graphPan.y };
+      });
+      stage.addEventListener("mousemove", (event) => {
+        if (!dragging) return;
+        graphPan = { x: event.clientX - dragging.x, y: event.clientY - dragging.y };
+        canvas.style.transform = `translate(${graphPan.x}px, ${graphPan.y}px) scale(${graphZoom})`;
+      });
+      stage.addEventListener("mouseup", () => { dragging = null; });
+      stage.addEventListener("mouseleave", () => { dragging = null; });
+      stage.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        graphZoom = Math.max(0.25, Math.min(3, graphZoom + (event.deltaY < 0 ? 0.1 : -0.1)));
+        canvas.style.transform = `translate(${graphPan.x}px, ${graphPan.y}px) scale(${graphZoom})`;
+        zoomLabel.textContent = `${Math.round(graphZoom * 100)}%`;
+      }, { passive: false });
       wrapper.append(stage);
-      if (host.getState().notes.length > 150) wrapper.append(el("small", "feature-help", "Showing the first 150 notes."));
+      if (graph.capped || allNotes.length > 150) wrapper.append(el("small", "feature-help", `Showing the first 150 of ${allNotes.length} notes.`));
+      else if (visibleNodes.length < graph.nodes.length) wrapper.append(el("small", "feature-help", `Showing ${visibleNodes.length} of ${graph.nodes.length} notes in this view.`));
       return wrapper;
     }
+
 
     function renderSettings() {
       const wrap = el("div", "workspace-tools");
@@ -947,9 +1255,11 @@
       content.querySelector(".database-cell-input")?.focus();
     }
 
-    function addTable() {
-      const name = window.prompt("Name the new database:");
-      if (name === null) return;
+    async function addTable() {
+      const name = await window.xPinPhase3?.showDialog(document, {
+        title: "New database", label: "Database name", value: "", placeholder: "e.g. Projects", confirmLabel: "Create"
+      });
+      if (name === null || name === undefined) return;
       const clean = name.trim().slice(0, 80);
       if (!clean) return host.notify("Database names cannot be empty.");
       const table = {
@@ -965,9 +1275,11 @@
       render();
     }
 
-    function renameTable(table) {
-      const name = window.prompt("Rename this database:", table.name);
-      if (name === null) return;
+    async function renameTable(table) {
+      const name = await window.xPinPhase3?.showDialog(document, {
+        title: "Rename database", label: "Database name", value: table.name, confirmLabel: "Rename"
+      });
+      if (name === null || name === undefined) return;
       const clean = name.trim().slice(0, 80);
       if (!clean) return host.notify("Database names cannot be empty.");
       table.name = clean;
@@ -1004,11 +1316,13 @@
       render();
     }
 
-    function renameColumn(table) {
+    async function renameColumn(table) {
       const column = columnById(table, content.querySelector('[data-role="manage-column"]')?.value);
       if (!column) return;
-      const name = window.prompt("Rename this property:", column.name);
-      if (name === null) return;
+      const name = await window.xPinPhase3?.showDialog(document, {
+        title: "Rename property", label: "Property name", value: column.name, confirmLabel: "Rename"
+      });
+      if (name === null || name === undefined) return;
       const clean = name.trim().slice(0, 80);
       if (!clean) return host.notify("Property names cannot be empty.");
       if (table.columns.some((candidate) => candidate.id !== column.id &&
@@ -1058,6 +1372,19 @@
           column.sourceColumnId = sourceId;
         }
       }
+      // Phase 3 (Databases v2) — formula columns store a safe expression
+      // (e.g. "= price * qty", "= days(due, today())"). Only parse errors
+      // are rejected here; value errors (missing field, empty cell) show
+      // per-row at render time instead of blocking creation.
+      if (type === "formula") {
+        const expression = content.querySelector('[data-role="new-column-expression"]')?.value?.trim() ?? "";
+        if (!expression) return host.notify("Enter a formula, for example: = price * qty");
+        const check = window.xPinPhase3?.evaluateFormula(expression, { values: {} }, table.columns);
+        if (check && !check.ok && !/unknown field|expected a number|divides by zero/i.test(check.error)) {
+          return host.notify(`Formula problem: ${check.error}`);
+        }
+        column.expression = expression;
+      }
       table.columns.push(column);
       save();
       render();
@@ -1082,7 +1409,7 @@
       if (!table || !target.dataset.rowId || !target.dataset.columnId) return;
       const row = table.rows.find((item) => item.id === target.dataset.rowId);
       const column = columnById(table, target.dataset.columnId);
-      if (!row || !column || column.type === "rollup") return;
+      if (!row || !column || column.type === "rollup" || column.type === "formula") return;
       let value = target.value;
       if (column.type === "text") value = value.slice(0, 2000);
       if (column.type === "number") {
@@ -1157,8 +1484,11 @@
     async function exportBackup() {
       host.flushSave();
       if (!globalThis.crypto?.subtle) throw new Error("This browser does not support Web Crypto. Open xPin from localhost or a secure origin.");
-      const passphrase = window.prompt("Choose a passphrase (at least 12 characters). It cannot be recovered:");
-      if (passphrase === null) return;
+      const passphrase = await window.xPinPhase3?.showDialog(document, {
+        title: "Encrypted backup", message: "Choose a passphrase (at least 12 characters). It cannot be recovered.",
+        label: "Passphrase", value: "", password: true, confirmLabel: "Export"
+      });
+      if (passphrase === null || passphrase === undefined) return;
       if (passphrase.length < 12) throw new TypeError("Use a passphrase with at least 12 characters.");
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -1191,8 +1521,10 @@
         typeof envelope.iv !== "string" || typeof envelope.ciphertext !== "string") {
         throw new TypeError("This is not a supported xPin encrypted backup.");
       }
-      const passphrase = window.prompt("Enter the backup passphrase:");
-      if (passphrase === null) return;
+      const passphrase = await window.xPinPhase3?.showDialog(document, {
+        title: "Import encrypted backup", label: "Backup passphrase", value: "", password: true, confirmLabel: "Import"
+      });
+      if (passphrase === null || passphrase === undefined) return;
       let clear;
       try {
         const key = await deriveKey(passphrase, base64ToBytes(envelope.salt));
@@ -1216,13 +1548,17 @@
       window.location.reload();
     }
 
-    function addSyncedBlock() {
-      const title = window.prompt("Name this shared block:");
-      if (title === null) return;
+    async function addSyncedBlock() {
+      const title = await window.xPinPhase3?.showDialog(document, {
+        title: "New shared block", label: "Block name", value: "", placeholder: "e.g. Weekly intro", confirmLabel: "Next"
+      });
+      if (title === null || title === undefined) return;
       const cleanTitle = title.trim().slice(0, 100);
       if (!cleanTitle) return host.notify("Give the shared block a name.");
-      const contentText = window.prompt("Enter the shared text:");
-      if (contentText === null) return;
+      const contentText = await window.xPinPhase3?.showDialog(document, {
+        title: "New shared block", label: "Shared text", value: "", multiline: true, confirmLabel: "Create"
+      });
+      if (contentText === null || contentText === undefined) return;
       if (contentText.length > 20_000) return host.notify("Shared blocks are limited to 20,000 characters.");
       const block = { id: makeId("sync"), title: cleanTitle, content: contentText };
       featureState.syncedBlocks.push(block);
@@ -1245,6 +1581,12 @@
         ["task", "Task", "- [ ] "],
         ["quote", "Quote", "> "],
         ["code", "Code block", "```javascript\n\n```"],
+        ["typed-task", "Task block", "```xpin-task\n{\"title\":\"\",\"status\":\"open\",\"due\":\"\",\"priority\":\"medium\"}\n```"],
+        ["typed-person", "Person block", "```xpin-person\n{\"name\":\"\",\"role\":\"\",\"contact\":\"\"}\n```"],
+        ["typed-project", "Project block", "```xpin-project\n{\"name\":\"\",\"status\":\"not started\",\"owner\":\"\",\"due\":\"\"}\n```"],
+        ["typed-book", "Book block", "```xpin-book\n{\"title\":\"\",\"author\":\"\",\"status\":\"to read\",\"rating\":\"\"}\n```"],
+        ["typed-idea", "Idea block", "```xpin-idea\n{\"title\":\"\",\"area\":\"\",\"energy\":\"medium\"}\n```"],
+        ["script", "Script block", "```xpin-script\n// Runs only when you tap “Run script”, in the sandbox.\n// api.ui.notify(\"Hello from this note.\");\n```"],
         ["synced", "Shared block", ""]
       ];
       commands.forEach(([id, label, value]) => {
@@ -1295,6 +1637,20 @@
             if (!window.confirm(`Delete "${label}"? This cannot be undone.`)) return;
             removeRow(table, rowElement.dataset.rowId);
           }
+          // Phase 3 (Databases v2) — date reminder on a row. In-app only:
+          // it surfaces on the daily note for that date when the app opens.
+          else if (action === "remind-row" && table) {
+            const rowElement = event.target.closest("[data-row-id]");
+            const row = table.rows.find((item) => item.id === rowElement?.dataset.rowId);
+            const date = event.target.dataset.date;
+            const phase3 = host.getState().phase3;
+            if (row && date && phase3 && window.xPinPhase3?.createReminder) {
+              const label = String(row.values[table.columns[0]?.id] ?? "Record");
+              window.xPinPhase3.createReminder(phase3, { tableId: table.id, rowId: row.id, date, label });
+              save();
+              host.notify(`Reminder set for ${date} — it will appear on that day's daily note.`);
+            }
+          }
           else if (action === "run-query") runQuery();
           else if (action === "query-help") toggleQueryHelp();
           else if (action === "publish") exportPage();
@@ -1330,7 +1686,26 @@
             render();
           }
         } else if (action === "cell-change") updateCell(event);
-        else if (action === "accent" && Object.hasOwn(ACCENTS, target.value)) {
+        // Phase 3 (Databases v2) — per-view sort / filter / group controls.
+        else if (["view-sort", "view-sort-dir", "view-filter-column", "view-filter-op", "view-filter-value", "view-group"].includes(action)) {
+          const table = tableById(content.querySelector('[data-action="select-table"]')?.value);
+          const phase3 = host.getState().phase3;
+          if (table && phase3) {
+            if (!phase3.dbViews) phase3.dbViews = {};
+            if (!phase3.dbViews[table.id]) {
+              phase3.dbViews[table.id] = { sortColumnId: "", sortDir: "asc", filterColumnId: "", filterOp: "", filterValue: "", groupByColumnId: "" };
+            }
+            const view = phase3.dbViews[table.id];
+            if (action === "view-sort") view.sortColumnId = target.value;
+            if (action === "view-sort-dir") view.sortDir = target.value;
+            if (action === "view-filter-column") view.filterColumnId = target.value;
+            if (action === "view-filter-op") view.filterOp = target.value;
+            if (action === "view-filter-value") view.filterValue = target.value.slice(0, 200);
+            if (action === "view-group") view.groupByColumnId = target.value;
+            save();
+            render();
+          }
+        } else if (action === "accent" && Object.hasOwn(ACCENTS, target.value)) {
           featureState.theme.accent = target.value;
           emit("settings:changed", { section: "appearance", key: "accent" });
           save();
@@ -1352,6 +1727,15 @@
       content.addEventListener("input", (event) => {
         const target = event.target;
         if (target.dataset.action === "cell-input") updateCell(event);
+        // Phase 3 — filter value updates live (re-render on blur/change).
+        if (target.dataset.action === "view-filter-value") {
+          const table = tableById(content.querySelector('[data-action="select-table"]')?.value);
+          const phase3 = host.getState().phase3;
+          if (table && phase3?.dbViews?.[table.id]) {
+            phase3.dbViews[table.id].filterValue = target.value.slice(0, 200);
+            save();
+          }
+        }
         if (target.dataset.action === "query-input") {
           featureState.query = target.value.slice(0, 500);
           save();
@@ -1383,15 +1767,23 @@
         if (!note) return host.notify("Open a page first to create a sub-page.");
         host.createNote({ parentNoteId: note.id });
       });
-      document.getElementById("insert-synced-block").addEventListener("click", () => {
+      document.getElementById("insert-synced-block").addEventListener("click", async () => {
         if (!featureState.syncedBlocks.length) return addSyncedBlock();
-        const choices = featureState.syncedBlocks.map((block, index) => `${index + 1}. ${block.title}`).join("\n");
-        const selected = window.prompt(`Choose a shared block by number, or enter 0 to create one:\n${choices}`);
-        if (selected === null) return;
-        if (selected.trim() === "0") return addSyncedBlock();
-        const index = Number.parseInt(selected, 10) - 1;
-        const block = featureState.syncedBlocks[index];
-        if (!block) return host.notify("Choose a number from the shared-block list.");
+        const selected = await window.xPinPhase3?.showDialog(document, {
+          title: "Insert shared block",
+          message: "Choose a shared block to insert, or create a new one.",
+          label: "Shared block",
+          value: featureState.syncedBlocks[0].id,
+          options: [
+            ...featureState.syncedBlocks.map((block, index) => ({ value: block.id, label: `${index + 1}. ${block.title}` })),
+            { value: "__new__", label: "0. Create a new shared block" }
+          ],
+          confirmLabel: "Insert"
+        });
+        if (selected === null || selected === undefined) return;
+        if (selected === "__new__") return addSyncedBlock();
+        const block = featureState.syncedBlocks.find((item) => item.id === selected);
+        if (!block) return host.notify("Choose a shared block from the list.");
         if (!host.currentNote()) host.createNote();
         host.insertText(`{{sync:${block.id}}}`);
       });
