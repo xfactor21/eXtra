@@ -2254,6 +2254,10 @@ async function main() {
     } catch (e) { threw = `${e.code}:${e.message}`; }
     check("T47: no relay URL means not configured, never a connection attempt",
       threw.startsWith("not_configured:"), threw);
+    const freshState = b.win.xPinDomain.getState();
+    check("T47: fresh workspace defaults to the xPin hosted relay",
+      freshState.sync?.relayUrl === "https://xpin-sync-relay.vercel.app/api",
+      String(freshState.sync?.relayUrl));
     const store = [];
     b.win.fetch = async (url, opts) => {
       const u = String(url);

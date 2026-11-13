@@ -4,6 +4,11 @@
   const STORAGE_KEY = "xPin.workspace.v1";
   const LEGACY_STORAGE_KEYS = ["xpin.workspace.v1", "pinboard.workspace.v1"]; // pre-rename keys; migrated once on first run, newest first
   const SAVE_DELAY = 2000;
+  // Phase 1 — sync: the xPin hosted relay is the default, so sync is one tap
+  // (set a passphrase, press Sync now). Anyone can point at their own relay
+  // instead. Envelopes are E2EE — the relay holds no keys and never sees
+  // note content — and nothing syncs until you unlock with your passphrase.
+  const DEFAULT_RELAY_URL = "https://xpin-sync-relay.vercel.app/api";
   // M4 — storage: IndexedDB is the primary store, localStorage keeps a backup
   // copy of the same JSON so one corrupt value cannot wipe the workspace.
   const IDB_NAME = "xpin";
@@ -64,11 +69,12 @@
     integrations: sanitizeFabrixState(null),
     extensions: [],
     marketplaceDirs: [],
-    // Phase 1 — sync state (E2EE sync; relay URL empty = bundles only).
+    // Phase 1 — sync state (E2EE sync; the xPin hosted relay is the default —
+    // point at your own relay in Sync settings to self-host).
     // Passphrases are NEVER stored — only key-check values + salts.
     sync: {
       deviceId: null, // generated once on first sync use ("xpin-<random>")
-      relayUrl: "",
+      relayUrl: DEFAULT_RELAY_URL,
       lastSyncAt: null,
       lastSyncStatus: "off", // off | ok | error | not-configured
       lastSyncLamport: 0,
@@ -502,7 +508,9 @@
     return {
       deviceId: typeof value.deviceId === "string" && /^xpin-[a-z0-9]{1,32}$/.test(value.deviceId)
         ? value.deviceId : null,
-      relayUrl: typeof value.relayUrl === "string" ? value.relayUrl.slice(0, 500) : "",
+      relayUrl: typeof value.relayUrl === "string" && value.relayUrl.trim()
+        ? value.relayUrl.slice(0, 500)
+        : DEFAULT_RELAY_URL, // empty / missing = the xPin default (custom relays preserved)
       lastSyncAt: typeof value.lastSyncAt === "string" && Number.isFinite(Date.parse(value.lastSyncAt))
         ? value.lastSyncAt : null,
       lastSyncStatus: ["off", "ok", "error", "not-configured"].includes(value.lastSyncStatus)
@@ -5558,7 +5566,7 @@
         ? `Sync finished with ${errors.length} error${errors.length === 1 ? "" : "s"} — see the console.`
         : relayUsed
           ? `Synced via relay: ${envelopes.length} sent, ${applied} applied, ${ignored} kept locally.`
-          : `Sync bundle ready: ${envelopes.length} notes. No relay configured — bundles are the sync path today.`);
+          : `Sync bundle ready: ${envelopes.length} notes.`);
       return true;
     } catch (error) {
       console.error("Sync failed.", error);
@@ -5787,9 +5795,9 @@
       : `This device has no sync id yet — one is generated when you sync. ${lastSync}`;
     section.append(status);
     const copy = document.createElement("p");
-    copy.textContent = state.sync.relayUrl
-      ? "Relay configured. Sync sends encrypted envelopes only — the relay cannot read your notes."
-      : "No relay configured — bundles are the sync path today. Export a bundle, hand the file to your other device, and import it there. Sync is off by default.";
+    copy.textContent = state.sync.relayUrl === DEFAULT_RELAY_URL
+      ? "Using the xPin relay (default). Sync sends encrypted envelopes only — the relay cannot read your notes. Point at your own relay below to self-host."
+      : "Using your own relay. Sync sends encrypted envelopes only — the relay cannot read your notes.";
     section.append(copy);
     const passphraseRow = document.createElement("div");
     passphraseRow.className = "backup-actions";
@@ -5827,7 +5835,7 @@
     const relayInput = document.createElement("input");
     relayInput.type = "url";
     relayInput.className = "feature-input";
-    relayInput.placeholder = "Relay URL (optional, e.g. http://127.0.0.1:8787)";
+    relayInput.placeholder = "Relay URL (e.g. https://your-relay.vercel.app/api)";
     relayInput.value = state.sync.relayUrl ?? "";
     relayInput.setAttribute("aria-label", "Sync relay URL");
     const saveRelay = document.createElement("button");
@@ -5842,11 +5850,11 @@
         try { parsed = new URL(value); } catch { showToast("That is not a valid URL."); return; }
         if (!["http:", "https:"].includes(parsed.protocol)) { showToast("Relay URLs must use http or https."); return; }
       }
-      state.sync.relayUrl = value;
+      state.sync.relayUrl = value || DEFAULT_RELAY_URL;
       persistWorkspace();
       pluginManager?.emit("settings:changed", { section: "sync" });
       renderCoreToolsSections(true);
-      showToast(value ? "Relay URL saved." : "Relay URL cleared — bundles are the sync path.");
+      showToast(value ? "Relay URL saved." : "Relay URL reset to the xPin default.");
     });
     relayRow.append(relayInput, saveRelay);
     section.append(relayRow);

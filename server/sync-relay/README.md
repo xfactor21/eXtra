@@ -1,4 +1,4 @@
-# xPin sync relay — Neon + Vercel (reference implementation, NOT deployed)
+# xPin sync relay — Neon + Vercel (deployed at https://xpin-sync-relay.vercel.app/ — the app's default relay)
 
 The production sync target, per the owner's locked decision: **Neon +
 Vercel** (the existing stack). The relay stores only opaque encrypted
@@ -26,7 +26,7 @@ keys and never sees a passphrase.
   HTTP-based Neon driver built for serverless (no connection pooling to
   manage). Everything else is plain Node.
 
-## Deploy (owner step — nothing here is deployed)
+## Deploy (self-hosting — the xPin relay above is already deployed and is the app default; these steps are only for running your own)
 
 1. **Neon:** create a project (or reuse the existing one), then run the
    migration — paste `migrations/001_create_sync_envelopes.sql` into the
@@ -51,22 +51,28 @@ keys and never sees a passphrase.
   capped at 500 envelopes)
 - `GET /v1/sync/pull?since=<lamport>` → `{ok, envelopes, serverLamport}`
 
-## Reference only — what this is NOT
+## What this is NOT (yet)
 
-- **No auth.** Anyone who knows the URL can push/pull envelopes. Before
-  this serves real users it needs authentication (the natural next step
-  is a per-device bearer token — the capture token in the app's sync
-  settings is built for exactly this — plus per-account isolation).
-  Until then, treat the deployed URL as private.
+- **No auth.** Anyone who knows the URL can push/pull envelopes. The
+  xPin relay URL is now the public default baked into the app, so its
+  store is shared by everyone who uses it. Envelopes are E2EE — the
+  relay holds no keys and cannot read note content — and a device only
+  applies envelopes it can decrypt with its own sync passphrase
+  (foreign envelopes fail to decrypt and are skipped). Before this
+  serves real users at scale it still needs authentication (the natural
+  next step is a per-device bearer token — the capture token in the
+  app's sync settings is built for exactly this — plus per-account
+  isolation).
 - **No rate limiting or retention policy** beyond the pull limit (1,000
   envelopes per pull). A production relay needs both, plus a tombstone /
   retention decision.
 - **No per-account isolation** — one shared envelope store.
 - TLS is handled by Vercel automatically; Neon connections require SSL.
 
-Until a relay is deployed, encrypted sync **bundles** (export/import
-files, in the app's Sync settings) are the sync path that works with no
-server at all, and sync stays off by default when no relay URL is set.
+Sync stays off until you set a sync passphrase and press Sync now — the
+relay URL being set does not sync anything by itself. Encrypted sync
+**bundles** (export/import files, in the app's Sync settings) remain the
+offline path that works with no server at all.
 
 ## Local dev harness
 
