@@ -3949,7 +3949,11 @@
       title: title || note.title || "Untitled note",
       format: "html",
       publishedAt: new Date().toISOString(),
-      html: noteToHtml(note)
+      // No html stored: the rendered page is regenerable from the note on
+      // demand (noteToHtml), and persisting it would risk the ~5 MB
+      // localStorage ceiling (up to 500 KB × 50 artifacts). The public
+      // shape never included it either.
+      html: ""
     };
     const artifacts = state.integrations.fabrix.artifacts || [];
     artifacts.push(record);
@@ -3977,10 +3981,21 @@
         return state.notes.find((note) => note.id === target || note.title.trim().toLowerCase() === clean) ?? null;
       },
       persistFabrixState: (next) => {
-        state.integrations.fabrix = window.xPinFabrixState
+        const sanitized = window.xPinFabrixState
           ? window.xPinFabrixState.sanitize(next)
           : { enabled: false };
+        // Merge, don't clobber: the app owns the artifacts list
+        // (publishArtifactRecord pushes here). The adapter's in-memory copy
+        // is stale by design — an adapter persist after a publish must not
+        // wipe the record. The merged state is returned so the adapter can
+        // adopt it (see adapter.js persist()).
+        const kept = state.integrations.fabrix && Array.isArray(state.integrations.fabrix.artifacts)
+          ? state.integrations.fabrix.artifacts
+          : [];
+        sanitized.artifacts = kept;
+        state.integrations.fabrix = sanitized;
         persistWorkspace();
+        return sanitized;
       },
       getFabrixState: () => state.integrations.fabrix
     });

@@ -1899,6 +1899,20 @@ async function main() {
     check("F5: artifacts.publish records a local artifact with no URL",
       published.result.artifact && published.result.artifact.noteId === "note-a" && published.result.artifact.url === null,
       JSON.stringify(published.result.artifact));
+    const storedWs = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    check("F5: published artifact HTML is not persisted (regenerable on demand)",
+      (storedWs.integrations.fabrix.artifacts || []).length === 1 &&
+      (storedWs.integrations.fabrix.artifacts || []).every((a) => a.html === ""),
+      JSON.stringify((storedWs.integrations.fabrix.artifacts || []).map((a) => (a.html || "").length)));
+    // The publish record must survive a later adapter persist: the adapter
+    // replaces state.integrations.fabrix with its in-memory copy on every
+    // call, so persistFabrixState must merge (not clobber) the app-side
+    // artifacts list.
+    await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { query: "alpha" })`);
+    const storedWs2 = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    check("F5: published artifact survives a later adapter call",
+      (storedWs2.integrations.fabrix.artifacts || []).length === 1,
+      JSON.stringify(storedWs2.integrations.fabrix.artifacts));
     check("F5: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
   }
 
@@ -1920,6 +1934,26 @@ async function main() {
       stored.idempotency["request_idem_1"] && stored.idempotency["request_idem_1"].result.note.body === "[redacted]");
     check("F6: a replay records a receipt", stored.receipts.length >= 2, "receipts: " + stored.receipts.length);
     check("F6: receipts carry an action", stored.receipts.every((r) => r.action === "invoke"), JSON.stringify(stored.receipts[0]));
+    // Export and search replays must not return body text either: export
+    // results carry the full body under files[].content, search results
+    // under notes[].snippet. (Phase 3 audit B1: redacting only `body`
+    // missed both.)
+    const expFirst = await fabrixEval(b, `window.xPinFabrix.invoke("notes.export", { id: "note-a", format: "markdown" }, { requestId: "request_exp_1" })`);
+    check("F6: live export still returns the body", expFirst.result.files[0].content.includes("alpha body"));
+    const expSecond = await fabrixEval(b, `window.xPinFabrix.invoke("notes.export", { id: "note-a", format: "markdown" }, { requestId: "request_exp_1" })`);
+    check("F6: export replay returns redacted content, not the body",
+      expSecond.replayed === true && expSecond.result.files[0].content === "[redacted]" && expSecond.result.files[0].name === expFirst.result.files[0].name,
+      JSON.stringify(expSecond.result.files[0]));
+    const searchFirst = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { query: "alpha body" }, { requestId: "request_search_1" })`);
+    check("F6: live search still returns snippets", (searchFirst.result.notes[0].snippet || "").includes("alpha"));
+    const searchSecond = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { query: "alpha body" }, { requestId: "request_search_1" })`);
+    check("F6: search replay returns redacted snippets, not body text",
+      searchSecond.replayed === true && searchSecond.result.notes[0].snippet === "[redacted]",
+      JSON.stringify(searchSecond.result.notes[0]));
+    const stored2 = await fabrixEval(b, `window.xPinFabrix.getState()`);
+    check("F6: stored export/search entries contain no body text",
+      JSON.stringify(stored2.idempotency["request_exp_1"]).indexOf("alpha body") === -1 &&
+      JSON.stringify(stored2.idempotency["request_search_1"]).indexOf("alpha body") === -1);
     await fabrixEval(b, `window.xPinFabrix.revoke("write")`);
     let err = null;
     try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "Idem note", body: "idem body" }, { requestId: "request_idem_1" })`); } catch (e) { err = e; }

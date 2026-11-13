@@ -52,11 +52,14 @@
   }
 
   // Redacts a handler result for the idempotency log: note bodies (and any
-  // nested `body` key) are stripped, long strings are truncated, and the
-  // whole value is capped at MAX_IDEMPOTENCY_RESULT_BYTES. A replay returns
-  // this redacted summary — never a stored note body (spec §6: receipts and
-  // the idempotency log never contain note bodies or credentials). It also
-  // bounds the persisted workspace blob (the ~5 MB localStorage ceiling).
+  // nested `body` key), search snippets, and export file contents are
+  // stripped; long strings are truncated; and the whole value is capped at
+  // MAX_IDEMPOTENCY_RESULT_BYTES. A replay returns this redacted summary —
+  // never a stored note body (spec §6: receipts and the idempotency log
+  // never contain note bodies or credentials). It also bounds the persisted
+  // workspace blob (the ~5 MB localStorage ceiling). Redacting only `body`
+  // is not enough: export results carry the full body under `files[].content`
+  // and search results under `notes[].snippet` — both are body text too.
   function redactResult(value) {
     var cleaned;
     try {
@@ -71,7 +74,7 @@
           return;
         }
         Object.keys(node).forEach(function (key) {
-          if (key === "body") {
+          if (key === "body" || key === "snippet" || key === "content") {
             node[key] = "[redacted]";
           } else if (typeof node[key] === "string" && node[key].length > 256) {
             node[key] = node[key].slice(0, 256) + "…";
@@ -146,9 +149,11 @@
       title: cleanString(value.title, 120),
       format: value.format === "html" ? "html" : "markdown",
       publishedAt: cleanString(value.publishedAt, 40),
-      // The HTML body is stored only for local artifacts; it is never sent
-      // to the Bridge unless a publish target is configured (none today).
-      html: typeof value.html === "string" ? value.html.slice(0, 500000) : ""
+      // Artifact HTML is NOT persisted: it is regenerable from the note on
+      // demand (noteToHtml), and storing up to 500 KB × 50 artifacts would
+      // risk the ~5 MB localStorage ceiling. Old entries have their html
+      // stripped to "" on load.
+      html: ""
     };
   }
 

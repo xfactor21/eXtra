@@ -23,6 +23,7 @@
   function createMockBridge(config) {
     var buildId = (config && config.buildId) || "mock-rc19.8";
     var connected = false;
+    var requestSeq = 0; // monotonic: default ids must not repeat across poll cycles
     var registered = {};
     var requests = [];
     var receipts = [];
@@ -110,12 +111,13 @@
 
       // Test helper: enqueue a capability request for the adapter to poll.
       enqueueRequest: function (envelope) {
+        var seq = requestSeq++;
         var request = {
-          requestId: envelope.requestId || ("request_mock_" + requests.length),
+          requestId: envelope.requestId || ("request_mock_" + seq),
           capability: envelope.capability,
           action: envelope.action || "invoke",
           inputs: envelope.inputs || {},
-          idempotencyKey: envelope.idempotencyKey || envelope.requestId || ("mock_" + requests.length),
+          idempotencyKey: envelope.idempotencyKey || envelope.requestId || ("mock_" + seq),
           issuedAt: new Date().toISOString(),
           expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString()
         };

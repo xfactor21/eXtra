@@ -49,7 +49,14 @@
 
   function persist() {
     if (domain && fabrixState) {
-      domain.persistFabrixState(fabrixState);
+      // persistFabrixState returns the merged state (app-side artifact
+      // pushes included); adopt it so the adapter's copy stays in sync.
+      // Only adopt a well-shaped state — never the {enabled:false}
+      // fallback used when the state module failed to load.
+      var merged = domain.persistFabrixState(fabrixState);
+      if (merged && typeof merged === "object" && merged.grants && typeof merged.enabled === "boolean") {
+        fabrixState = merged;
+      }
     }
   }
 
