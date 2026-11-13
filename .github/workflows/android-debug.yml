@@ -8,6 +8,9 @@ name: Android debug build
 # NOTE: setup-android must stay on v4+. v3 installs the retired SDK
 # "tools" package (Google removed it 2026-09-15), so the SDK step failed
 # with "Failed to find package 'tools'". v4 drops it.
+# NOTE: JDK must stay on 21. Capacitor 8.6's Android library compiles
+# with source/target Java 21 (its build.gradle sets VERSION_21), so
+# JDK 17 fails the build with "invalid source release: 21".
 on:
   push:
     branches: [main]
@@ -32,11 +35,11 @@ jobs:
       - name: Run smoke tests
         run: npm run test:smoke
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
