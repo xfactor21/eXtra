@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#07151d">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https:; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: http://127.0.0.1:*; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
     <title>xPin — a place for your thoughts</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -197,6 +197,18 @@
     <script src="plugin-system.js"></script>
     <script src="plugins.js"></script>
     <script src="feature-suite.js"></script>
+    <!-- fabriX integration adapter (integrations/fabrix/). Disabled by default; -->
+    <!-- the app works fully without it. Loaded before app.js so the adapter -->
+    <!-- exists when app.js attaches the domain. -->
+    <script src="integrations/fabrix/state.js"></script>
+    <script src="integrations/fabrix/crypto.js"></script>
+    <script src="integrations/fabrix/permissions.js"></script>
+    <script src="integrations/fabrix/transport.js"></script>
+    <script src="integrations/fabrix/mock-transport.js"></script>
+    <script src="integrations/fabrix/domain.js"></script>
+    <script src="integrations/fabrix/capabilities.js"></script>
+    <script src="integrations/fabrix/adapter.js"></script>
+    <script src="integrations/fabrix/settings.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

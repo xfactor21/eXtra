@@ -43,6 +43,9 @@
     tagFilter: null,
     collapsed: [],
     plugins: { enabled: {}, settings: {} },
+    // fabriX integration state. The sanitizer lives in integrations/fabrix/state.js;
+    // without it (adapter files failed to load) the integration stays disabled.
+    integrations: { fabrix: sanitizeFabrixState(null) },
     extensions: [],
     marketplaceDirs: [],
     templates: seedTemplates(),
@@ -376,7 +379,8 @@
             enabled: parsed.plugins.enabled && typeof parsed.plugins.enabled === "object" ? parsed.plugins.enabled : {},
             settings: parsed.plugins.settings && typeof parsed.plugins.settings === "object" ? parsed.plugins.settings : {}
           }
-          : { enabled: {}, settings: {} }
+          : { enabled: {}, settings: {} },
+        integrations: sanitizeFabrixState(parsed.integrations)
       };
     } catch (error) {
       console.error("Could not load the saved xPin workspace.", error);
@@ -3754,6 +3758,223 @@
     showToast("Note deleted.");
   }
 
+  // ---- fabriX integration domain (integrations/fabrix/) -------------------
+  // First-party domain functions for the adapter. They reuse the same
+  // validation and side effects as the UI paths (emit the same note:*
+  // events, persist the same way) but perform no UI navigation, no
+  // confirms, and no toasts — the adapter's permission grant is the
+  // confirmation and its receipt is the record. The plugin RPC handler
+  // (handleExtensionRequest) is untouched.
+  function fabrixDomainError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  function sanitizeFabrixState(value) {
+    if (window.xPinFabrixState && typeof window.xPinFabrixState.sanitize === "function") {
+      return { fabrix: window.xPinFabrixState.sanitize(value && value.fabrix) };
+    }
+    return { fabrix: { enabled: false } };
+  }
+
+  function createNoteRecord({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
+    // Data-only create (no view switch, no focus, no toast). Used by the
+    // fabriX adapter; the UI path (createNote) is unchanged.
+    const note = buildNoteRecord({ title, body, folderId, parentNoteId, metadata });
+    state.notes.push(note);
+    pluginManager?.emit("note:created", { ...note });
+    render();
+    persistWorkspace();
+    return note;
+  }
+
+  function updateNoteRecord(id, patch) {
+    if (typeof id !== "string" || !id) throw fabrixDomainError("validation_error", "Note update requires a note id.");
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      throw fabrixDomainError("validation_error", "Note update requires a patch object.");
+    }
+    const note = state.notes.find((item) => item.id === id);
+    if (!note) throw fabrixDomainError("not_found", "No note with id " + id + ".");
+    const changes = {};
+    if (patch.title !== undefined) {
+      if (typeof patch.title !== "string" || patch.title.length > 120) {
+        throw fabrixDomainError("validation_error", "Note title must be text under 120 characters.");
+      }
+      changes.title = patch.title;
+    }
+    if (patch.body !== undefined) {
+      if (typeof patch.body !== "string" || patch.body.length > 100_000) {
+        throw fabrixDomainError("validation_error", "Note body must be text under 100 KB.");
+      }
+      changes.body = patch.body;
+    }
+    if (patch.folderId !== undefined) {
+      if (patch.folderId !== null && !state.folders.some((folder) => folder.id === patch.folderId)) {
+        throw fabrixDomainError("validation_error", "Unknown xPin folder: " + patch.folderId);
+      }
+      changes.folderId = patch.folderId;
+    }
+    if (patch.parentNoteId !== undefined) {
+      if (patch.parentNoteId !== null) {
+        if (!state.notes.some((item) => item.id === patch.parentNoteId)) {
+          throw fabrixDomainError("validation_error", "Unknown xPin parent page: " + patch.parentNoteId);
+        }
+        // Cycle guard: walking up from the candidate parent must not reach this note.
+        let ancestor = patch.parentNoteId;
+        const visited = new Set([id]);
+        while (ancestor) {
+          if (visited.has(ancestor)) throw fabrixDomainError("validation_error", "Parent page would create a cycle.");
+          visited.add(ancestor);
+          ancestor = state.notes.find((item) => item.id === ancestor)?.parentNoteId ?? null;
+        }
+      }
+      changes.parentNoteId = patch.parentNoteId;
+    }
+    if (patch.metadata !== undefined) {
+      if (!patch.metadata || typeof patch.metadata !== "object" || Array.isArray(patch.metadata)) {
+        throw fabrixDomainError("validation_error", "Note metadata must be an object.");
+      }
+      changes.metadata = { ...note.metadata, ...patch.metadata };
+    }
+    if (!Object.keys(changes).length) throw fabrixDomainError("validation_error", "Note update changed nothing.");
+    Object.assign(note, changes, { updatedAt: new Date().toISOString() });
+    refreshNoteRow(note.id);
+    if (note.id === selectedNoteId) renderEditor();
+    pluginManager?.emit("note:updated", { ...note });
+    persistWorkspace();
+    return { ...note };
+  }
+
+  function deleteNoteRecord(id) {
+    if (typeof id !== "string" || !id) throw fabrixDomainError("validation_error", "Note delete requires a note id.");
+    const note = state.notes.find((item) => item.id === id);
+    if (!note) throw fabrixDomainError("not_found", "No note with id " + id + ".");
+    state.notes = state.notes.filter((item) => item.id !== note.id);
+    state.notes.forEach((item) => {
+      if (item.parentNoteId === note.id) item.parentNoteId = note.parentNoteId ?? null;
+    });
+    state.features.tables.forEach((table) => {
+      table.columns.filter((column) => column.type === "relation" && column.targetTableId === "notes")
+        .forEach((column) => table.rows.forEach((row) => {
+          if (row.values[column.id] === note.id) delete row.values[column.id];
+        }));
+    });
+    state.canvases.forEach((board) => {
+      board.nodes.forEach((node) => {
+        if (node.type === "file" && node.xPinNoteId === note.id) {
+          node.xPinNoteId = null;
+          node.file = `notes/${note.id}.md (deleted note)`;
+        }
+      });
+    });
+    selectedNoteId = visibleNotes()[0]?.id ?? null;
+    pluginManager?.emit("note:deleted", { ...note });
+    render();
+    persistWorkspace();
+    return { ...note };
+  }
+
+  function searchNotes({ query = "", tag = null, folderId = null, limit = 20 } = {}) {
+    // Parameterized search (NOT visibleNotes, which is UI-state-coupled).
+    let notes = state.notes;
+    if (folderId !== null && folderId !== undefined) notes = notes.filter((note) => note.folderId === folderId);
+    if (tag) {
+      const wanted = String(tag).toLowerCase();
+      notes = notes.filter((note) => extractTags(`${note.title}\n${note.body}`).includes(wanted));
+    }
+    if (query) {
+      const needle = String(query).toLowerCase();
+      notes = notes.filter((note) => `${note.title}\n${note.body}`.toLowerCase().includes(needle));
+    }
+    return [...notes]
+      .sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 20, 100)))
+      .map((note) => ({ ...note }));
+  }
+
+  function readNoteRecord(id) {
+    if (typeof id !== "string" || !id) throw fabrixDomainError("validation_error", "Note read requires a note id.");
+    const note = state.notes.find((item) => item.id === id);
+    return note ? { ...note } : null;
+  }
+
+  function noteToHtml(note) {
+    // Rendered through the existing Markdown renderer (not raw text — the
+    // M6 defect in exportPage). Produces a standalone page.
+    const holder = document.createElement("div");
+    appendMarkdownBlocks(holder, note.body);
+    const title = (note.title || "Untitled note").replace(/</g, "&lt;");
+    return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>" + title + "</title>\n" +
+      "<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#111}h1{font-size:1.6rem}pre{background:#f4f4f4;padding:.75rem;overflow:auto}code{font-family:ui-monospace,monospace}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.25rem .5rem}</style>\n</head>\n<body>\n<h1>" + title + "</h1>\n" + holder.innerHTML + "\n</body>\n</html>\n";
+  }
+
+  function exportNoteRecord(id, format) {
+    if (typeof id !== "string" || !id) throw fabrixDomainError("validation_error", "Note export requires a note id.");
+    const note = state.notes.find((item) => item.id === id);
+    if (!note) throw fabrixDomainError("not_found", "No note with id " + id + ".");
+    const slug = (note.title || "untitled").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || note.id;
+    if (format === "html") return { name: slug + ".html", content: noteToHtml(note) };
+    return { name: slug + ".md", content: note.body };
+  }
+
+  function listProjectRecords() {
+    // Metadata only — row values are never returned by the adapter.
+    return state.features.tables.map((table) => ({
+      id: table.id,
+      name: table.name,
+      view: table.view,
+      columns: table.columns.map((column) => ({ id: column.id, name: column.name, type: column.type })),
+      rowCount: table.rows.length
+    }));
+  }
+
+  function publishArtifactRecord(id, title) {
+    if (typeof id !== "string" || !id) throw fabrixDomainError("validation_error", "Artifact publish requires a note id.");
+    const note = state.notes.find((item) => item.id === id);
+    if (!note) throw fabrixDomainError("not_found", "No note with id " + id + ".");
+    const record = {
+      id: "artifact-" + note.id + "-" + Date.now(),
+      noteId: note.id,
+      title: title || note.title || "Untitled note",
+      format: "html",
+      publishedAt: new Date().toISOString(),
+      html: noteToHtml(note)
+    };
+    const artifacts = state.integrations.fabrix.artifacts || [];
+    artifacts.push(record);
+    state.integrations.fabrix.artifacts = artifacts.slice(-50);
+    persistWorkspace();
+    // The public shape: no html body, no upload claim (no target configured).
+    return { id: record.id, noteId: record.noteId, title: record.title, format: record.format, publishedAt: record.publishedAt, url: null };
+  }
+
+  function createFabrixDomain() {
+    return Object.freeze({
+      searchNotes,
+      readNote: readNoteRecord,
+      createNote: (options) => createNoteRecord(options),
+      updateNote: updateNoteRecord,
+      deleteNote: deleteNoteRecord,
+      exportNote: exportNoteRecord,
+      listProjects: listProjectRecords,
+      publishArtifact: publishArtifactRecord,
+      extractTags,
+      findNoteByTitleOrId: (target) => {
+        if (typeof target !== "string") return null;
+        const clean = target.trim().toLowerCase();
+        return state.notes.find((note) => note.id === target || note.title.trim().toLowerCase() === clean) ?? null;
+      },
+      persistFabrixState: (next) => {
+        state.integrations.fabrix = window.xPinFabrixState
+          ? window.xPinFabrixState.sanitize(next)
+          : { enabled: false };
+        persistWorkspace();
+      },
+      getFabrixState: () => state.integrations.fabrix
+    });
+  }
+
   function createPluginHost() {
     return {
       notes: Object.freeze({
@@ -4274,6 +4495,11 @@
       renderEditorStatus();
     }
   });
+  // fabriX adapter: hand it the domain + persisted state. The adapter does
+  // nothing until the user enables it in Settings (flag defaults to OFF).
+  if (window.xPinFabrix && typeof window.xPinFabrix.attachDomain === "function") {
+    window.xPinFabrix.attachDomain(createFabrixDomain(), state.integrations.fabrix);
+  }
   setupEvents();
   render();
   switchView(state.view);

@@ -883,6 +883,12 @@
       wrap.append(synced);
       const pluginNote = el("p", "feature-help", "The local plugin catalogue remains under Plugins. Uploaded packages are not fetched from a remote marketplace and stay disabled until reviewed.");
       wrap.append(pluginNote);
+      // fabriX integration panel (integrations/fabrix/settings.js). Guarded:
+      // the app works normally if the adapter files failed to load.
+      if (window.xPinFabrix && typeof window.xPinFabrix.renderSettingsSection === "function") {
+        const fabrixSection = window.xPinFabrix.renderSettingsSection();
+        if (fabrixSection) wrap.append(fabrixSection);
+      }
       return wrap;
     }
 
