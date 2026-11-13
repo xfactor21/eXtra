@@ -634,3 +634,45 @@ html[data-xPin-density="comfortable"] .feature-content { padding: 24px; }
 .plugin-origin-row small { color: #9fd8e8; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .marketplace-changelog { display: block; margin-top: 8px; color: #c9a06a; font-size: 11px; line-height: 1.45; }
 #sync-section h3, #publish-section h3 { margin: 18px 0 4px; color: #d9e9eb; font-size: 13px; }
+
+/* ---------- Phase 2: Capture & smarts ---------- */
+.daily-strip-wrap { margin-top: 14px; }
+.daily-strip { display: flex; gap: 4px; align-items: center; }
+.daily-strip-nav { flex: 0 0 auto; background: none; border: none; color: #7f979e; font-size: 16px; cursor: pointer; padding: 4px 2px; }
+.daily-strip-day { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 5px 0 4px; border: 1px solid transparent; border-radius: 7px; background: none; color: #a8bfc4; cursor: pointer; font-family: inherit; }
+.daily-strip-day:hover { border-color: #29454e; }
+.daily-strip-day.is-today { border-color: var(--cyan); color: #d9e9eb; }
+.daily-strip-day.has-note .daily-strip-num::after { content: "•"; display: block; font-size: 8px; line-height: 6px; color: var(--cyan); }
+.daily-strip-dow { font-size: 9px; letter-spacing: .5px; color: #7f979e; }
+.daily-strip-num { font-size: 13px; font-weight: 600; }
+.daily-strip-today { flex: 0 0 auto; background: none; border: none; color: #9fd8e8; font-size: 10px; cursor: pointer; padding: 4px 2px; }
+.phase2-view { padding: 8px 0 40px; max-width: 860px; }
+.phase2-header h2 { font-size: 22px; margin: 0 0 4px; }
+.phase2-header p { color: #7f979e; font-size: 12px; margin: 0 0 14px; }
+.phase2-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+.phase2-tab { padding: 7px 12px; border: 1px solid #29454e; border-radius: 20px; background: none; color: #a8bfc4; font-size: 12px; cursor: pointer; font-family: inherit; }
+.phase2-tab.is-active { border-color: var(--cyan); color: #d9e9eb; background: rgba(255,255,255,.04); }
+.phase2-body { display: grid; gap: 16px; }
+.phase2-section h3 { margin: 0 0 6px; font-size: 15px; }
+.phase2-section p { color: #7f979e; font-size: 12px; line-height: 1.5; margin: 0 0 10px; }
+.phase2-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.phase2-status { color: #9fd8e8; font-size: 12px; }
+.phase2-check { display: flex; gap: 8px; align-items: center; color: #d9e9eb; font-size: 12px; margin: 8px 0; }
+.phase2-card { padding: 12px; border: 1px solid #1d3841; border-radius: 8px; background: rgba(255,255,255,.018); margin-bottom: 10px; }
+.phase2-card-title { color: #d9e9eb; font-size: 13px; font-weight: 600; text-decoration: none; }
+.phase2-card-title:hover { text-decoration: underline; }
+.phase2-card-meta { color: #789198; font-size: 11px; margin: 4px 0; }
+.phase2-card-text { color: #a8bfc4; font-size: 12px; line-height: 1.55; margin: 6px 0; white-space: pre-wrap; }
+.phase2-flashcard { padding: 18px; border: 1px solid #29454e; border-radius: 10px; background: rgba(255,255,255,.03); font-size: 16px; line-height: 1.5; margin: 10px 0; white-space: pre-wrap; }
+.phase2-flashcard-back { border-color: var(--cyan); }
+.phase2-assist-out { white-space: pre-wrap; color: #d9e9eb; font-size: 12px; line-height: 1.55; margin-top: 10px; }
+.note-search-snippet { display: block; color: #7f979e; font-size: 11px; line-height: 1.4; margin-top: 2px; }
+.note-search-snippet mark { background: rgba(159, 216, 232, .25); color: #d9e9eb; border-radius: 2px; padding: 0 1px; }
+.search-extras { margin-top: 10px; padding-top: 8px; border-top: 1px solid #1d3841; }
+.search-extras-heading { color: #789198; font-size: 9px; letter-spacing: .6px; margin-bottom: 4px; }
+.search-extra-row { display: block; width: 100%; text-align: left; background: none; border: none; color: #9fd8e8; font-size: 11px; padding: 4px 0; cursor: pointer; font-family: inherit; }
+.attachment-ref { display: block; margin: 8px 0; padding: 8px; border: 1px dashed #29454e; border-radius: 7px; color: #a8bfc4; font-size: 12px; }
+.attachment-image { max-width: 100%; border-radius: 6px; }
+.attachment-pdf { width: 100%; min-height: 420px; border: none; }
+.attachment-download { color: #9fd8e8; }
+.attachment-sync-note { display: block; color: #789198; font-size: 10px; margin-top: 2px; }

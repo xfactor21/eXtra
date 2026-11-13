@@ -29,8 +29,12 @@
           <button class="nav-item" id="canvas-nav" data-view="canvas" type="button" aria-label="Canvas"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
           <button class="nav-item" data-feature-view="database" type="button" aria-label="Databases"><span class="nav-icon" aria-hidden="true">▦</span><span>Databases</span></button>
           <button class="nav-item" data-feature-view="graph" type="button" aria-label="Graph"><span class="nav-icon" aria-hidden="true">◎</span><span>Graph</span></button>
+          <button class="nav-item" data-phase2-view="capture" type="button" aria-label="Capture and smarts"><span class="nav-icon" aria-hidden="true">✦</span><span>Capture &amp; smarts</span></button>
+          <button class="nav-item" data-phase2-view="readlater" type="button" aria-label="Read later"><span class="nav-icon" aria-hidden="true">◐</span><span>Read later</span><span class="nav-count" id="readlater-count">0</span></button>
+          <button class="nav-item" data-phase2-view="flashcards" type="button" aria-label="Flashcards"><span class="nav-icon" aria-hidden="true">▧</span><span>Flashcards</span><span class="nav-count" id="flashcards-due-count">0</span></button>
           <button class="nav-item" data-feature-view="settings" type="button" aria-label="Workspace tools"><span class="nav-icon" aria-hidden="true">⚙</span><span>Workspace tools</span></button>
         </nav>
+        <div class="daily-strip-wrap"><div class="nav-label">THIS WEEK</div><div class="daily-strip" id="daily-strip" aria-label="Daily notes this week"></div></div>
         <div class="sidebar-bottom">
           <div class="sync-card"><span class="sync-indicator" aria-hidden="true"></span><span><strong>Just you and your notes</strong><small>Saved on this device</small></span></div>
           <div class="profile"><div class="avatar" aria-hidden="true">Y</div><span><strong>Your workspace</strong><small>Personal space</small></span></div>
@@ -79,6 +83,8 @@
                     </select>
                   </label>
                   <button class="editor-tool-button" id="insert-code-block" type="button">＋ Code block</button>
+                  <button class="editor-tool-button" id="attach-file" type="button">＋ Attach file</button>
+                  <input id="attachment-file-input" type="file" multiple hidden>
                   <button class="editor-tool-button" id="export-note-markdown" type="button">Export .md</button>
                   <button class="editor-tool-button" id="toggle-preview" type="button" aria-pressed="false">Preview</button>
                 </div>
@@ -121,6 +127,7 @@
           <section class="feature-view" id="feature-view" aria-label="Workspace tools" hidden>
             <div class="feature-content" id="feature-content"></div>
           </section>
+          <section class="phase2-view" id="phase2-view" aria-label="Capture and smarts" hidden></section>
         </section>
       </main>
       <div class="modal-backdrop" id="plugins-modal" hidden>
@@ -203,6 +210,7 @@
     <script src="sync/transports.js"></script>
     <script src="sync/credentials.js"></script>
     <script src="sync/publish.js"></script>
+    <script src="phase2.js"></script>
     <script src="feature-suite.js"></script>
     <script src="app.js"></script>
   </body>

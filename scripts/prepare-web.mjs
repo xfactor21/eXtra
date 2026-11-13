@@ -12,6 +12,7 @@ const webFiles = [
   "plugin-system.js",
   "plugins.js",
   "feature-suite.js",
+  "phase2.js",
   "sync/sync.js",
   "sync/transports.js",
   "sync/credentials.js",

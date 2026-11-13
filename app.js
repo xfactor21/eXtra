@@ -86,6 +86,14 @@
     // Phase 1 — connector credential store (audit C4): per-plugin ENCRYPTED
     // envelopes only ({iv, ciphertext}); plaintext never lands here.
     connectorCredentials: {},
+    // Phase 2 — Capture & smarts. Sanitized on load by xPinPhase2 (see
+    // loadWorkspace); keys live in the plaintext workspace blob EXCEPT AI
+    // keys, which stay in connectorCredentials above.
+    settings: { dailyLanding: true, ai: { enabled: false, provider: "claude", baseUrl: "", embeddingsEnabled: false, embeddingsBaseUrl: "" } },
+    attachments: [], // {id, noteId, name, mime, size, createdAt, data?, synced} — blobs in phase2 IndexedDB
+    readLater: [], // {id, url, title, text, fetchedText, fetchedAt, fetchStatus, savedAt, read}
+    highlights: [], // {id, quote, sourceId, sourceTitle, sourceUrl, createdAt, dismissedAt, shownCount}
+    flashcards: [], // {id, front, back, sourceNoteId, kind, clozeIndex, stability, difficulty, dueAt, lastReviewedAt, reviews, lapses}
     trash: [], // M2: soft-deleted notes ({...note, deletedAt}); restored or emptied, never silently lost
     savedAt: null, // M4: ISO timestamp of the last successful persist; used to reconcile IndexedDB vs localStorage
     templates: seedTemplates(),
@@ -214,6 +222,8 @@
   let toastTimer = null;
   let pluginManager = null;
   let featureSuite = null;
+  // Phase 2 — Capture & smarts UI controller (created at boot).
+  let phase2UI = null;
   // Phase 1 — sync session state (in-memory only; never persisted).
   let syncSessionKey = null;
   let captureTokenVisibleOnce = null; // token text shown once after generation
@@ -583,6 +593,11 @@
         connectorCredentials: window.xPinCredentials?.sanitizeCredentialStore
           ? window.xPinCredentials.sanitizeCredentialStore(parsed.connectorCredentials)
           : {},
+        // Phase 2 — Capture & smarts state (sanitized by the phase2 module;
+        // unknown keys are dropped, known ones survive the round-trip).
+        ...(window.xPinPhase2?.sanitizePhase2State
+          ? window.xPinPhase2.sanitizePhase2State(parsed)
+          : { settings: { dailyLanding: true, ai: { enabled: false, provider: "claude", baseUrl: "", embeddingsEnabled: false, embeddingsBaseUrl: "" } }, attachments: [], readLater: [], highlights: [], flashcards: [] }),
         features: window.xPinFeatures.sanitizeState(parsed.features, notes),
         plugins: parsed.plugins && typeof parsed.plugins === "object"
           ? {
@@ -616,18 +631,29 @@
   }
 
   function storageInfo() {
+    // Phase 2 — attachment usage comes from attachment metadata (bytes are
+    // in IndexedDB, so the workspace JSON size alone would understate it).
+    const attachmentUsage = window.xPinPhase2?.attachmentUsage
+      ? window.xPinPhase2.attachmentUsage(state.attachments)
+      : { count: 0, bytes: 0 };
     return {
       backend: storageBackend,
       bytes: storageBytes,
       displayBytes: formatBytes(storageBytes),
       notes: state.notes.length,
-      trash: state.trash.length
+      trash: state.trash.length,
+      attachments: attachmentUsage.count,
+      attachmentBytes: attachmentUsage.bytes,
+      attachmentDisplayBytes: formatBytes(attachmentUsage.bytes)
     };
   }
 
   function updateStorageIndicator() {
     if (!ui.storageNote) return;
-    ui.storageNote.textContent = `Saved on this device · ${formatBytes(storageBytes)} · ${storageBackend === "indexeddb" ? "IndexedDB" : "localStorage"}`;
+    const attachmentUsage = window.xPinPhase2?.attachmentUsage
+      ? window.xPinPhase2.attachmentUsage(state.attachments)
+      : { count: 0, bytes: 0 };
+    ui.storageNote.textContent = `Saved on this device · ${formatBytes(storageBytes)} · ${storageBackend === "indexeddb" ? "IndexedDB" : "localStorage"}${attachmentUsage.count ? ` · ${attachmentUsage.count} attachment${attachmentUsage.count === 1 ? "" : "s"} (${formatBytes(attachmentUsage.bytes)})` : ""}`;
   }
 
   function openIdb() {
@@ -975,6 +1001,11 @@
     return [...tags];
   }
 
+  // Phase 2 — last ranked-search results (note id -> {score, snippet}).
+  // Set by visibleNotes() when a text query is active; renderNoteRow()
+  // shows the snippet. Cleared whenever there is no query.
+  let lastSearchResults = new Map();
+
   function visibleNotes() {
     if (state.filter === "trash") {
       return [...state.trash].sort((a, b) => timestamp(b.deletedAt) - timestamp(a.deletedAt));
@@ -993,10 +1024,25 @@
       const tagQuery = rawQuery.toLocaleLowerCase();
       notes = notes.filter((note) => extractTags(`${note.title}\n${note.body}`)
         .some((tag) => tag === tagQuery || tag.startsWith(`${tagQuery}/`)));
+      lastSearchResults = new Map();
     } else {
       const query = rawQuery.toLocaleLowerCase();
       if (query) {
+        // Phase 2 (audit B2) — ranked search: title > headings > body
+        // frequency, recency as a small tiebreak; snippets with matches.
+        // Falls back to the old substring filter if the phase2 module is
+        // unavailable, so search never breaks outright.
+        const ranked = window.xPinPhase2?.rankNotes
+          ? window.xPinPhase2.rankNotes(notes, query)
+          : null;
+        if (ranked) {
+          lastSearchResults = new Map(ranked.map((result) => [result.note.id, result]));
+          return ranked.map((result) => result.note);
+        }
         notes = notes.filter((note) => `${note.title}\n${note.body}`.toLocaleLowerCase().includes(query));
+        lastSearchResults = new Map();
+      } else {
+        lastSearchResults = new Map();
       }
     }
     return sortNotes(notes);
@@ -1028,6 +1074,27 @@
     row.className = `note-row${note.id === selectedNoteId ? " is-selected" : ""}`;
     row.dataset.noteId = note.id;
     row.innerHTML = `<span class="note-row-titleline"><span class="note-row-title">${escapeText(note.title.trim() || "Untitled note")}</span>${note.pinned ? '<span class="note-row-pin" aria-label="Pinned">◆</span>' : ""}</span><span class="note-preview">${escapeText(preview)}</span><span class="note-row-time">${escapeText(formatRelative(note.updatedAt))}</span>`;
+    // Phase 2 — ranked-search snippet with the match highlighted.
+    const searchHit = lastSearchResults.get(note.id);
+    if (searchHit?.snippet) {
+      const snippetEl = document.createElement("span");
+      snippetEl.className = "note-search-snippet";
+      const { text, ranges, prefix, suffix } = searchHit.snippet;
+      if (prefix) snippetEl.append(document.createTextNode("… "));
+      let at = 0;
+      const merged = [...ranges].sort((a, b) => a[0] - b[0]);
+      for (const [start, end] of merged) {
+        if (start < at) continue;
+        if (start > at) snippetEl.append(document.createTextNode(text.slice(at, start)));
+        const mark = document.createElement("mark");
+        mark.textContent = text.slice(start, end);
+        snippetEl.append(mark);
+        at = end;
+      }
+      snippetEl.append(document.createTextNode(text.slice(at)));
+      if (suffix) snippetEl.append(document.createTextNode(" …"));
+      row.append(snippetEl);
+    }
     row.addEventListener("click", () => selectNote(note.id));
     return row;
   }
@@ -1165,6 +1232,37 @@
     const empty = notes.length === 0;
     ui.emptyState.hidden = !empty;
     ui.noteList.hidden = empty && folders.length === 0;
+    // Phase 2 — ranked search also covers database rows and canvas titles;
+    // those matches land here, below the note list.
+    const existingExtras = ui.noteList.querySelector(".search-extras");
+    existingExtras?.remove();
+    const rawQuery = ui.search.value.trim();
+    if (rawQuery && !rawQuery.startsWith("#") && window.xPinPhase2?.searchExtras) {
+      const extras = window.xPinPhase2.searchExtras(state, rawQuery);
+      if (extras.length) {
+        const extrasEl = document.createElement("div");
+        extrasEl.className = "search-extras";
+        const heading = document.createElement("div");
+        heading.className = "search-extras-heading";
+        heading.textContent = "ALSO FOUND IN DATABASES & CANVAS";
+        extrasEl.append(heading);
+        for (const extra of extras) {
+          const line = document.createElement("button");
+          line.type = "button";
+          line.className = "search-extra-row";
+          line.textContent = extra.label;
+          if (extra.kind === "canvas") {
+            line.addEventListener("click", () => {
+              state.selectedCanvasId = extra.canvasId;
+              switchView("canvas");
+              renderCanvas();
+            });
+          }
+          extrasEl.append(line);
+        }
+        ui.noteList.append(extrasEl);
+      }
+    }
     ui.listCount.textContent = `${notes.length} ${notes.length === 1 ? "note" : "notes"}`;
     if (empty) {
       ui.emptyTitle.textContent = ui.search.value ? "No matching notes" : state.tagFilter ? `Nothing tagged ${state.tagFilter}` : state.filter === "pinned" ? "Nothing pinned yet" : "No notes yet";
@@ -1429,6 +1527,7 @@
   function switchView(view) {
     featureSuite?.deactivate();
     hideEdgeEditor();
+    hidePhase2View();
     state.view = view === "canvas" ? "canvas" : "notes";
     const isCanvas = state.view === "canvas";
     ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : state.filter === "trash" ? "Trash" : "Recent notes");
@@ -1925,6 +2024,34 @@
     return result + escapeText(source.slice(previous));
   }
 
+  // Phase 2 (audit B1) — `![name](attachment:<id>)` / `[name](attachment:<id>)`
+  // references. Renders a placeholder the phase2 module resolves after the
+  // preview builds (image inline, PDF embedded, other files as download
+  // links). Unknown ids stay honest instead of linking nowhere.
+  function attachmentRefElement(id, fallbackName) {
+    const attachment = state.attachments.find((item) => item.id === id);
+    const span = document.createElement("span");
+    span.className = "attachment-ref";
+    if (!attachment) {
+      span.textContent = `Attachment unavailable: ${fallbackName || id}`;
+      return span;
+    }
+    const kind = /^image\//.test(attachment.mime) ? "image"
+      : attachment.mime === "application/pdf" ? "pdf" : "file";
+    span.dataset.attachmentId = attachment.id;
+    span.dataset.attachmentKind = kind;
+    span.dataset.attachmentName = attachment.name;
+    span.dataset.attachmentMime = attachment.mime;
+    span.textContent = `${kind === "image" ? "Image" : kind === "pdf" ? "PDF" : "File"}: ${attachment.name} — loading…`;
+    const note = document.createElement("small");
+    note.className = "attachment-sync-note";
+    note.textContent = window.xPinPhase2?.attachmentSyncNote
+      ? window.xPinPhase2.attachmentSyncNote(attachment)
+      : "";
+    span.append(document.createTextNode(" "), note);
+    return span;
+  }
+
   function appendInlineMarkdown(element, source) {
     const pattern = /(!\[[^\]]*\]\([^)]+\)|\[\[[^\]]+\]\]|`[^`]+`|\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)|\*\*(.+?)\*\*|__(.+?)__|~~(.+?)~~|\*(?!\s)(.+?)\*|_(?!\s)(.+?)_)/g;
     let previous = 0;
@@ -1933,7 +2060,14 @@
       const token = match[0];
       let rendered;
       if (token.startsWith("![")) {
-        rendered = document.createTextNode(token);
+        // Phase 2 — image attachments render inline; other images stay as
+        // plain text (unchanged pre-Phase 2 behavior).
+        const imageMatch = token.match(/^!\[([^\]]*)\]\(([^)\s]+)\)$/);
+        const attachmentId = imageMatch?.[2]?.startsWith("attachment:")
+          ? imageMatch[2].slice("attachment:".length) : null;
+        rendered = attachmentId
+          ? attachmentRefElement(attachmentId, imageMatch[1])
+          : document.createTextNode(token);
       } else if (token.startsWith("[[")) {
         const [target, alias] = token.slice(2, -2).split("|", 2);
         const cleanTarget = target.trim();
@@ -1953,8 +2087,12 @@
         rendered = document.createElement("code");
         rendered.textContent = token.slice(1, -1);
       } else if (token.startsWith("[")) {
-        try {
-          const url = new URL(match[3], window.location.href);
+        // Phase 2 — attachment links resolve to the stored file.
+        if (typeof match[3] === "string" && match[3].startsWith("attachment:")) {
+          rendered = attachmentRefElement(match[3].slice("attachment:".length), match[2]);
+        } else {
+          try {
+            const url = new URL(match[3], window.location.href);
           if (!["http:", "https:"].includes(url.protocol)) throw new TypeError("Unsupported link protocol.");
           rendered = document.createElement("a");
           rendered.href = url.href;
@@ -1962,8 +2100,9 @@
           rendered.rel = "noopener noreferrer";
           rendered.textContent = match[2];
           if (match[4]) rendered.title = match[4];
-        } catch {
-          rendered = document.createTextNode(token);
+          } catch {
+            rendered = document.createTextNode(token);
+          }
         }
       } else {
         const content = match[5] ?? match[6] ?? match[7] ?? match[8] ?? match[9];
@@ -2260,6 +2399,14 @@
   function renderMarkdownPreview(source) {
     ui.markdownPreview.replaceChildren();
     appendMarkdownBlocks(ui.markdownPreview, source);
+    // Phase 2 — resolve attachment references (images inline, PDFs
+    // embedded, files as download links). Best-effort: a missing blob
+    // leaves the honest placeholder the renderer already wrote.
+    if (window.xPinPhase2?.resolveAttachmentRefs) {
+      window.xPinPhase2.resolveAttachmentRefs(ui.markdownPreview).catch((error) => {
+        console.error("Could not resolve note attachments.", error);
+      });
+    }
   }
 
   function setPreviewMode(enabled) {
@@ -4375,6 +4522,30 @@
         run: () => openDailyNote()
       },
       {
+        id: "core-new-meeting",
+        name: "New meeting note",
+        description: "Create a meeting note from the template, linked to today",
+        run: () => createMeetingNote()
+      },
+      {
+        id: "core-capture-smarts",
+        name: "Capture & smarts",
+        description: "Voice memos, read-later, flashcards, highlights, imports, AI assists",
+        run: () => openPhase2View("capture")
+      },
+      {
+        id: "core-review-flashcards",
+        name: "Review flashcards",
+        description: "Review due FSRS flashcards",
+        run: () => openPhase2View("flashcards")
+      },
+      {
+        id: "core-read-later",
+        name: "Open Read Later",
+        description: "Open the read-it-later inbox",
+        run: () => openPhase2View("readlater")
+      },
+      {
         id: "core-shortcuts",
         name: "Keyboard shortcuts",
         description: "Open the shortcuts reference",
@@ -4411,6 +4582,81 @@
     if (state.view === "canvas") renderCanvas();
     featureSuite?.render();
     renderCoreToolsSections();
+    // Phase 2 — week strip + sidebar counts (read-later unread, due cards).
+    phase2UI?.renderDailyStrip();
+    const unread = state.readLater.filter((item) => !item.read).length;
+    const readLaterCount = byId("readlater-count");
+    if (readLaterCount) readLaterCount.textContent = String(unread);
+    const dueCount = byId("flashcards-due-count");
+    if (dueCount && window.xPinPhase2?.flashcardCounts) {
+      dueCount.textContent = String(window.xPinPhase2.flashcardCounts(state.flashcards).due);
+    }
+  }
+
+  // Phase 2 — Capture & smarts panel (voice, read-later, flashcards,
+  // highlights, importers, AI). A view alongside notes/canvas, not a modal.
+  function openPhase2View(tab = "capture") {
+    featureSuite?.deactivate();
+    hideEdgeEditor();
+    byId("notes-toolbar").hidden = true;
+    byId("notes-layout").hidden = true;
+    ui.canvasView.hidden = true;
+    byId("new-folder").hidden = true;
+    const view = byId("phase2-view");
+    if (view) view.hidden = false;
+    document.querySelectorAll(".nav-item").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.phase2View === tab);
+    });
+    ui.currentView.textContent = "Capture & smarts";
+    ui.pageTitle.innerHTML = `Capture &amp; smarts<span class="title-period">.</span>`;
+    byId("notes-heading").querySelector(".page-subtitle").textContent = "Capture fast, resurface what matters, study what you keep.";
+    if (phase2UI) phase2UI.setTab(tab);
+    else if (view) view.replaceChildren();
+  }
+
+  function hidePhase2View() {
+    const view = byId("phase2-view");
+    if (view) view.hidden = true;
+  }
+
+  // Phase 2 (audit B1) — attach files to the current note. Blobs go to the
+  // phase2 IndexedDB store; small ones (<= 1 MB) also base64 into the
+  // record so they can travel inside sync envelopes. Large ones stay
+  // device-local and the note says so honestly.
+  async function attachFiles(fileList) {
+    const files = [...(fileList ?? [])];
+    if (!files.length) return;
+    if (!window.xPinPhase2?.storeAttachment) {
+      showToast("Attachments are unavailable in this build.");
+      return;
+    }
+    if (!currentNote()) createNote();
+    const note = currentNote();
+    let attached = 0;
+    let large = 0;
+    for (const file of files) {
+      try {
+        window.xPinPhase2.validateAttachmentFile(file);
+        const { record } = await window.xPinPhase2.storeAttachment({ noteId: note.id, file });
+        state.attachments.push(record);
+        const markdown = window.xPinPhase2.attachmentMarkdown(record);
+        const start = ui.noteBody.selectionStart ?? ui.noteBody.value.length;
+        const end = ui.noteBody.selectionEnd ?? ui.noteBody.value.length;
+        ui.noteBody.setRangeText(`\n${markdown}\n`, start, end, "end");
+        ui.noteBody.dispatchEvent(new Event("input", { bubbles: true }));
+        attached += 1;
+        if (record.size > window.xPinPhase2.SYNCABLE_ATTACHMENT_BYTES) large += 1;
+      } catch (error) {
+        showToast(error.message || "That file could not be attached.");
+      }
+    }
+    if (attached) {
+      persistWorkspace();
+      render();
+      showToast(large
+        ? `${attached} file${attached === 1 ? "" : "s"} attached — ${large} over 1 MB ${large === 1 ? "is" : "are"} stored on this device only, not synced.`
+        : `${attached} file${attached === 1 ? "" : "s"} attached.`);
+    }
   }
 
   function selectNote(id) {
@@ -4626,6 +4872,77 @@
     state.notes.push(note);
     pluginManager?.emit("note:created", { ...note });
     return { note, created: true };
+  }
+
+  // Phase 2 (research #5) — meeting note from the template, linked to the
+  // day via note properties (Phase 0 metadata): date/time/attendees, plus
+  // metadata.dailyDate so it shows up on that day.
+  function createMeetingNote() {
+    const title = window.prompt("Meeting title:", "") ?? "";
+    if (title === null) return null;
+    const attendees = window.prompt("Attendees (comma-separated):", "") ?? "";
+    const time = window.prompt("Time (e.g. 14:30):", "") ?? "";
+    if (attendees === null || time === null) return null;
+    const built = window.xPinPhase2?.buildMeetingNote
+      ? window.xPinPhase2.buildMeetingNote({ title, attendees, time })
+      : { title: title.trim() || "Meeting notes", body: `# ${title.trim() || "Meeting notes"}\n\nAttendees: ${attendees}\n\n## Notes\n\n- \n\n## Actions\n\n- [ ] `, metadata: { meetingDate: localDateKey(), meetingTime: time, attendees, dailyDate: localDateKey() } };
+    const note = createNote(built);
+    selectNote(note.id);
+    showToast("Meeting note created — linked to today.");
+    return note;
+  }
+
+  // Phase 2 (Item 8) — AI keys live in the Phase 1 credential store
+  // (plugin id "ai-assists", one key per provider), encrypted with the
+  // sync passphrase. Never in the plaintext workspace blob, never logged.
+  async function unlockPhase2Credentials(passphrase) {
+    if (!window.xPinCredentials) throw new Error("Credential storage is unavailable in this build.");
+    if (typeof passphrase !== "string" || passphrase.length < 12) {
+      throw new Error("Credential passphrase needs at least 12 characters.");
+    }
+    if (!state.sync.credentialSalt) {
+      // First setup: derive + store the salt and key-check (same KDF as
+      // sync), then unlock the session key.
+      const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
+      const key = await window.xPinCredentials.deriveCredentialKey(passphrase, salt);
+      const check = await window.xPinCredentials.keyCheckValue(key);
+      state.sync.credentialSalt = btoa(String.fromCharCode(...salt));
+      state.sync.credentialKeyCheck = check;
+      persistWorkspace();
+    }
+    await window.xPinCredentials.unlock(passphrase, state.sync.credentialSalt, state.sync.credentialKeyCheck);
+    return true;
+  }
+
+  function aiKeyPresent() {
+    const provider = state.settings.ai.provider;
+    return Boolean(state.connectorCredentials?.["ai-assists"]?.[provider]);
+  }
+
+  async function getAiKey() {
+    const provider = state.settings.ai.provider;
+    const envelope = state.connectorCredentials?.["ai-assists"]?.[provider];
+    if (!envelope) return null;
+    if (!window.xPinCredentials?.isUnlocked()) {
+      throw new Error("Credential storage is locked — unlock it in Capture & smarts settings first.");
+    }
+    return window.xPinCredentials.decryptSecret(envelope);
+  }
+
+  async function setAiKey(value) {
+    const provider = state.settings.ai.provider;
+    if (!window.xPinCredentials?.isUnlocked()) {
+      throw new Error("Credential storage is locked — unlock it in Capture & smarts settings first.");
+    }
+    if (!state.connectorCredentials["ai-assists"]) state.connectorCredentials["ai-assists"] = {};
+    if (!value) {
+      delete state.connectorCredentials["ai-assists"][provider];
+    } else {
+      state.connectorCredentials["ai-assists"][provider] =
+        await window.xPinCredentials.encryptSecret(value);
+    }
+    persistWorkspace();
+    return true;
   }
 
   function openDailyNote(dateKey = localDateKey()) {
@@ -6332,6 +6649,30 @@
     });
     ui.noteBody.addEventListener("keydown", handleCodeEditorKeydown);
     byId("insert-code-block").addEventListener("click", insertCodeBlock);
+    // Phase 2 — attachments: file picker + drag-drop onto the editor.
+    const attachButton = byId("attach-file");
+    const attachInput = byId("attachment-file-input");
+    if (attachButton && attachInput) {
+      attachButton.addEventListener("click", () => attachInput.click());
+      attachInput.addEventListener("change", () => {
+        attachFiles(attachInput.files);
+        attachInput.value = "";
+      });
+    }
+    ui.noteBody.addEventListener("dragover", (event) => {
+      if (event.dataTransfer?.types?.includes?.("Files")) event.preventDefault();
+    });
+    ui.noteBody.addEventListener("drop", (event) => {
+      const files = event.dataTransfer?.files;
+      if (files?.length) {
+        event.preventDefault();
+        attachFiles(files);
+      }
+    });
+    // Phase 2 — Capture & smarts nav (Read Later / Flashcards / Capture).
+    document.querySelectorAll("[data-phase2-view]").forEach((button) => {
+      button.addEventListener("click", () => openPhase2View(button.dataset.phase2View));
+    });
     ui.togglePreview.addEventListener("click", () => setPreviewMode(!previewMode));
     ui.noteTitle.addEventListener("input", () => updateSelectedNote({ title: ui.noteTitle.value }));
     byId("export-note-markdown").addEventListener("click", () => exportNoteMarkdown());
@@ -6556,11 +6897,43 @@
     publishCurrentNote,
     on: (name, callback) => pluginManager?.on(name, callback)
   });
+  // Phase 2 — Capture & smarts UI (voice, read-later, flashcards,
+  // highlights, importers, AI). Guarded: a UI failure must never break boot.
+  try {
+    phase2UI = window.xPinPhase2?.createPhase2UI({
+      getState: () => state,
+      persist: persistWorkspace,
+      render,
+      toast: showToast,
+      notify: showToast,
+      createNote,
+      selectNote,
+      openDailyNote,
+      currentNote,
+      getAiKey,
+      setAiKey,
+      aiKeyPresent,
+      credentialsUnlocked: () => window.xPinCredentials?.isUnlocked() ?? false,
+      unlockCredentials: unlockPhase2Credentials
+    }) ?? null;
+    phase2UI?.renderDailyStrip();
+  } catch (error) {
+    console.error("Could not start Capture & smarts.", error);
+  }
   setupEvents();
   render();
   switchView(state.view);
   reconcileIdbStore(); // M4: migrate to / reconcile with IndexedDB (async, no-op without it)
   setupDeepLinks(); // Phase 1: xpin:// links from the hash fallback + Capacitor App
+  // Phase 2 — daily note is the landing page (default ON). Skipped when a
+  // deep link already chose a destination (hash present).
+  if (state.settings.dailyLanding && !(window.location?.hash ?? "")) {
+    try {
+      openDailyNote();
+    } catch (error) {
+      console.error("Could not open today's note.", error);
+    }
+  }
   if (restoredFeatureView) featureSuite.open(restoredFeatureView);
   pluginManager.start().then(() => {
     state.plugins = pluginManager.serialize();

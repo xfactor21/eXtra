@@ -838,7 +838,7 @@
       const storage = el("section", "tools-section");
       const info = typeof host.storageInfo === "function" ? host.storageInfo() : null;
       storage.append(el("h2", "", "Storage"), el("p", "", info
-        ? `${info.notes} ${info.notes === 1 ? "note" : "notes"} · ${info.trash} in Trash · about ${info.displayBytes} stored in ${info.backend === "indexeddb" ? "IndexedDB" : "localStorage (IndexedDB is unavailable here)"}. A backup copy is kept in localStorage, and if saving ever fails xPin offers a Markdown backup download instead of losing edits.`
+        ? `${info.notes} ${info.notes === 1 ? "note" : "notes"} · ${info.trash} in Trash · about ${info.displayBytes} stored in ${info.backend === "indexeddb" ? "IndexedDB" : "localStorage (IndexedDB is unavailable here)"}${info.attachments ? ` · ${info.attachments} attachment${info.attachments === 1 ? "" : "s"} (${info.attachmentDisplayBytes})` : ""}. A backup copy is kept in localStorage, and if saving ever fails xPin offers a Markdown backup download instead of losing edits.`
         : "Storage details are unavailable."));
       wrap.append(storage);
 

@@ -563,7 +563,7 @@ function boot(seedStorage, opts) {
   const b = buildContext(seedStorage, opts);
   const files = ["plugin-sandbox.js", "plugin-system.js", "plugins.js",
     "sync/sync.js", "sync/transports.js", "sync/credentials.js", "sync/publish.js",
-    "feature-suite.js", "app.js"];
+    "phase2.js", "feature-suite.js", "app.js"];
   for (const f of files) {
     const code = fs.readFileSync(REPO + "/" + f, "utf8");
     try {
@@ -1798,6 +1798,10 @@ async function main() {
     await flush(120);
     const { doc, win } = b;
     const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    // Phase 2: boot lands on today's note, so select the seeded note first.
+    const exportRow = [...doc.querySelectorAll("#note-list [data-note-id]")].find((r) => r.textContent.includes("Export Me"));
+    check("T39: seeded note row found", !!exportRow);
+    if (exportRow) click(exportRow);
     click(doc.querySelector('[data-feature-view="settings"]'));
     await flush(100);
     const before = b.createdURLs.length;
@@ -1920,6 +1924,10 @@ async function main() {
     await flush(120);
     const { doc, win } = b;
     const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    // Phase 2: boot lands on today's note, so select the seeded note first.
+    const pageRow = [...doc.querySelectorAll("#note-list [data-note-id]")].find((r) => r.textContent.includes("Rendered Page"));
+    check("T42: seeded note row found", !!pageRow);
+    if (pageRow) click(pageRow);
     click(doc.querySelector('[data-feature-view="settings"]'));
     await flush(100);
     click(doc.querySelector('[data-action="publish"]'));
@@ -2351,6 +2359,278 @@ async function main() {
       ws2.connectorCredentials?.["some-plugin"]?.token?.ciphertext === "d29ybGQ=",
       JSON.stringify(ws2.connectorCredentials));
     check("T51: no console errors", b2.errors.length === 0, b2.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T52 (Phase 2): boot clean with phase2; daily note is the landing page */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    check("T52: phase2 module loaded", !!win.xPinPhase2, typeof win.xPinPhase2);
+    const state = win.xPinDomain.getState();
+    const today = new Date();
+    const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const daily = state.notes.find((n) => n.metadata?.dailyDate === key);
+    check("T52: daily landing opened today's note", !!daily, `dailyDate=${key}, notes=${state.notes.map((n) => n.metadata?.dailyDate ?? n.title).join(",")}`);
+    check("T52: daily landing is on by default", state.settings?.dailyLanding === true, JSON.stringify(state.settings));
+    const stripDays = doc.querySelectorAll(".daily-strip-day");
+    check("T52: week strip shows 7 days", stripDays.length === 7, `days=${stripDays.length}`);
+    check("T52: phase2 nav buttons exist", !!doc.querySelector('[data-phase2-view="flashcards"]') && !!doc.querySelector('[data-phase2-view="readlater"]'));
+    check("T52: attach button exists", !!doc.getElementById("attach-file"));
+    check("T52: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T53 (Phase 2, Item 2): ranked search orders title matches first + snippets */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Shopping list");
+    type(doc.getElementById("note-body"), "buy bananas and bread and milk");
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Banana bread");
+    type(doc.getElementById("note-body"), "bake banana bread on Sunday");
+    const search = doc.getElementById("search-input");
+    type(search, "banana bread");
+    const listText = doc.getElementById("note-list").textContent;
+    const bananaPos = listText.indexOf("Banana bread");
+    const shopPos = listText.indexOf("Shopping list");
+    check("T53: title match ranks above body match", bananaPos >= 0 && shopPos >= 0 && bananaPos < shopPos, listText.slice(0, 300));
+    const snippet = doc.getElementById("note-list").querySelector(".note-search-snippet");
+    check("T53: snippet shown with highlighted match", !!snippet && snippet.textContent.toLocaleLowerCase().includes("banana") && !!snippet.querySelector("mark"), snippet ? snippet.textContent.slice(0, 120) : "no snippet");
+    type(search, "");
+    const list2 = doc.getElementById("note-list").textContent;
+    check("T53: clearing search restores list", list2.includes("Shopping list") && list2.includes("Banana bread"));
+    check("T53: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T54 (Phase 2, Item 1): attachment store round-trip + caps + sync rule */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { win } = b;
+    const P = win.xPinPhase2;
+    const blob = await P.saveAttachmentBlob("att-smoke-1", { type: "image/png", size: 5 });
+    const back = await P.getAttachmentBlob("att-smoke-1");
+    check("T54: attachment blob round-trips (IDB/memory fallback)", !!back && back.size === 5, JSON.stringify(back));
+    const missing = await P.getAttachmentBlob("att-nope");
+    check("T54: missing attachment returns null", missing === null, String(missing));
+    let overLimit = false;
+    try { P.validateAttachmentFile({ name: "big.bin", size: 26 * 1024 * 1024 }); } catch { overLimit = true; }
+    check("T54: >25 MB file rejected honestly", overLimit);
+    const small = { id: "a1", noteId: "n1", name: "s.png", mime: "image/png", size: 100, createdAt: new Date().toISOString(), data: "aGVsbG8=", synced: true };
+    const big = { id: "a2", noteId: "n1", name: "b.pdf", mime: "application/pdf", size: 2 * 1024 * 1024, createdAt: new Date().toISOString(), data: null, synced: false };
+    check("T54: <=1 MB attachment is syncable", P.syncableAttachments([small, big]).length === 1, JSON.stringify(P.syncableAttachments([small, big])));
+    check("T54: large attachment labelled device-only", /not synced/.test(P.attachmentSyncNote(big)), P.attachmentSyncNote(big));
+    check("T54: attachment markdown syntax", P.attachmentMarkdown(small) === "![s.png](attachment:a1)" && P.attachmentMarkdown(big) === "[b.pdf](attachment:a2)");
+    check("T54: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T55 (Phase 2, Item 1): attachment references render as markers in preview */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    const state = win.xPinDomain.getState();
+    state.attachments.push({
+      id: "att-preview-1", noteId: null, name: "pic.png", mime: "image/png", size: 10,
+      createdAt: new Date().toISOString(), data: null, synced: false
+    });
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "With attachment");
+    type(doc.getElementById("note-body"), "See this: ![pic.png](attachment:att-preview-1)");
+    const previewBtn = doc.getElementById("toggle-preview");
+    click(previewBtn);
+    await flush(50);
+    const preview = doc.getElementById("markdown-preview");
+    const ref = preview.querySelector('[data-attachment-id="att-preview-1"]');
+    check("T55: attachment ref renders in preview", !!ref, preview.textContent.slice(0, 200));
+    check("T55: missing blob stays honest (not a broken image)", /not on this device/.test(preview.textContent), preview.textContent.slice(0, 200));
+    check("T55: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T56 (Phase 2, Item 5): importers parse the sample files correctly */
+  {
+    const P = boot(null).win.xPinPhase2;
+    const enex = fs.readFileSync(REPO + "/tests/fixtures/sample.enex", "utf8");
+    const parsedEnex = P.parseEnex(enex);
+    check("T56: .enex imports 1 note, skips 1 empty", parsedEnex.notes.length === 1 && parsedEnex.skipped === 1, JSON.stringify(parsedEnex));
+    check("T56: .enex keeps title/body/tags", parsedEnex.notes[0].title === "Trip ideas" && /coast in spring/.test(parsedEnex.notes[0].body) && /#travel/.test(parsedEnex.notes[0].body), parsedEnex.notes[0].body.slice(0, 200));
+    const one = P.parseOneNoteHtml(fs.readFileSync(REPO + "/tests/fixtures/onenote-sample.html", "utf8"), "page.html");
+    check("T56: OneNote HTML imports with list", one.notes.length === 1 && /Ship the beta/.test(one.notes[0].body), one.notes[0]?.body?.slice(0, 200) ?? "");
+    const notion = P.parseNotionFiles([
+      { path: "Project Atlas.html", content: fs.readFileSync(REPO + "/tests/fixtures/notion-parent.html", "utf8") },
+      { path: "Project Atlas/Atlas notes.html", content: fs.readFileSync(REPO + "/tests/fixtures/notion-child.html", "utf8") },
+      { path: "image.png", content: "binary" }
+    ]);
+    check("T56: Notion nested page keeps parent path", notion.notes.length === 2 && notion.notes[1].parentPath === "Project Atlas" && notion.skipped === 1, JSON.stringify(notion.notes.map((n) => n.parentPath)));
+  }
+
+  /* T57 (Phase 2, Item 4): voice memo note structure (transcription mocked) */
+  {
+    const P = boot(null).win.xPinPhase2;
+    const withTranscript = P.buildVoiceMemoNote({ transcript: "Buy milk tomorrow\nCall Ana", audioAttachmentId: "att-vm-1", transcriptionStatus: "speech-api" });
+    check("T57: voice memo title from first transcript line", withTranscript.title === "Buy milk tomorrow", withTranscript.title);
+    check("T57: voice memo keeps transcript + audio link + provenance",
+      /Buy milk tomorrow/.test(withTranscript.body) && /attachment:att-vm-1/.test(withTranscript.body) && withTranscript.metadata.voiceMemo === true && withTranscript.metadata.transcription === "speech-api",
+      withTranscript.body.slice(0, 200));
+    const noTranscript = P.buildVoiceMemoNote({ transcript: "", audioAttachmentId: "att-vm-2", transcriptionStatus: "unavailable" });
+    check("T57: no transcript stays honest, audio kept", /unavailable/.test(noTranscript.body) && /attachment:att-vm-2/.test(noTranscript.body), noTranscript.body.slice(0, 200));
+  }
+
+  /* T58 (Phase 2, Item 6): read-later + highlight + digest flows */
+  {
+    const P = boot(null).win.xPinPhase2;
+    const item = P.createReadLaterItem({ url: "https://example.com/article", title: "An article" });
+    check("T58: read-later item saved with source + date", item.url === "https://example.com/article" && item.fetchStatus === "saved" && !!item.savedAt, JSON.stringify(item));
+    let badUrl = false;
+    try { P.createReadLaterItem({ url: "not-a-url" }); } catch { badUrl = true; }
+    check("T58: read-later rejects non-http URLs", badUrl);
+    const highlight = P.createHighlight({ quote: "The quick brown fox", sourceTitle: "An article", sourceUrl: "https://example.com/article" });
+    check("T58: highlight stores quote + source", highlight.quote === "The quick brown fox" && highlight.sourceUrl === "https://example.com/article");
+    const digest = P.dailyDigest([
+      { ...highlight, id: "h-old", createdAt: "2026-11-01T00:00:00.000Z" },
+      { ...highlight, id: "h-new", createdAt: "2026-11-13T00:00:00.000Z" },
+      { ...highlight, id: "h-dismissed", createdAt: "2026-11-01T00:00:00.000Z", dismissedAt: "2026-11-12T00:00:00.000Z" }
+    ], "2026-11-13", 3);
+    check("T58: digest resurfaces older highlight, never dismissed ones",
+      digest.some((h) => h.id === "h-old") && !digest.some((h) => h.id === "h-dismissed") && !digest.some((h) => h.id === "h-new"),
+      JSON.stringify(digest.map((h) => h.id)));
+  }
+
+  /* T59 (Phase 2, Item 7): FSRS-4.5 known vectors */
+  {
+    const P = boot(null).win.xPinPhase2;
+    check("T59: R(S,S)=0.9", Math.abs(P.fsrsRetrievability(3.173, 3.173) - 0.9) < 1e-9, String(P.fsrsRetrievability(3.173, 3.173)));
+    check("T59: S0(Good)=3.173, D0(Good)=7.1949",
+      P.fsrsInitialStability(3) === 3.173 && Math.abs(P.fsrsInitialDifficulty(3) - 7.1949) < 1e-9,
+      `${P.fsrsInitialStability(3)} / ${P.fsrsInitialDifficulty(3)}`);
+    const firstGood = P.fsrsReview({ stability: null, difficulty: null, reviews: 0, lapses: 0 }, 3);
+    check("T59: first Good keeps S=3.173, interval ~3.17d",
+      Math.abs(firstGood.stability - 3.173) < 1e-9 && Math.abs(firstGood.intervalDays - 3.17) < 0.05,
+      JSON.stringify(firstGood));
+    const mature = { stability: 3.173, difficulty: 7.1949, lastReviewedAt: new Date(Date.now() - 3.173 * 864e5).toISOString(), dueAt: new Date().toISOString(), reviews: 1, lapses: 0 };
+    const good = P.fsrsReview(mature, 3);
+    check("T59: mature Good S~8.47", Math.abs(good.stability - 8.467) < 0.05, JSON.stringify(good));
+    const again = P.fsrsReview(mature, 1);
+    check("T59: mature Again S~1.03, due in 10 min",
+      Math.abs(again.stability - 1.0312) < 0.05 && Date.parse(again.dueAt) - Date.now() < 11 * 60 * 1000,
+      JSON.stringify(again));
+    const cards = P.extractCardsFromNotes([
+      { id: "n1", body: "The capital of France is {{c1::Paris}}.\nQ: What is 2+2?\nA: 4" }
+    ]);
+    check("T59: cloze + Q/A cards extracted with source link",
+      cards.length === 2 && cards.some((c) => c.kind === "cloze" && c.back === "Paris") && cards.every((c) => c.sourceNoteId === "n1"),
+      JSON.stringify(cards.map((c) => [c.kind, c.front.slice(0, 30)])));
+  }
+
+  /* T60 (Phase 2, Item 7): APKG export is a valid zip + SQLite DB */
+  {
+    const P = boot(null).win.xPinPhase2;
+    const cards = [
+      { id: "c1", front: "Capital of France?", back: "Paris", sourceNoteId: null, kind: "qa", clozeIndex: 1, stability: null, difficulty: null, dueAt: null, lastReviewedAt: null, reviews: 0, lapses: 0 },
+      { id: "c2", front: "The mitochondria is the [...] of the cell", back: "powerhouse", sourceNoteId: null, kind: "cloze", clozeIndex: 1, stability: null, difficulty: null, dueAt: null, lastReviewedAt: null, reviews: 0, lapses: 0 }
+    ];
+    const apkg = P.buildApkg(cards, "Smoke Deck");
+    check("T60: .apkg is a zip (PK magic)", apkg.bytes[0] === 0x50 && apkg.bytes[1] === 0x4b && apkg.cardCount === 2, `bytes=${apkg.bytes.length}`);
+    const entries = await P.unzipEntries(apkg.bytes);
+    check("T60: zip holds collection.anki2 + media", entries.length === 2 && entries.some((e) => e.name === "collection.anki2") && entries.some((e) => e.name === "media"), entries.map((e) => e.name).join(","));
+    const dbEntry = entries.find((e) => e.name === "collection.anki2");
+    check("T60: SQLite magic present", new TextDecoder().decode(dbEntry.data.slice(0, 16)) === "SQLite format 3\0");
+    const tables = P.readSqliteTables(dbEntry.data);
+    check("T60: notes/cards tables exist with rows",
+      tables.notes?.rows.length === 2 && tables.cards?.rows.length === 2 && tables.col?.rows.length === 1,
+      Object.keys(tables).join(","));
+    const imported = await P.importApkg(apkg.bytes);
+    check("T60: APKG round-trips back into cards",
+      imported.cards.length === 2 && imported.cards.some((c) => c.front === "Capital of France?" && c.back === "Paris"),
+      JSON.stringify(imported.cards.map((c) => c.front)));
+    check("T60: CSV export + JSON import interchange works",
+      P.importCardsJson(JSON.stringify({ cards: [{ front: "Q", back: "A" }] })).cards.length === 1
+      && P.exportCardsCsv(cards).includes("Capital of France?"));
+  }
+
+  /* T61 (Phase 2, Item 8): AI assists gated off without key; work with one */
+  {
+    const P = boot(null).win.xPinPhase2;
+    check("T61: AI disabled -> unavailable", P.aiStatus({ ai: { enabled: false } }, true).available === false);
+    check("T61: AI enabled without key -> unavailable", P.aiStatus({ ai: { enabled: true } }, false).available === false);
+    check("T61: AI enabled + key -> available", P.aiStatus({ ai: { enabled: true } }, true).available === true);
+    const note = { id: "n1", title: "Cats", body: "Cats sleep all day. Dogs bark at the mail." };
+    const extractive = P.extractiveSummary(note);
+    check("T61: no-key summary is labelled extractive", extractive.source === "extractive" && /Cats sleep/.test(extractive.text), JSON.stringify(extractive));
+    const related = P.relatedNotesKeyword(note, [
+      { id: "n2", title: "Dogs", body: "Dogs bark loudly" },
+      { id: "n3", title: "Cars", body: "Engines and wheels" }
+    ]);
+    check("T61: related notes are keyword-labelled", related.length === 1 && related[0].note.id === "n2" && related[0].source === "keyword", JSON.stringify(related));
+    const blended = P.relatedNotesBlended(note, [
+      { id: "n2", title: "Dogs", body: "Dogs bark loudly" },
+      { id: "n3", title: "Cars", body: "Engines and wheels" }
+    ], new Map([["n3", [1, 0]], ["n2", [0, 1]]]), [1, 0]);
+    check("T61: semantic blend surfaces vector-similar note",
+      blended.some((r) => r.note.id === "n3" && r.source === "semantic") && P.cosineSimilarity([1, 0], [1, 0]) === 1 && P.cosineSimilarity([1, 0], [0, 1]) === 0,
+      JSON.stringify(blended.map((r) => [r.note.id, r.source])));
+    const b = boot(null);
+    b.win.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: "AI brief text" } }] }) });
+    const withKey = await b.win.xPinPhase2.summarizeNoteWithAi({
+      settings: { ai: { enabled: true, provider: "openai", baseUrl: "" } },
+      apiKey: "test-key", note
+    });
+    check("T61: enabled-with-key path returns AI summary", withKey.source === "ai" && withKey.text === "AI brief text", JSON.stringify(withKey));
+    check("T61: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T62 (Phase 2): new state keys survive a save/load round-trip */
+  {
+    const b = boot(null);
+    await flush(120);
+    const ws = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    ws.settings = { dailyLanding: false, ai: { enabled: true, provider: "openai", baseUrl: "https://example.com/v1", embeddingsEnabled: true, embeddingsBaseUrl: "" } };
+    ws.attachments = [{ id: "att-rt", noteId: "n1", name: "f.png", mime: "image/png", size: 10, createdAt: new Date().toISOString(), data: null, synced: false }];
+    ws.readLater = [{ id: "rl-1", url: "https://example.com", title: "X", text: "", fetchedText: "", fetchedAt: null, fetchStatus: "saved", savedAt: new Date().toISOString(), read: false }];
+    ws.highlights = [{ id: "hl-1", quote: "keep me", sourceId: null, sourceTitle: "", sourceUrl: "", createdAt: new Date().toISOString(), dismissedAt: null, shownCount: 0 }];
+    ws.flashcards = [{ id: "fc-1", front: "Q", back: "A", sourceNoteId: null, kind: "qa", clozeIndex: 1, stability: null, difficulty: null, dueAt: null, lastReviewedAt: null, reviews: 0, lapses: 0 }];
+    ws.unknownPhase2 = "drop-me";
+    const b2 = boot({ "xPin.workspace.v1": JSON.stringify(ws) });
+    await flush(120);
+    const ws2 = JSON.parse(b2.storageData["xPin.workspace.v1"]);
+    check("T62: settings survive round-trip (dailyLanding off kept)",
+      ws2.settings?.dailyLanding === false && ws2.settings?.ai?.provider === "openai", JSON.stringify(ws2.settings));
+    check("T62: attachments/read-later/highlights/flashcards survive",
+      ws2.attachments?.length === 1 && ws2.readLater?.length === 1 && ws2.highlights?.length === 1 && ws2.flashcards?.length === 1,
+      JSON.stringify({ a: ws2.attachments?.length, r: ws2.readLater?.length, h: ws2.highlights?.length, f: ws2.flashcards?.length }));
+    check("T62: unknown top-level keys still dropped", !("unknownPhase2" in ws2), Object.keys(ws2).join(","));
+    check("T62: no console errors", b2.errors.length === 0, b2.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T63 (Phase 2, Item 3): calendar strip navigates to past daily notes */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const days = [...doc.querySelectorAll(".daily-strip-day")];
+    const other = days.find((d) => !d.classList.contains("is-today"));
+    check("T63: strip has a non-today day to click", !!other, `days=${days.length}`);
+    if (other) {
+      click(other);
+      await flush(50);
+      const state = win.xPinDomain.getState();
+      const key = other.dataset.dateKey;
+      const note = state.notes.find((n) => n.metadata?.dailyDate === key);
+      check("T63: clicking a past day opens/creates that daily note", !!note, `dateKey=${key}`);
+    }
+    const meeting = win.xPinPhase2.buildMeetingNote({ title: "Sync", attendees: "Ana, Bo", time: "14:30" });
+    check("T63: meeting note carries date/time/attendees properties",
+      meeting.metadata.meetingDate && meeting.metadata.meetingTime === "14:30" && /Ana/.test(meeting.metadata.attendees) && !!meeting.metadata.dailyDate,
+      JSON.stringify(meeting.metadata));
+    check("T63: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
   }
 
   /* report */
