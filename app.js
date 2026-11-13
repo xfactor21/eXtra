@@ -60,6 +60,32 @@
     plugins: { enabled: {}, settings: {} },
     extensions: [],
     marketplaceDirs: [],
+    // Phase 1 — integrations key (fabriX spec §10): the explicit edit point
+    // the fabriX adapter owns. The adapter owns the fabrix sub-key shape;
+    // this key must survive save/load round-trips (see sanitizeIntegrations).
+    integrations: { fabrix: { enabled: false } },
+    // Phase 1 — sync state (E2EE sync; relay URL empty = bundles only).
+    // Passphrases are NEVER stored — only key-check values + salts.
+    sync: {
+      deviceId: null, // generated once on first sync use ("xpin-<random>")
+      relayUrl: "",
+      lastSyncAt: null,
+      lastSyncStatus: "off", // off | ok | error | not-configured
+      lastSyncLamport: 0,
+      lamport: 0,
+      seen: [], // envelope ids already applied (last 200, idempotency)
+      tombstones: [], // {noteId, lamport, deviceId} for permanent deletes
+      syncSalt: null, // base64, 16 bytes — sync key KDF salt
+      syncKeyCheck: null, // base64 SHA-256 key-check (see sync/sync.js)
+      credentialSalt: null, // base64, 16 bytes — credential key KDF salt
+      credentialKeyCheck: null,
+      captureToken: null, // random token for the future capture endpoint / fabriX adapter; revocable
+      captureTokenCreatedAt: null,
+      publishTarget: "" // empty = bundle is the deliverable; no hosted publishing exists
+    },
+    // Phase 1 — connector credential store (audit C4): per-plugin ENCRYPTED
+    // envelopes only ({iv, ciphertext}); plaintext never lands here.
+    connectorCredentials: {},
     trash: [], // M2: soft-deleted notes ({...note, deletedAt}); restored or emptied, never silently lost
     savedAt: null, // M4: ISO timestamp of the last successful persist; used to reconcile IndexedDB vs localStorage
     templates: seedTemplates(),
@@ -188,6 +214,9 @@
   let toastTimer = null;
   let pluginManager = null;
   let featureSuite = null;
+  // Phase 1 — sync session state (in-memory only; never persisted).
+  let syncSessionKey = null;
+  let captureTokenVisibleOnce = null; // token text shown once after generation
   let activeCommandIndex = 0;
   let canvasViewportState = { x: 0, y: 0, zoom: 1 };
   let canvasSaveTimer = null;
@@ -293,6 +322,14 @@
           grants: Array.isArray(record.grants) ? record.grants.filter((item) =>
             plugin.manifest.permissions.includes(item)
           ) : [],
+          // Phase 1 — connector origins: only origins the plugin declared
+          // AND the user approved, each individually, in the review queue.
+          // Revocation removes an entry here and takes effect immediately
+          // (the host checks this list on every network:fetch).
+          approvedOrigins: Array.isArray(record.approvedOrigins)
+            ? record.approvedOrigins.filter((origin) =>
+              typeof origin === "string" && (plugin.manifest.networkOrigins ?? []).includes(origin))
+            : [],
           settings: record.settings && typeof record.settings === "object" && !Array.isArray(record.settings)
             ? record.settings
             : {},
@@ -362,7 +399,12 @@
       createdAt: validDate(raw.createdAt),
       updatedAt: validDate(raw.updatedAt),
       metadata: sanitizeNoteMetadata(raw.metadata),
-      versions: sanitizeNoteVersions(raw.versions)
+      versions: sanitizeNoteVersions(raw.versions),
+      // Phase 1 — per-note sync version {lamport, deviceId} (LWW clock).
+      // Defaults to 0 (never synced); sanitized, never trusted blindly.
+      syncVersion: window.xPinSync?.sanitizeSyncVersion
+        ? window.xPinSync.sanitizeSyncVersion(raw.syncVersion)
+        : { lamport: 0, deviceId: "" }
     };
   }
 
@@ -386,6 +428,78 @@
       if (note.parentNoteId && !knownIds.has(note.parentNoteId)) note.parentNoteId = null;
     });
     return records;
+  }
+
+  // Phase 1 (fabriX spec §10 + audit G4): the `integrations` key is an
+  // explicit edit point. Known keys are kept, unknown ones dropped — the
+  // fabriX adapter owns its sub-key shape and sanitizes it itself.
+  function sanitizeIntegrations(value) {
+    const clean = { fabrix: { enabled: false } };
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const fabrix = value.fabrix;
+      if (fabrix && typeof fabrix === "object" && !Array.isArray(fabrix)) {
+        clean.fabrix = {
+          enabled: fabrix.enabled === true,
+          // The adapter owns everything else under fabrix; keep only
+          // JSON-safe values so a corrupt sub-key cannot break the load.
+          ...(typeof fabrix === "object" ? {} : {})
+        };
+        // Preserve adapter-owned scalar/JSON fields verbatim (capped), but
+        // never trust nested executable content — the adapter re-validates
+        // its own state on enable.
+        for (const [key, item] of Object.entries(fabrix)) {
+          if (key === "enabled") continue;
+          if (Object.keys(clean.fabrix).length > 40) break;
+          if (typeof item === "string") clean.fabrix[key] = item.slice(0, 4000);
+          else if (typeof item === "number" && Number.isFinite(item)) clean.fabrix[key] = item;
+          else if (typeof item === "boolean" || item === null) clean.fabrix[key] = item;
+          else if (Array.isArray(item) && item.length <= 200) {
+            try { clean.fabrix[key] = JSON.parse(JSON.stringify(item.slice(0, 200))); } catch { /* drop */ }
+          } else if (item && typeof item === "object") {
+            try { clean.fabrix[key] = JSON.parse(JSON.stringify(item)); } catch { /* drop */ }
+          }
+        }
+      }
+    }
+    return clean;
+  }
+
+  // Phase 1: sync state sanitizer — keeps known keys, drops unknown ones,
+  // caps the seen-log and tombstone list (audit G4: new state keys must
+  // survive load, not be silently stripped).
+  function sanitizeSyncState(value) {
+    const defaults = structuredClone(initialWorkspace.sync);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return defaults;
+    const str = (item, max = 400) => typeof item === "string" ? item.slice(0, max) : null;
+    const lamport = (item) => Number.isFinite(item) ? Math.max(0, Math.floor(item)) : 0;
+    return {
+      deviceId: typeof value.deviceId === "string" && /^xpin-[a-z0-9]{1,32}$/.test(value.deviceId)
+        ? value.deviceId : null,
+      relayUrl: typeof value.relayUrl === "string" ? value.relayUrl.slice(0, 500) : "",
+      lastSyncAt: typeof value.lastSyncAt === "string" && Number.isFinite(Date.parse(value.lastSyncAt))
+        ? value.lastSyncAt : null,
+      lastSyncStatus: ["off", "ok", "error", "not-configured"].includes(value.lastSyncStatus)
+        ? value.lastSyncStatus : "off",
+      lastSyncLamport: lamport(value.lastSyncLamport),
+      lamport: lamport(value.lamport),
+      seen: Array.isArray(value.seen)
+        ? value.seen.filter((id) => typeof id === "string").slice(-200) : [],
+      tombstones: Array.isArray(value.tombstones)
+        ? value.tombstones.filter((t) => t && typeof t.noteId === "string" && Number.isFinite(t.lamport))
+          .slice(-200).map((t) => ({
+            noteId: t.noteId.slice(0, 120),
+            lamport: Math.max(0, Math.floor(t.lamport)),
+            deviceId: typeof t.deviceId === "string" ? t.deviceId.slice(0, 80) : ""
+          })) : [],
+      syncSalt: str(value.syncSalt, 64),
+      syncKeyCheck: str(value.syncKeyCheck, 64),
+      credentialSalt: str(value.credentialSalt, 64),
+      credentialKeyCheck: str(value.credentialKeyCheck, 64),
+      captureToken: str(value.captureToken, 128),
+      captureTokenCreatedAt: typeof value.captureTokenCreatedAt === "string" &&
+        Number.isFinite(Date.parse(value.captureTokenCreatedAt)) ? value.captureTokenCreatedAt : null,
+      publishTarget: typeof value.publishTarget === "string" ? value.publishTarget.slice(0, 500) : ""
+    };
   }
 
   function loadWorkspace() {
@@ -464,6 +578,11 @@
         canvases: sanitizeCanvases(parsed.canvases),
         extensions: sanitizeExtensions(parsed.extensions),
         templates: sanitizeTemplates(parsed.templates),
+        integrations: sanitizeIntegrations(parsed.integrations),
+        sync: sanitizeSyncState(parsed.sync),
+        connectorCredentials: window.xPinCredentials?.sanitizeCredentialStore
+          ? window.xPinCredentials.sanitizeCredentialStore(parsed.connectorCredentials)
+          : {},
         features: window.xPinFeatures.sanitizeState(parsed.features, notes),
         plugins: parsed.plugins && typeof parsed.plugins === "object"
           ? {
@@ -662,6 +781,10 @@
       localStorage.setItem(STORAGE_KEY, serialized);
       storageRecoveryOffered = false;
       setSaveState("saved");
+      // Phase 1 — save lifecycle event (audit C2). Integrations subscribe
+      // to know a persist completed; the emit is best-effort and never
+      // breaks the save itself.
+      pluginManager?.emit("save:completed", { savedAt: state.savedAt, bytes: storageBytes });
       return true;
     } catch (error) {
       console.error("Could not save the xPin workspace.", error);
@@ -1430,6 +1553,7 @@
     const cleanName = name.trim().slice(0, 100);
     if (!cleanName) return showToast("Board names cannot be empty.");
     board.name = cleanName;
+    pluginManager?.emit("canvas:updated", { id: board.id, name: board.name });
     renderCanvas();
     updateCanvasSaveStatus(persistWorkspace());
     showToast("Board renamed.");
@@ -1445,6 +1569,7 @@
     state.canvases = state.canvases.filter((canvas) => canvas.id !== board.id);
     state.selectedCanvasId = state.canvases[0]?.id ?? null;
     selectedCanvasNodeId = null;
+    pluginManager?.emit("canvas:deleted", { id: board.id, name: board.name });
     renderCanvas();
     updateCanvasSaveStatus(persistWorkspace());
     showToast("Board deleted.");
@@ -2939,45 +3064,26 @@
     }
     if (capability === "notes:update") {
       if (typeof payload?.id !== "string") throw new TypeError("Plugin note update requires a note id.");
-      const patch = payload?.patch;
-      if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
-        throw new TypeError("Plugin note update requires a patch object with title, body, and/or metadata.");
-      }
-      const changes = {};
-      if (patch.title !== undefined) {
-        if (typeof patch.title !== "string" || patch.title.length > 120) {
-          throw new TypeError("Plugin note title must be text under 120 characters.");
-        }
-        changes.title = patch.title;
-      }
-      if (patch.body !== undefined) {
-        if (typeof patch.body !== "string" || patch.body.length > 100_000) {
-          throw new TypeError("Plugin note body must be text under 100 KB.");
-        }
-        changes.body = patch.body;
-      }
-      // M5 — plugins may write note properties (frontmatter) through
-      // patch.metadata; see mergeNoteMetadata for the key/value rules.
-      // A null value deletes that property.
-      if (patch.metadata !== undefined) {
-        const note = state.notes.find((item) => item.id === payload.id);
-        if (!note) throw new Error("The note no longer exists.");
-        const nextMetadata = mergeNoteMetadata(note.metadata, patch.metadata);
-        if (JSON.stringify(nextMetadata) !== JSON.stringify(note.metadata ?? {})) {
-          changes.metadata = nextMetadata;
-        }
-      }
-      if (!Object.keys(changes).length) throw new TypeError("Plugin note update changed nothing.");
-      const note = state.notes.find((item) => item.id === payload.id);
-      if (!note) throw new Error("The note no longer exists.");
-      Object.assign(note, changes, { updatedAt: new Date().toISOString() });
-      refreshNoteRow(note.id);
-      if (note.id === selectedNoteId) renderEditor();
-      pluginManager?.emit("note:updated", { ...note });
-      renderPluginPanels();
-      renderEditorStatus();
+      // Phase 1: the RPC handler delegates to the shared domain function
+      // (same validation as createNote; folder/parent/pinned/metadata all
+      // supported). The editor re-renders when the open note changed from
+      // outside the editor itself.
+      const updated = updateNote(payload.id, payload?.patch ?? {});
+      if (updated.id === selectedNoteId) renderEditor();
       persistWorkspace();
-      return { ...note };
+      return updated;
+    }
+    if (capability === "notes:delete") {
+      if (typeof payload?.id !== "string") throw new TypeError("Plugin note delete requires a note id.");
+      const permanent = payload?.permanent === true;
+      if (permanent) {
+        const trashed = state.trash.find((item) => item.id === payload.id);
+        if (!trashed) throw new Error("Only a note already in Trash can be permanently deleted.");
+        if (!window.confirm(`Permanently delete “${trashed.title.trim() || "Untitled note"}”? This cannot be undone.`)) {
+          return false;
+        }
+      }
+      return deleteNote(payload.id, { permanent });
     }
     if (capability === "editor:write") {
       if (typeof payload?.text !== "string" || payload.text.length > 5_000) {
@@ -3055,7 +3161,195 @@
       persistWorkspace();
       return true;
     }
+    // Phase 1 (audit C3) — folders, databases, canvas, templates, export.
+    // All delegate to the same domain functions the built-in host API uses.
+    if (capability === "folders:read") {
+      if (payload?.action === "list") return state.folders.map((folder) => ({ ...folder }));
+      throw new TypeError("Unknown folder-read action.");
+    }
+    if (capability === "folders:write") {
+      const action = payload?.action;
+      if (action === "create") {
+        if (typeof payload?.name !== "string") throw new TypeError("Folder creation needs a name.");
+        const folder = createFolderRecord(payload.name);
+        persistWorkspace();
+        render();
+        return folder;
+      }
+      if (action === "rename") {
+        if (typeof payload?.id !== "string" || typeof payload?.name !== "string") {
+          throw new TypeError("Folder rename needs an id and a name.");
+        }
+        const folder = renameFolderRecord(payload.id, payload.name);
+        persistWorkspace();
+        render();
+        return folder;
+      }
+      if (action === "delete") {
+        if (typeof payload?.id !== "string") throw new TypeError("Folder deletion needs an id.");
+        const folder = deleteFolderRecord(payload.id);
+        persistWorkspace();
+        render();
+        return folder;
+      }
+      throw new TypeError("Unknown folder-write action.");
+    }
+    if (capability === "databases:read") {
+      if (payload?.action === "list") return listDatabaseTables();
+      if (payload?.action === "rows") {
+        if (typeof payload?.tableId !== "string") throw new TypeError("Database rows need a table id.");
+        return readDatabaseRows(payload.tableId);
+      }
+      throw new TypeError("Unknown database-read action.");
+    }
+    if (capability === "databases:write") {
+      if (payload?.action === "add-row") {
+        if (typeof payload?.tableId !== "string") throw new TypeError("Adding a row needs a table id.");
+        return addDatabaseRow(payload.tableId, payload?.values ?? {});
+      }
+      if (payload?.action === "update-row") {
+        if (typeof payload?.tableId !== "string" || typeof payload?.rowId !== "string") {
+          throw new TypeError("Updating a row needs a table id and a row id.");
+        }
+        return updateDatabaseRow(payload.tableId, payload.rowId, payload?.values ?? {});
+      }
+      throw new TypeError("Unknown database-write action.");
+    }
+    if (capability === "canvas:read") {
+      if (payload?.action === "list") {
+        return state.canvases.map((board) => ({
+          id: board.id, name: board.name, nodes: board.nodes.length, edges: board.edges.length
+        }));
+      }
+      throw new TypeError("Unknown canvas-read action.");
+    }
+    if (capability === "templates:read") {
+      if (payload?.action === "list") return state.templates.map((template) => ({ ...template }));
+      throw new TypeError("Unknown template-read action.");
+    }
+    if (capability === "export:note") {
+      if (payload?.action === "note-markdown") {
+        const target = typeof payload?.id === "string"
+          ? state.notes.find((note) => note.id === payload.id) ?? null
+          : currentNote();
+        if (!target) throw new Error("The note to export no longer exists.");
+        return exportNoteMarkdown(target);
+      }
+      if (payload?.action === "markdown-zip") return exportMarkdownZip();
+      throw new TypeError("Unknown export action.");
+    }
+    // Phase 1 (audit C1/C4) — connector tier: gated host-side fetch and the
+    // encrypted credential store. The sandboxed tier never reaches these:
+    // the sandbox rejects connector permissions at validation time, and the
+    // host double-checks the tier + grants here.
+    if (capability === "network:fetch") {
+      if (plugin.manifest.tier !== "connector") {
+        throw new Error("Only connector-tier plugins can use network:fetch.");
+      }
+      return connectorFetch(plugin, payload);
+    }
+    if (capability === "credentials:set" || capability === "credentials:get" || capability === "credentials:delete") {
+      if (plugin.manifest.tier !== "connector") {
+        throw new Error("Only connector-tier plugins can use the credential store.");
+      }
+      return connectorCredential(plugin, capability, payload);
+    }
     throw new Error("Unknown plugin capability.");
+  }
+
+  // Connector fetch: the HOST performs the request; the worker never
+  // touches the network. Enforced here: connector tier (checked by the
+  // caller), grant + declared permission (checked by the caller), exact
+  // origin match against individually approved origins, https only, 10 s
+  // timeout, 1 MB response cap.
+  async function connectorFetch(plugin, payload) {
+    const url = payload?.url;
+    if (typeof url !== "string" || !url) throw new TypeError("Connector fetch needs a URL.");
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new TypeError("Connector fetch URL is invalid.");
+    }
+    if (parsed.protocol !== "https:") throw new TypeError("Connector fetches must use https.");
+    const approved = (plugin.approvedOrigins ?? []).includes(parsed.origin);
+    if (!approved) {
+      throw new Error(`Origin ${parsed.origin} is not approved for “${plugin.manifest.name}”. Approve it in the plugin review queue.`);
+    }
+    const options = payload?.options ?? {};
+    const method = typeof options.method === "string" ? options.method.toUpperCase() : "GET";
+    if (!["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].includes(method)) {
+      throw new TypeError("Connector fetch method is not supported.");
+    }
+    const headers = {};
+    if (options.headers && typeof options.headers === "object" && !Array.isArray(options.headers)) {
+      const entries = Object.entries(options.headers).slice(0, 20);
+      for (const [name, value] of entries) {
+        if (typeof name !== "string" || typeof value !== "string") continue;
+        if (["host", "content-length", "connection"].includes(name.toLocaleLowerCase())) continue;
+        headers[name] = value.slice(0, 4000);
+      }
+    }
+    let body;
+    if (options.body !== undefined) {
+      if (typeof options.body !== "string" || options.body.length > 100_000) {
+        throw new TypeError("Connector request bodies must be text under 100 KB.");
+      }
+      body = options.body;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    let response;
+    try {
+      response = await fetch(parsed.toString(), { method, headers, body, signal: controller.signal });
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error("Connector fetch timed out after 10 seconds.");
+      throw new Error(`Connector fetch failed: ${String(error.message || error).slice(0, 200)}`);
+    } finally {
+      clearTimeout(timer);
+    }
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > 1_048_576) {
+      throw new Error("Connector response exceeds the 1 MB limit and was discarded.");
+    }
+    return {
+      status: response.status,
+      ok: response.ok,
+      contentType: response.headers?.get?.("content-type") ?? null,
+      body: new TextDecoder().decode(buffer)
+    };
+  }
+
+  // Connector credentials: per-plugin secrets, encrypted with the workspace
+  // passphrase envelope. Values never appear in the plaintext workspace
+  // blob and are never logged. Locked storage fails honestly — plaintext is
+  // never stored as a fallback.
+  async function connectorCredential(plugin, capability, payload) {
+    const key = payload?.key;
+    window.xPinCredentials.validateSecretKey(key);
+    const pluginId = plugin.manifest.id;
+    const store = state.connectorCredentials[pluginId] ?? {};
+    if (capability === "credentials:set") {
+      if (typeof payload?.value !== "string") throw new TypeError("Credential values must be text.");
+      const envelope = await window.xPinCredentials.encryptSecret(payload.value);
+      store[key] = envelope;
+      state.connectorCredentials[pluginId] = store;
+      persistWorkspace();
+      return true;
+    }
+    if (capability === "credentials:get") {
+      const envelope = store[key];
+      if (!envelope) return null;
+      return window.xPinCredentials.decryptSecret(envelope);
+    }
+    // credentials:delete
+    if (store[key]) {
+      delete store[key];
+      if (Object.keys(store).length) state.connectorCredentials[pluginId] = store;
+      else delete state.connectorCredentials[pluginId];
+      persistWorkspace();
+    }
+    return true;
   }
 
   async function startExtension(plugin) {
@@ -3157,17 +3451,28 @@
   // Shared core for local file imports AND marketplace installs: validate a
   // parsed package and stage it in the Pending review queue. Nothing runs
   // until the owner reviews and approves it in the Plugins catalogue.
-  async function importPluginPackage(parsed, fileName, provenance) {
+  async function importPluginPackage(parsed, fileName, provenance, { update = false } = {}) {
     const plugin = window.xPinSandbox.validatePackage(parsed);
     const clash = state.extensions.find((item) => item.manifest.id === plugin.manifest.id);
     if (pluginManager.plugins().some((item) => item.id === plugin.manifest.id)) {
       throw new Error(`"${plugin.manifest.name}" clashes with a built-in xPin feature id. Pick a different plugin id.`);
     }
-    if (clash) {
+    if (clash && !update) {
       throw new Error(`"${clash.manifest.name}" v${clash.manifest.version} is already installed. Remove it first to import v${plugin.manifest.version}.`);
+    }
+    if (clash && update && comparePluginVersions(plugin.manifest.version, clash.manifest.version) <= 0) {
+      throw new Error(`"${clash.manifest.name}" v${clash.manifest.version} is already installed — v${plugin.manifest.version} is not newer.`);
     }
     const sha256 = await window.xPinSandbox.digestPackage(plugin);
     if (!sha256) throw new Error("This browser cannot calculate a package fingerprint, so the plugin was not installed.");
+    if (clash && update) {
+      // Phase 1 (audit C6): an update REPLACES the installed record and
+      // sends it back through the review queue — the old version stops
+      // running until the new package is approved (changed package →
+      // re-review, as today). The running sandbox is stopped first.
+      disableExtension(clash);
+      state.extensions = state.extensions.filter((item) => item.manifest.id !== clash.manifest.id);
+    }
     state.extensions.push({
       ...plugin,
       fileName,
@@ -3177,9 +3482,10 @@
       enabled: false,
       approvedHash: null,
       grants: [],
+      approvedOrigins: [],
       settings: {},
       reviewStatus: "pending",
-      reviewReason: null,
+      reviewReason: clash && update ? "Updated package — review the new version before it can run." : null,
       reviewedAt: null
     });
     persistWorkspace();
@@ -3194,8 +3500,70 @@
      until the owner reviews and approves it, exactly like a local import. */
   const MARKETPLACE_DEFAULT_DIR = "https://raw.githubusercontent.com/xfactor21/eXtra/main/marketplace/index.json";
   const MARKETPLACE_CACHE_PREFIX = "xpin.marketplace.cache.";
+  // Phase 1 (audit C6): Ed25519 public key (SPKI DER, base64) that verifies
+  // marketplace/index.json. The matching private key lives outside the repo
+  // (see marketplace/SIGNING.md). window.__xPinMarketplacePublicKey is a
+  // TEST-ONLY override the smoke suite uses to sign mock indexes; the app
+  // never sets it itself.
+  const MARKETPLACE_PUBLIC_KEY_SPKI_B64 = window.__xPinMarketplacePublicKey ??
+    "MCowBQYDK2VwAyEAbp+0jHeAGI96yYl8G2hQubegyisqk8oeKtXncDa6A+U=";
+  const MARKETPLACE_SIGNATURE_KEY_ID = "xpin-marketplace-1";
   let marketplaceEntries = [];
   let marketplaceNotice = "";
+
+  function marketplaceB64ToBytes(value) {
+    const binary = atob(value);
+    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  }
+
+  // Verify an index's Ed25519 signature (covers the index JSON without the
+  // signature fields). A bad/missing signature fails closed: the directory
+  // is unusable, never silently trusted.
+  async function verifyMarketplaceIndex(index) {
+    if (!index || typeof index !== "object" || Array.isArray(index)) {
+      return { ok: false, reason: "not a plugin index" };
+    }
+    if (typeof index.signature !== "string" || !index.signature) {
+      return { ok: false, reason: "missing signature" };
+    }
+    if (index.signatureKeyId && index.signatureKeyId !== MARKETPLACE_SIGNATURE_KEY_ID) {
+      return { ok: false, reason: `unknown signing key (${index.signatureKeyId})` };
+    }
+    if (!globalThis.crypto?.subtle) return { ok: false, reason: "Web Crypto unavailable" };
+    try {
+      // _cachedAt is local cache metadata added by writeMarketplaceCache;
+      // it was not part of the signed payload and is ignored here.
+      const { signature, signatureKeyId: _keyId, _cachedAt: _cachedAt, ...rest } = index;
+      const subtle = globalThis.crypto.subtle;
+      const key = await subtle.importKey(
+        "spki",
+        marketplaceB64ToBytes(MARKETPLACE_PUBLIC_KEY_SPKI_B64),
+        { name: "Ed25519" },
+        false,
+        ["verify"]
+      );
+      const ok = await subtle.verify(
+        { name: "Ed25519" },
+        key,
+        marketplaceB64ToBytes(signature),
+        new TextEncoder().encode(JSON.stringify(rest))
+      );
+      return ok ? { ok: true } : { ok: false, reason: "bad signature" };
+    } catch (error) {
+      return { ok: false, reason: "verification failed" };
+    }
+  }
+
+  function comparePluginVersions(a, b) {
+    const parse = (v) => String(v ?? "").split(".").map((part) => Number.parseInt(part, 10) || 0);
+    const pa = parse(a);
+    const pb = parse(b);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+      const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  }
 
   function marketplaceDirList() {
     if (Array.isArray(state.marketplaceDirs) && state.marketplaceDirs.length) return state.marketplaceDirs;
@@ -3260,6 +3628,8 @@
       throw new Error("invalid JSON");
     }
     if (!index || !Array.isArray(index.plugins)) throw new Error("not a plugin index");
+    const verification = await verifyMarketplaceIndex(index);
+    if (!verification.ok) throw new Error(`unverified index (${verification.reason})`);
     writeMarketplaceCache(url, index);
     return index;
   }
@@ -3312,18 +3682,28 @@
       if (!forceRefresh && cachedIndex) {
         // Tab switches and searches reuse the cache without hitting the
         // network; the refresh button always tries the network first.
-        index = cachedIndex;
-        cached = true;
+        // Cached indexes are verified on every read, not just on fetch.
+        const verification = await verifyMarketplaceIndex(cachedIndex);
+        if (verification.ok) {
+          index = cachedIndex;
+          cached = true;
+        } else {
+          problems.push(`${dirUrl} (cached index unverified: ${verification.reason})`);
+        }
       } else {
         try {
           index = await fetchMarketplaceIndex(dirUrl);
         } catch (error) {
           // Offline or unreachable: fall back to the last good index so the
-          // directory stays browsable. The problem is reported in the status
-          // line and each entry is badged as an offline copy.
+          // directory stays browsable — but only if that copy verifies.
           if (cachedIndex) {
-            index = cachedIndex;
-            cached = true;
+            const verification = await verifyMarketplaceIndex(cachedIndex);
+            if (verification.ok) {
+              index = cachedIndex;
+              cached = true;
+            } else {
+              problems.push(`${dirUrl} (cached index unverified: ${verification.reason})`);
+            }
           } else {
             problems.push(`${dirUrl} (${error.message})`);
             continue;
@@ -3340,7 +3720,9 @@
       !query || `${entry.name} ${entry.description ?? ""} ${entry.id}`.toLocaleLowerCase().includes(query)
     );
     if (problems.length) {
-      status.textContent = `Some directories could not be reached: ${problems.join("; ")}.`;
+      const unverified = problems.some((problem) => /unverified/.test(problem));
+      status.textContent = `Some directories could not be reached: ${problems.join("; ")}.` +
+        (unverified ? " Unverified — showing installed plugins only; no installs from unverified directories." : "");
     } else if (matches.length === 0) {
       status.textContent = query ? "No plugins match your search." : "No plugins listed in these directories yet.";
     } else {
@@ -3380,21 +3762,36 @@
       button.type = "button";
       button.className = "editor-tool-button";
       const installedVersion = installed.get(entry.id);
-      if (installedVersion) {
+      const updateAvailable = installedVersion &&
+        comparePluginVersions(entry.version, installedVersion) > 0;
+      let changelog = null;
+      if (installedVersion && !updateAvailable) {
         button.disabled = true;
         button.textContent = `Installed (v${installedVersion})`;
+      } else if (updateAvailable) {
+        // Phase 1 (audit C6): an available update shows the version +
+        // changelog line, and updating routes through the review queue
+        // (changed package → re-review, as today).
+        button.textContent = `Update available (v${entry.version})`;
+        button.addEventListener("click", () => installMarketplacePlugin(entry, { update: true }));
+        if (entry.changelog) {
+          changelog = document.createElement("small");
+          changelog.className = "marketplace-changelog";
+          changelog.textContent = entry.changelog;
+        }
       } else {
         button.textContent = "Install";
         button.addEventListener("click", () => installMarketplacePlugin(entry));
       }
       actions.append(button);
       card.append(head, description, meta, caps, actions);
+      if (changelog) card.append(changelog);
       list.append(card);
     }
     marketplaceNotice = problems.join("; ");
   }
 
-  async function installMarketplacePlugin(entry) {
+  async function installMarketplacePlugin(entry, { update = false } = {}) {
     const url = resolveMarketplaceUrl(entry.dirUrl, entry.downloadUrl);
     showToast(`Downloading ${entry.name}…`);
     let response;
@@ -3417,7 +3814,7 @@
     }
     try {
       const fileName = url.split("/").pop() || `${entry.id}.xpin.json`;
-      await importPluginPackage(parsed, fileName, `marketplace: ${entry.dirUrl}`);
+      await importPluginPackage(parsed, fileName, `marketplace: ${entry.dirUrl}`, { update });
       switchPluginTab("catalogue");
     } catch (error) {
       console.error("Could not install marketplace plugin.", error);
@@ -3429,7 +3826,8 @@
     pendingPluginConsent = plugin;
     ui.pluginPermissions.replaceChildren();
     ui.pluginConsentProvenance.textContent =
-      `Local package: ${plugin.fileName} · SHA-256 ${plugin.sha256.slice(0, 16)}… · Author is self-reported; this fingerprint is not a signature.`;
+      `Local package: ${plugin.fileName} · SHA-256 ${plugin.sha256.slice(0, 16)}… · Author is self-reported; this fingerprint is not a signature.` +
+      (plugin.manifest.tier === "connector" ? " · Connector tier: network access is host-side only, per approved origin." : "");
     ui.pluginSourceView.textContent = plugin.source;
     plugin.manifest.permissions.forEach((permission) => {
       const label = document.createElement("label");
@@ -3451,6 +3849,33 @@
       label.append(checkbox, text);
       ui.pluginPermissions.append(label);
     });
+    // Phase 1 — connector origins: each declared origin is approved
+    // individually, in the same review (pre-checked like capabilities;
+    // uncheck any origin the plugin should not reach). Revocation later
+    // removes it from approvedOrigins and takes effect immediately.
+    if (plugin.manifest.tier === "connector" && (plugin.manifest.networkOrigins ?? []).length) {
+      const heading = document.createElement("p");
+      heading.className = "consent-origins-heading";
+      heading.textContent = "Network origins — approve each one separately. The plugin can only fetch from approved origins, over https.";
+      ui.pluginPermissions.append(heading);
+      plugin.manifest.networkOrigins.forEach((origin) => {
+        const label = document.createElement("label");
+        label.className = "permission-row";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = origin;
+        checkbox.dataset.origin = origin;
+        checkbox.checked = true;
+        const text = document.createElement("span");
+        const name = document.createElement("strong");
+        name.textContent = origin;
+        const description = document.createElement("small");
+        description.textContent = "Host-side fetch only: 10 s timeout, 1 MB response cap.";
+        text.append(name, description);
+        label.append(checkbox, text);
+        ui.pluginPermissions.append(label);
+      });
+    }
     ui.pluginTrustCheckbox.checked = false;
     ui.allowPluginButton.disabled = true;
     ui.pluginRejectRow.hidden = true;
@@ -3484,6 +3909,10 @@
       if (!proceed) return;
     }
     plugin.grants = granted;
+    // Phase 1 — approved origins are whatever the reviewer left checked.
+    plugin.approvedOrigins = [...ui.pluginPermissions.querySelectorAll("[data-origin]:checked")]
+      .map((checkbox) => checkbox.dataset.origin)
+      .filter((origin) => (plugin.manifest.networkOrigins ?? []).includes(origin));
     plugin.approvedHash = plugin.sha256;
     plugin.enabled = true;
     plugin.reviewStatus = "approved";
@@ -3518,6 +3947,7 @@
     plugin.reviewedAt = new Date().toISOString();
     plugin.enabled = false;
     plugin.grants = [];
+    plugin.approvedOrigins = [];
     plugin.approvedHash = null;
     closePluginConsent();
     persistWorkspace();
@@ -3641,6 +4071,36 @@
           ? `Rejected: ${sourcePlugin.reviewReason}`
           : sourcePlugin.reviewReason;
         details.append(reason);
+      }
+      // Phase 1 — connector origins: approved origins are listed with a
+      // per-origin Revoke button. Revocation removes the origin from the
+      // stored record and takes effect immediately (the host checks the
+      // live list on every network:fetch).
+      if (sourcePlugin.manifest.tier === "connector") {
+        const tierNote = document.createElement("small");
+        tierNote.className = "plugin-tier-note";
+        tierNote.textContent = "CONNECTOR TIER · network access is host-side only";
+        details.append(tierNote);
+        (sourcePlugin.approvedOrigins ?? []).forEach((origin) => {
+          const originRow = document.createElement("div");
+          originRow.className = "plugin-origin-row";
+          const label = document.createElement("small");
+          label.textContent = `Approved origin: ${origin}`;
+          const revoke = document.createElement("button");
+          revoke.type = "button";
+          revoke.className = "plugin-remove";
+          revoke.textContent = "Revoke";
+          revoke.setAttribute("aria-label", `Revoke network access to ${origin} for ${plugin.name}`);
+          revoke.addEventListener("click", () => {
+            sourcePlugin.approvedOrigins = (sourcePlugin.approvedOrigins ?? [])
+              .filter((item) => item !== origin);
+            persistWorkspace();
+            renderPluginManager();
+            showToast(`Network access to ${origin} revoked for ${plugin.name}.`);
+          });
+          originRow.append(label, revoke);
+          details.append(originRow);
+        });
       }
       const actions = document.createElement("div");
       actions.className = "imported-plugin-actions";
@@ -3778,7 +4238,10 @@
       await command.run();
     } catch (error) {
       console.error(`xPin command "${command.name}" failed.`, error);
-      showToast(`${command.name} could not be completed.`);
+      // Phase 1: surface the reason, not just a generic failure — a
+      // rejected connector fetch (or any capability refusal) must be
+      // visible to the user instead of silent.
+      showToast(`${command.name} could not be completed: ${String(error.message || error).slice(0, 200)}`);
     }
   }
 
@@ -3962,12 +4425,17 @@
   function updateSelectedNote(changes) {
     const note = currentNote();
     if (!note) return;
-    Object.assign(note, changes, { updatedAt: new Date().toISOString() });
-    ui.editorDate.textContent = `EDITED ${formatRelative(note.updatedAt).toLocaleUpperCase()}`;
-    refreshNoteRow(note.id);
-    pluginManager?.emit("note:updated", { ...note });
-    renderPluginPanels();
-    renderEditorStatus();
+    // Phase 1: typing goes through the shared domain function so plugins,
+    // sync, and the editor all see the same validation + events. A no-op
+    // edit (value set back to what it was) is not an error here.
+    let updated;
+    try {
+      updated = updateNote(note.id, changes);
+    } catch (error) {
+      if (/changed nothing/.test(error.message)) return;
+      throw error;
+    }
+    ui.editorDate.textContent = `EDITED ${formatRelative(updated.updatedAt).toLocaleUpperCase()}`;
     scheduleSave();
   }
 
@@ -4005,7 +4473,7 @@
       throw new TypeError("New note metadata must be an object.");
     }
     const now = new Date().toISOString();
-    return { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: sanitizeNoteMetadata(metadata) };
+    return { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: sanitizeNoteMetadata(metadata), syncVersion: { lamport: 0, deviceId: "" } };
   }
 
   function createNote({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
@@ -4022,6 +4490,111 @@
     if (!title && !body) ui.noteTitle.focus();
     showToast(title ? "Your note is ready." : "A fresh page, just for you.");
     return note;
+  }
+
+  // Phase 1 — shared domain functions (fabriX spec §10). The fabriX
+  // adapter and sync both consume these; nothing else duplicates note
+  // mutation logic. updateNote validates like createNote (title/body/
+  // folder/tags via metadata); deleteNote soft-deletes to Trash through
+  // the Phase 0 trash path, or permanently deletes (recording a sync
+  // tombstone so other devices learn of the delete).
+  function updateNote(id, patch) {
+    const note = state.notes.find((item) => item.id === id);
+    if (!note) throw new Error("The note no longer exists.");
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new TypeError("Note update requires a patch object with title, body, folderId, parentNoteId, pinned, and/or metadata.");
+    }
+    const beforeTags = extractTags(`${note.title}\n${note.body}`);
+    const changes = {};
+    if (patch.title !== undefined) {
+      if (typeof patch.title !== "string" || patch.title.length > 120) {
+        throw new TypeError("Note title must be text under 120 characters.");
+      }
+      changes.title = patch.title;
+    }
+    if (patch.body !== undefined) {
+      if (typeof patch.body !== "string" || patch.body.length > 100_000) {
+        throw new TypeError("Note body must be text under 100 KB.");
+      }
+      changes.body = patch.body;
+    }
+    if (patch.folderId !== undefined) {
+      if (patch.folderId !== null && !state.folders.some((folder) => folder.id === patch.folderId)) {
+        throw new Error(`Unknown xPin folder: ${patch.folderId}`);
+      }
+      changes.folderId = patch.folderId;
+    }
+    if (patch.parentNoteId !== undefined) {
+      if (patch.parentNoteId !== null) {
+        if (patch.parentNoteId === id) throw new Error("A page cannot be its own parent.");
+        if (!state.notes.some((item) => item.id === patch.parentNoteId)) {
+          throw new Error(`Unknown xPin parent page: ${patch.parentNoteId}`);
+        }
+        const descendants = new Set();
+        const collect = (parentId) => state.notes.filter((item) => item.parentNoteId === parentId)
+          .forEach((item) => { descendants.add(item.id); collect(item.id); });
+        collect(id);
+        if (descendants.has(patch.parentNoteId)) {
+          throw new Error("A page cannot be moved inside one of its own sub-pages.");
+        }
+      }
+      changes.parentNoteId = patch.parentNoteId;
+    }
+    if (patch.pinned !== undefined) {
+      if (typeof patch.pinned !== "boolean") throw new TypeError("Note pinned must be true or false.");
+      changes.pinned = patch.pinned;
+    }
+    if (patch.metadata !== undefined) {
+      const nextMetadata = mergeNoteMetadata(note.metadata, patch.metadata);
+      if (JSON.stringify(nextMetadata) !== JSON.stringify(note.metadata ?? {})) {
+        changes.metadata = nextMetadata;
+      }
+    }
+    if (!Object.keys(changes).length) throw new TypeError("Note update changed nothing.");
+    Object.assign(note, changes, { updatedAt: new Date().toISOString() });
+    refreshNoteRow(note.id);
+    pluginManager?.emit("note:updated", { ...note });
+    const afterTags = extractTags(`${note.title}\n${note.body}`);
+    if (JSON.stringify([...beforeTags].sort()) !== JSON.stringify([...afterTags].sort())) {
+      pluginManager?.emit("tag:changed", { noteId: note.id, tags: afterTags });
+    }
+    renderPluginPanels();
+    renderEditorStatus();
+    return { ...note };
+  }
+
+  function nextSyncLamport() {
+    const maxNote = state.notes.reduce((max, note) =>
+      Math.max(max, window.xPinSync?.noteSyncVersion(note).lamport ?? 0), 0);
+    state.sync.lamport = Math.max(state.sync.lamport ?? 0, maxNote) + 1;
+    return state.sync.lamport;
+  }
+
+  function recordSyncTombstone(noteId) {
+    if (!state.sync.deviceId) return; // sync never set up: nothing to tell
+    state.sync.tombstones = (state.sync.tombstones ?? []).filter((t) => t.noteId !== noteId);
+    state.sync.tombstones.push({ noteId, lamport: nextSyncLamport(), deviceId: state.sync.deviceId });
+    while (state.sync.tombstones.length > 200) state.sync.tombstones.shift();
+  }
+
+  function deleteNote(id, { permanent = false } = {}) {
+    const live = state.notes.find((item) => item.id === id) ?? null;
+    const trashed = state.trash.find((item) => item.id === id) ?? null;
+    if (!live && !trashed) throw new Error("The note no longer exists.");
+    if (permanent) {
+      pushUndo("Permanently delete note");
+      state.notes = state.notes.filter((item) => item.id !== id);
+      state.trash = state.trash.filter((item) => item.id !== id);
+      recordSyncTombstone(id);
+      if (selectedNoteId === id) selectedNoteId = visibleNotes()[0]?.id ?? null;
+      pluginManager?.emit("note:deleted", { ...(live ?? trashed) });
+      render();
+      persistWorkspace();
+      return true;
+    }
+    if (!live) throw new Error("Only a live note can be moved to Trash — this one is already there.");
+    moveNoteToTrash(live);
+    return true;
   }
 
   function localDateKey(date = new Date()) {
@@ -4220,6 +4793,7 @@
     }
     const template = { id: makeId("template"), name: cleanName, content: String(content ?? "").slice(0, 100_000) };
     state.templates.push(template);
+    pluginManager?.emit("template:created", { ...template });
     persistWorkspace();
     renderCoreToolsSections(true);
     showToast(`Template “${cleanName}” saved.`);
@@ -4231,6 +4805,7 @@
     if (!template) return;
     if (!window.confirm(`Delete the “${template.name}” template? Notes made from it are not affected.`)) return;
     state.templates = state.templates.filter((item) => item.id !== id);
+    pluginManager?.emit("template:deleted", { ...template });
     persistWorkspace();
     renderCoreToolsSections(true);
     showToast("Template deleted.");
@@ -4453,6 +5028,583 @@
     return section;
   }
 
+  /* ---------- Phase 1 — E2EE sync, capture token, publish ----------
+   * Local-first: the device store is authoritative; sync exchanges
+   * encrypted envelopes, never plaintext. The passphrase is never stored —
+   * only key-check values + salts persist. The derived keys live in memory
+   * for this session only (syncSessionKey + the credential store's key). */
+  function ensureSyncDeviceId() {
+    if (!state.sync.deviceId) {
+      state.sync.deviceId = window.xPinSync.makeDeviceId();
+      persistWorkspace();
+    }
+    return state.sync.deviceId;
+  }
+
+  function syncKeySaltBytes() {
+    if (!state.sync.syncSalt) {
+      state.sync.syncSalt = window.xPinSync.bytesToBase64(window.xPinSync.newSalt());
+    }
+    return window.xPinSync.base64ToBytes(state.sync.syncSalt);
+  }
+
+  function credentialSaltBytes() {
+    if (!state.sync.credentialSalt) {
+      state.sync.credentialSalt = window.xPinSync.bytesToBase64(window.xPinSync.newSalt());
+    }
+    return window.xPinSync.base64ToBytes(state.sync.credentialSalt);
+  }
+
+  // Set up (first time) or unlock (later) the sync + credential passphrase.
+  // Derives both keys, stores only the key-check values, and unlocks the
+  // credential store for the session. Throws on a wrong passphrase.
+  async function setSyncPassphrase(passphrase) {
+    if (typeof passphrase !== "string" || passphrase.length < 12) {
+      throw new TypeError("Use a passphrase with at least 12 characters.");
+    }
+    const syncKey = await window.xPinSync.deriveSyncKey(passphrase, syncKeySaltBytes());
+    const syncCheck = await window.xPinSync.keyCheckValue(syncKey);
+    if (state.sync.syncKeyCheck && syncCheck !== state.sync.syncKeyCheck) {
+      throw new Error("That passphrase does not match the one sync was set up with.");
+    }
+    const credentialKey = await window.xPinCredentials.deriveCredentialKey(passphrase, credentialSaltBytes());
+    const credentialCheck = await window.xPinCredentials.keyCheckValue(credentialKey);
+    if (state.sync.credentialKeyCheck && credentialCheck !== state.sync.credentialKeyCheck) {
+      throw new Error("That passphrase does not match the one credential storage was set up with.");
+    }
+    state.sync.syncKeyCheck = syncCheck;
+    state.sync.credentialKeyCheck = credentialCheck;
+    syncSessionKey = syncKey;
+    await window.xPinCredentials.unlock(passphrase, state.sync.credentialSalt, state.sync.credentialKeyCheck);
+    persistWorkspace();
+    pluginManager?.emit("settings:changed", { section: "sync" });
+    return true;
+  }
+
+  function lockSyncSession() {
+    syncSessionKey = null;
+    window.xPinCredentials.lock();
+    showToast("Sync locked. Enter your passphrase to sync again.");
+  }
+
+  // Build one envelope per live note (fresh lamport each) plus one tombstone
+  // envelope per permanently deleted note. Phase 1 pushes the full set on
+  // every sync — simple and correct under last-writer-wins; a later phase
+  // can send only changed notes.
+  async function buildSyncEnvelopes() {
+    const deviceId = ensureSyncDeviceId();
+    const envelopes = [];
+    for (const note of state.notes) {
+      const lamport = nextSyncLamport();
+      note.syncVersion = { lamport, deviceId };
+      envelopes.push(await window.xPinSync.makeEnvelope({
+        key: syncSessionKey, deviceId, lamport, note, op: "upsert"
+      }));
+    }
+    for (const tombstone of state.sync.tombstones ?? []) {
+      envelopes.push(await window.xPinSync.makeEnvelope({
+        key: syncSessionKey,
+        deviceId: tombstone.deviceId || deviceId,
+        lamport: tombstone.lamport,
+        note: { id: tombstone.noteId, updatedAt: new Date().toISOString() },
+        op: "tombstone"
+      }));
+    }
+    return envelopes;
+  }
+
+  async function syncNow() {
+    if (!syncSessionKey) {
+      showToast("Enter your sync passphrase in Sync settings first.");
+      return false;
+    }
+    if (!window.xPinSync) {
+      showToast("Sync is unavailable in this build.");
+      return false;
+    }
+    try {
+      const envelopes = await buildSyncEnvelopes();
+      let pulled = [];
+      let relayUsed = false;
+      if (state.sync.relayUrl) {
+        relayUsed = true;
+        const relay = window.xPinSyncTransports.createHttpRelayTransport(state.sync.relayUrl);
+        await relay.push(envelopes);
+        pulled = await relay.pull(state.sync.lastSyncLamport ?? 0);
+      }
+      const { results, seen } = await window.xPinSync.applyEnvelopes(
+        pulled, state, syncSessionKey, state.sync.seen
+      );
+      state.sync.seen = seen;
+      const maxLamport = Math.max(
+        state.sync.lastSyncLamport ?? 0,
+        ...envelopes.map((e) => e.lamport),
+        ...pulled.map((e) => e.lamport ?? 0)
+      );
+      state.sync.lastSyncLamport = maxLamport;
+      state.sync.lastSyncAt = new Date().toISOString();
+      state.sync.lastSyncStatus = "ok";
+      const applied = results.filter((r) => r.applied).length;
+      const ignored = results.filter((r) => r.outcome === "ignored-newer").length;
+      const errors = results.filter((r) => r.outcome === "error");
+      persistWorkspace();
+      render();
+      renderCoreToolsSections(true);
+      pluginManager?.emit("sync:completed", {
+        pushed: envelopes.length, pulled: pulled.length, applied, ignored,
+        errors: errors.length, relay: relayUsed ? state.sync.relayUrl : null
+      });
+      showToast(errors.length
+        ? `Sync finished with ${errors.length} error${errors.length === 1 ? "" : "s"} — see the console.`
+        : relayUsed
+          ? `Synced via relay: ${envelopes.length} sent, ${applied} applied, ${ignored} kept locally.`
+          : `Sync bundle ready: ${envelopes.length} notes. No relay configured — bundles are the sync path today.`);
+      return true;
+    } catch (error) {
+      console.error("Sync failed.", error);
+      state.sync.lastSyncStatus = "error";
+      persistWorkspace();
+      renderCoreToolsSections(true);
+      pluginManager?.emit("sync:completed", { error: String(error.message || error).slice(0, 300) });
+      showToast(error.message || "Sync could not complete.");
+      return false;
+    }
+  }
+
+  async function exportSyncBundle() {
+    if (!syncSessionKey) {
+      showToast("Enter your sync passphrase in Sync settings first.");
+      return false;
+    }
+    try {
+      const envelopes = await buildSyncEnvelopes();
+      const text = window.xPinSyncTransports.BundleTransport.exportBundle(envelopes, state.sync.deviceId);
+      downloadFile(`xpin-sync-${new Date().toISOString().slice(0, 10)}.xpin-sync.json`, text, "application/json");
+      persistWorkspace();
+      showToast(`Sync bundle exported (${envelopes.length} notes, encrypted). Hand the file to your other device and import it there.`);
+      return true;
+    } catch (error) {
+      console.error("Sync bundle export failed.", error);
+      showToast(error.message || "Sync bundle could not be exported.");
+      return false;
+    }
+  }
+
+  async function importSyncBundleText(text) {
+    if (!syncSessionKey) {
+      showToast("Enter your sync passphrase in Sync settings first.");
+      return false;
+    }
+    try {
+      const envelopes = window.xPinSyncTransports.BundleTransport.importBundle(text);
+      const { results, seen } = await window.xPinSync.applyEnvelopes(
+        envelopes, state, syncSessionKey, state.sync.seen
+      );
+      state.sync.seen = seen;
+      state.sync.lastSyncLamport = Math.max(
+        state.sync.lastSyncLamport ?? 0,
+        ...envelopes.map((e) => e.lamport ?? 0)
+      );
+      state.sync.lastSyncAt = new Date().toISOString();
+      state.sync.lastSyncStatus = "ok";
+      const applied = results.filter((r) => r.applied).length;
+      const duplicates = results.filter((r) => r.outcome === "duplicate").length;
+      const errors = results.filter((r) => r.outcome === "error");
+      persistWorkspace();
+      render();
+      renderCoreToolsSections(true);
+      pluginManager?.emit("sync:completed", { imported: envelopes.length, applied, duplicates, errors: errors.length, via: "bundle" });
+      showToast(errors.length
+        ? `Bundle imported with ${errors.length} error${errors.length === 1 ? "" : "s"} — see the console.`
+        : `Bundle imported: ${applied} applied, ${duplicates} already seen.`);
+      return true;
+    } catch (error) {
+      console.error("Sync bundle import failed.", error);
+      showToast(error.message || "Sync bundle could not be imported.");
+      return false;
+    }
+  }
+
+  // Phase 1 — capture token (research #3). There is no local HTTP server
+  // in a static web app, so there is no HTTP capture endpoint today. The
+  // token is the auth the future capture endpoint and the fabriX adapter
+  // will use; it is generated here, stored in sync state, revocable, and
+  // shown in full exactly once (with a copy button).
+  function generateCaptureToken() {
+    const random = `${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+    const token = `xpin_cap_${random.replace(/[^a-zA-Z0-9]/g, "").slice(0, 40)}`;
+    state.sync.captureToken = token;
+    state.sync.captureTokenCreatedAt = new Date().toISOString();
+    captureTokenVisibleOnce = token;
+    persistWorkspace();
+    pluginManager?.emit("settings:changed", { section: "capture" });
+    renderCoreToolsSections(true);
+    showToast("Capture token generated — copy it now; it will not be shown in full again.");
+    return token;
+  }
+
+  function revokeCaptureToken() {
+    state.sync.captureToken = null;
+    state.sync.captureTokenCreatedAt = null;
+    captureTokenVisibleOnce = null;
+    persistWorkspace();
+    renderCoreToolsSections(true);
+    showToast("Capture token revoked.");
+  }
+
+  // Phase 1 — Inbox capture (research #3). Shared/captured items land as a
+  // note in a dedicated "Inbox" folder (created on first use) with a
+  // `captured` marker and the source app name when provided.
+  function getOrCreateInboxFolder() {
+    const existing = state.folders.find((folder) => folder.name.toLocaleLowerCase() === "inbox");
+    if (existing) return existing;
+    const folder = createFolderRecord("Inbox");
+    persistWorkspace();
+    return folder;
+  }
+
+  function captureToInbox(text, { title = "", source = "" } = {}) {
+    const clean = String(text ?? "").trim();
+    if (!clean) {
+      showToast("Nothing to capture.");
+      return null;
+    }
+    const folder = getOrCreateInboxFolder();
+    const firstLine = clean.split("\n")[0].trim();
+    const noteTitle = String(title ?? "").trim().slice(0, 120) || firstLine.slice(0, 120) || "Captured note";
+    const body = source ? `${clean}\n\nSource: ${String(source).slice(0, 200)}` : clean;
+    const metadata = { captured: "true" };
+    if (source) metadata.source = String(source).slice(0, 200);
+    const record = buildNoteRecord({ title: noteTitle, body: body.slice(0, 100_000), folderId: folder.id, metadata });
+    state.notes.push(record);
+    pluginManager?.emit("note:created", { ...record });
+    render();
+    persistWorkspace();
+    showToast(source ? `Captured to Inbox from ${source}.` : "Captured to Inbox.");
+    return record;
+  }
+
+  // Phase 1 — xpin:// deep links. Parsed on app start from the location
+  // hash as a fallback AND wired to Capacitor App's appUrlOpen listener so
+  // the native side can deliver URLs. Forms:
+  //   xpin://capture?text=...&title=...&source=...  → Inbox capture
+  //   xpin://note/<id>                              → open that note
+  function handleDeepLink(raw) {
+    if (!raw || typeof raw !== "string") return false;
+    let urlText = raw.trim();
+    if (urlText.startsWith("#")) urlText = urlText.slice(1);
+    if (!/^xpin:\/\//i.test(urlText)) return false;
+    let parsed;
+    try {
+      parsed = new URL(urlText);
+    } catch {
+      return false;
+    }
+    const host = parsed.hostname.toLocaleLowerCase();
+    const path = `${parsed.hostname}${parsed.pathname}`.replace(/\/+$/, "");
+    if (host === "capture" || path === "capture") {
+      const text = parsed.searchParams.get("text") ?? "";
+      const title = parsed.searchParams.get("title") ?? "";
+      const source = parsed.searchParams.get("source") ?? "";
+      return Boolean(captureToInbox(text, { title, source }));
+    }
+    if (host === "note" || path.startsWith("note/")) {
+      const id = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
+      if (!id) return false;
+      if (!state.notes.some((note) => note.id === id)) {
+        showToast("That note is not on this device.");
+        return false;
+      }
+      selectNote(id);
+      return true;
+    }
+    return false;
+  }
+
+  function setupDeepLinks() {
+    // Hash fallback for the web build (e.g. #xpin/capture?text=...).
+    try {
+      const hash = window.location?.hash ?? "";
+      if (hash) handleDeepLink(hash.replace(/^#xpin\//, "xpin://").replace(/^#/, ""));
+    } catch { /* deep links are best-effort on boot */ }
+    // Native delivery on Android via @capacitor/app (guarded: the web
+    // build has no Capacitor bridge, and this must not throw there).
+    try {
+      const App = window.Capacitor?.Plugins?.App;
+      if (App && typeof App.addListener === "function") {
+        App.addListener("appUrlOpen", (event) => {
+          if (event?.url) handleDeepLink(event.url);
+        });
+      }
+    } catch { /* no Capacitor bridge: web build */ }
+  }
+
+  // Phase 1 — publish a note as a web page (research #15). Produces a
+  // publish bundle (self-contained HTML + manifest) with one-click download
+  // and a local preview. Default target: none — the bundle is the
+  // deliverable ("host this file yourself, or configure a publish
+  // service"). No hosted publishing exists and none is claimed.
+  function publishCurrentNote({ preview = false } = {}) {
+    const note = currentNote();
+    if (!note) {
+      showToast("Open a note before publishing it.");
+      return null;
+    }
+    try {
+      const bundle = window.xPinPublish.buildPublishBundle(note, markdownToHtml);
+      if (preview) {
+        const url = URL.createObjectURL(new Blob([bundle.html], { type: "text/html;charset=utf-8" }));
+        window.open(url, "_blank");
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        showToast("Publish preview opened in a new tab.");
+      } else {
+        downloadFile(bundle.fileName, bundle.html, "text/html;charset=utf-8");
+        showToast(state.sync.publishTarget
+          ? "Publish bundle downloaded. (Sending to a configured target is not implemented yet — the bundle is still the deliverable.)"
+          : "Publish bundle downloaded. Host this file yourself to make it public.");
+      }
+      return bundle;
+    } catch (error) {
+      console.error("Publish failed.", error);
+      showToast(error.message || "This note could not be published.");
+      return null;
+    }
+  }
+
+  function renderSyncSection() {
+    const section = document.createElement("section");
+    section.className = "tools-section";
+    section.id = "sync-section";
+    const heading = document.createElement("h2");
+    heading.textContent = "Sync (encrypted, local-first)";
+    section.append(heading);
+    const status = document.createElement("p");
+    const lastSync = state.sync.lastSyncAt
+      ? `Last sync ${new Date(state.sync.lastSyncAt).toLocaleString()} (${state.sync.lastSyncStatus}).`
+      : "Never synced on this device.";
+    status.textContent = state.sync.deviceId
+      ? `Device ${state.sync.deviceId} · ${lastSync}`
+      : `This device has no sync id yet — one is generated when you sync. ${lastSync}`;
+    section.append(status);
+    const copy = document.createElement("p");
+    copy.textContent = state.sync.relayUrl
+      ? "Relay configured. Sync sends encrypted envelopes only — the relay cannot read your notes."
+      : "No relay configured — bundles are the sync path today. Export a bundle, hand the file to your other device, and import it there. Sync is off by default.";
+    section.append(copy);
+    const passphraseRow = document.createElement("div");
+    passphraseRow.className = "backup-actions";
+    const passphraseInput = document.createElement("input");
+    passphraseInput.type = "password";
+    passphraseInput.className = "feature-input";
+    passphraseInput.placeholder = "Sync passphrase (12+ characters)";
+    passphraseInput.setAttribute("aria-label", "Sync passphrase");
+    passphraseInput.autocomplete = "off";
+    const setPassphrase = document.createElement("button");
+    setPassphrase.type = "button";
+    setPassphrase.className = "feature-button feature-button-primary";
+    setPassphrase.textContent = state.sync.syncKeyCheck ? "Unlock sync" : "Set sync passphrase";
+    setPassphrase.dataset.action = "sync-set-passphrase";
+    setPassphrase.addEventListener("click", async () => {
+      try {
+        await setSyncPassphrase(passphraseInput.value);
+        passphraseInput.value = "";
+        showToast("Sync unlocked for this session.");
+        renderCoreToolsSections(true);
+      } catch (error) {
+        showToast(error.message || "Passphrase could not be set.");
+      }
+    });
+    const lockButton = document.createElement("button");
+    lockButton.type = "button";
+    lockButton.className = "feature-button";
+    lockButton.textContent = "Lock";
+    lockButton.dataset.action = "sync-lock";
+    lockButton.addEventListener("click", () => { lockSyncSession(); renderCoreToolsSections(true); });
+    passphraseRow.append(passphraseInput, setPassphrase, lockButton);
+    section.append(passphraseRow);
+    const relayRow = document.createElement("div");
+    relayRow.className = "backup-actions";
+    const relayInput = document.createElement("input");
+    relayInput.type = "url";
+    relayInput.className = "feature-input";
+    relayInput.placeholder = "Relay URL (optional, e.g. http://127.0.0.1:8787)";
+    relayInput.value = state.sync.relayUrl ?? "";
+    relayInput.setAttribute("aria-label", "Sync relay URL");
+    const saveRelay = document.createElement("button");
+    saveRelay.type = "button";
+    saveRelay.className = "feature-button";
+    saveRelay.textContent = "Save relay URL";
+    saveRelay.dataset.action = "sync-save-relay";
+    saveRelay.addEventListener("click", () => {
+      const value = relayInput.value.trim();
+      if (value) {
+        let parsed;
+        try { parsed = new URL(value); } catch { showToast("That is not a valid URL."); return; }
+        if (!["http:", "https:"].includes(parsed.protocol)) { showToast("Relay URLs must use http or https."); return; }
+      }
+      state.sync.relayUrl = value;
+      persistWorkspace();
+      pluginManager?.emit("settings:changed", { section: "sync" });
+      renderCoreToolsSections(true);
+      showToast(value ? "Relay URL saved." : "Relay URL cleared — bundles are the sync path.");
+    });
+    relayRow.append(relayInput, saveRelay);
+    section.append(relayRow);
+    const syncActions = document.createElement("div");
+    syncActions.className = "backup-actions";
+    const syncNowButton = document.createElement("button");
+    syncNowButton.type = "button";
+    syncNowButton.className = "feature-button feature-button-primary";
+    syncNowButton.textContent = "Sync now";
+    syncNowButton.dataset.action = "sync-now";
+    syncNowButton.addEventListener("click", () => syncNow());
+    const exportBundleButton = document.createElement("button");
+    exportBundleButton.type = "button";
+    exportBundleButton.className = "feature-button";
+    exportBundleButton.textContent = "Export sync bundle";
+    exportBundleButton.dataset.action = "sync-export-bundle";
+    exportBundleButton.addEventListener("click", () => exportSyncBundle());
+    const importBundleButton = document.createElement("button");
+    importBundleButton.type = "button";
+    importBundleButton.className = "feature-button";
+    importBundleButton.textContent = "Import sync bundle";
+    importBundleButton.dataset.action = "sync-import-bundle";
+    const bundleInput = document.createElement("input");
+    bundleInput.type = "file";
+    bundleInput.accept = ".xpin-sync.json,application/json";
+    bundleInput.hidden = true;
+    bundleInput.setAttribute("aria-label", "Choose a sync bundle to import");
+    bundleInput.addEventListener("change", async () => {
+      const [file] = bundleInput.files ?? [];
+      bundleInput.value = "";
+      if (!file) return;
+      try {
+        const text = typeof file.text === "function" ? await file.text() : await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result ?? ""));
+          reader.onerror = () => reject(new Error("Could not read the bundle file."));
+          reader.readAsText(file);
+        });
+        await importSyncBundleText(text);
+      } catch (error) {
+        showToast(error.message || "Sync bundle could not be imported.");
+      }
+    });
+    importBundleButton.addEventListener("click", () => bundleInput.click());
+    syncActions.append(syncNowButton, exportBundleButton, importBundleButton, bundleInput);
+    section.append(syncActions);
+    // Capture token (the auth the future capture endpoint / fabriX adapter
+    // will use). Shown in full exactly once, with a copy button.
+    const tokenHeading = document.createElement("h3");
+    tokenHeading.textContent = "Capture token";
+    section.append(tokenHeading);
+    const tokenCopy = document.createElement("p");
+    tokenCopy.textContent = "For the future capture endpoint and the fabriX adapter. There is no HTTP capture endpoint in this static web build yet — the token is the auth that endpoint will use.";
+    section.append(tokenCopy);
+    const tokenRow = document.createElement("div");
+    tokenRow.className = "backup-actions";
+    if (captureTokenVisibleOnce && state.sync.captureToken === captureTokenVisibleOnce) {
+      const tokenField = document.createElement("input");
+      tokenField.type = "text";
+      tokenField.className = "feature-input";
+      tokenField.value = captureTokenVisibleOnce;
+      tokenField.readOnly = true;
+      tokenField.setAttribute("aria-label", "Capture token (shown once)");
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "feature-button";
+      copyButton.textContent = "Copy";
+      copyButton.dataset.action = "capture-copy-token";
+      copyButton.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard?.writeText(captureTokenVisibleOnce);
+          showToast("Capture token copied.");
+        } catch {
+          tokenField.select();
+          showToast("Copy failed — select the token and copy it manually.");
+        }
+      });
+      tokenRow.append(tokenField, copyButton);
+    } else if (state.sync.captureToken) {
+      const masked = document.createElement("span");
+      masked.textContent = `Token set (${state.sync.captureToken.slice(0, 9)}…${state.sync.captureToken.slice(-4)}). It is shown in full only once, right after generation.`;
+      tokenRow.append(masked);
+    } else {
+      const none = document.createElement("span");
+      none.textContent = "No capture token yet.";
+      tokenRow.append(none);
+    }
+    const tokenButton = document.createElement("button");
+    tokenButton.type = "button";
+    tokenButton.className = "feature-button";
+    tokenButton.textContent = state.sync.captureToken ? "Regenerate token" : "Generate token";
+    tokenButton.dataset.action = "capture-generate-token";
+    tokenButton.addEventListener("click", () => generateCaptureToken());
+    tokenRow.append(tokenButton);
+    if (state.sync.captureToken) {
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "feature-button";
+      revoke.textContent = "Revoke token";
+      revoke.dataset.action = "capture-revoke-token";
+      revoke.addEventListener("click", () => revokeCaptureToken());
+      tokenRow.append(revoke);
+    }
+    section.append(tokenRow);
+    return section;
+  }
+
+  function renderPublishSection() {
+    const section = document.createElement("section");
+    section.className = "tools-section";
+    section.id = "publish-section";
+    section.append(Object.assign(document.createElement("h2"), { textContent: "Publish a note as a web page" }));
+    const copy = document.createElement("p");
+    copy.textContent = state.sync.publishTarget
+      ? `Publish target: ${state.sync.publishTarget}. Sending to a target is not implemented yet — the bundle download is still the deliverable.`
+      : "No publish target configured — the bundle is the deliverable. Download it and host the file yourself, or configure a publish service.";
+    section.append(copy);
+    const targetRow = document.createElement("div");
+    targetRow.className = "backup-actions";
+    const targetInput = document.createElement("input");
+    targetInput.type = "url";
+    targetInput.className = "feature-input";
+    targetInput.placeholder = "Publish target URL (optional)";
+    targetInput.value = state.sync.publishTarget ?? "";
+    targetInput.setAttribute("aria-label", "Publish target URL");
+    const saveTarget = document.createElement("button");
+    saveTarget.type = "button";
+    saveTarget.className = "feature-button";
+    saveTarget.textContent = "Save target";
+    saveTarget.dataset.action = "publish-save-target";
+    saveTarget.addEventListener("click", () => {
+      state.sync.publishTarget = targetInput.value.trim().slice(0, 500);
+      persistWorkspace();
+      pluginManager?.emit("settings:changed", { section: "publish" });
+      renderCoreToolsSections(true);
+      showToast(state.sync.publishTarget ? "Publish target saved." : "Publish target cleared.");
+    });
+    targetRow.append(targetInput, saveTarget);
+    section.append(targetRow);
+    const actions = document.createElement("div");
+    actions.className = "backup-actions";
+    const publishButton = document.createElement("button");
+    publishButton.type = "button";
+    publishButton.className = "feature-button feature-button-primary";
+    publishButton.textContent = "Publish current note";
+    publishButton.dataset.action = "publish-bundle";
+    publishButton.addEventListener("click", () => publishCurrentNote());
+    const previewButton = document.createElement("button");
+    previewButton.type = "button";
+    previewButton.className = "feature-button";
+    previewButton.textContent = "Preview";
+    previewButton.dataset.action = "publish-preview";
+    previewButton.addEventListener("click", () => publishCurrentNote({ preview: true }));
+    actions.append(publishButton, previewButton);
+    section.append(actions);
+    return section;
+  }
+
   function renderCoreToolsSections(force = false) {
     if (!featureSuite || !featureSuite.active || state.features.activeView !== "settings") return;
     const content = byId("feature-content");
@@ -4475,7 +5627,7 @@
       if (nameInput) nameInput.value = draft.name;
       if (contentInput) contentInput.value = draft.content;
     }
-    wrap.append(templatesSection, renderImportSection());
+    wrap.append(templatesSection, renderImportSection(), renderSyncSection(), renderPublishSection());
     content.append(wrap);
   }
 
@@ -4542,36 +5694,72 @@
     });
   }
 
+  // Phase 1 — folder domain functions (shared by the UI, the plugin host
+  // API, and the sandboxed RPC). They validate, mutate, emit, and return;
+  // the prompt/confirm/toast UI stays in the wrappers below.
+  function createFolderRecord(name) {
+    const cleanName = String(name ?? "").trim().slice(0, 100);
+    if (!cleanName) throw new TypeError("Folder names cannot be empty.");
+    if (state.folders.some((folder) => folder.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase())) {
+      throw new Error("A folder with that name already exists.");
+    }
+    const folder = { id: makeId("folder"), name: cleanName };
+    state.folders.push(folder);
+    pluginManager?.emit("folder:created", { ...folder });
+    return { ...folder };
+  }
+
+  function renameFolderRecord(folderId, name) {
+    const folder = state.folders.find((item) => item.id === folderId);
+    if (!folder) throw new Error(`Unknown xPin folder: ${folderId}`);
+    const cleanName = String(name ?? "").trim().slice(0, 100);
+    if (!cleanName) throw new TypeError("Folder names cannot be empty.");
+    if (state.folders.some((item) => item.id !== folder.id && item.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase())) {
+      throw new Error("A folder with that name already exists.");
+    }
+    folder.name = cleanName;
+    pluginManager?.emit("folder:updated", { ...folder });
+    return { ...folder };
+  }
+
+  function deleteFolderRecord(folderId) {
+    const folder = state.folders.find((item) => item.id === folderId);
+    if (!folder) throw new Error(`Unknown xPin folder: ${folderId}`);
+    pushUndo(`Delete folder “${folder.name}”`);
+    const noteCount = state.notes.filter((note) => note.folderId === folder.id).length;
+    state.folders = state.folders.filter((item) => item.id !== folder.id);
+    state.notes.forEach((note) => {
+      if (note.folderId === folder.id) note.folderId = null;
+    });
+    state.collapsed = state.collapsed.filter((id) => id !== folder.id);
+    pluginManager?.emit("folder:deleted", { ...folder, noteCount });
+    return { ...folder, noteCount };
+  }
+
   function createFolder() {
     const name = window.prompt("Name your new folder:");
     if (name === null) return;
-    const cleanName = name.trim().slice(0, 100);
-    if (!cleanName) {
-      showToast("Give your folder a name first.");
-      return;
+    try {
+      const folder = createFolderRecord(name);
+      persistWorkspace();
+      render();
+      showToast(`“${folder.name}” is ready.`);
+    } catch (error) {
+      showToast(error.message || "Folder could not be created.");
     }
-    if (state.folders.some((folder) => folder.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase())) {
-      showToast("A folder with that name already exists.");
-      return;
-    }
-    state.folders.push({ id: makeId("folder"), name: cleanName.slice(0, 100) });
-    persistWorkspace();
-    render();
-    showToast(`“${cleanName}” is ready.`);
   }
 
   function renameFolder(folder) {
     const name = window.prompt("Rename this folder:", folder.name);
     if (name === null) return;
-    const cleanName = name.trim().slice(0, 100);
-    if (!cleanName) return showToast("Folder names cannot be empty.");
-    if (state.folders.some((item) => item.id !== folder.id && item.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase())) {
-      return showToast("A folder with that name already exists.");
+    try {
+      renameFolderRecord(folder.id, name);
+      persistWorkspace();
+      render();
+      showToast("Folder renamed.");
+    } catch (error) {
+      showToast(error.message || "Folder could not be renamed.");
     }
-    folder.name = cleanName.slice(0, 100);
-    persistWorkspace();
-    render();
-    showToast("Folder renamed.");
   }
 
   function deleteFolder(folder) {
@@ -4580,15 +5768,11 @@
       ? `Delete "${folder.name}"? ${noteCount} ${noteCount === 1 ? "note will" : "notes will"} move to Uncategorized.`
       : `Delete the empty "${folder.name}" folder?`;
     if (!window.confirm(message)) return;
-    pushUndo(`Delete folder “${folder.name}”`);
-    state.folders = state.folders.filter((item) => item.id !== folder.id);
-    state.notes.forEach((note) => {
-      if (note.folderId === folder.id) note.folderId = null;
-    });
-    state.collapsed = state.collapsed.filter((id) => id !== folder.id);
+    const removed = deleteFolderRecord(folder.id);
     persistWorkspace();
     render();
     showToast(noteCount ? `${noteCount} ${noteCount === 1 ? "note moved" : "notes moved"} to Uncategorized. Press Ctrl+Z to undo.` : "Folder deleted. Press Ctrl+Z to undo.");
+    return removed;
   }
 
   // M2 — Trash. Deleting a note soft-deletes it: the record (with its
@@ -4653,6 +5837,7 @@
     if (!window.confirm(`Permanently delete “${note.title.trim() || "Untitled note"}”? This cannot be undone.`)) return false;
     pushUndo("Permanently delete note");
     state.trash = state.trash.filter((item) => item.id !== id);
+    recordSyncTombstone(id); // Phase 1: other devices learn of the delete
     render();
     persistWorkspace();
     showToast("Note permanently deleted.");
@@ -4666,11 +5851,108 @@
     }
     if (!window.confirm(`Permanently delete ${state.trash.length} ${state.trash.length === 1 ? "note" : "notes"} in Trash? This cannot be undone.`)) return false;
     pushUndo("Empty Trash");
+    state.trash.forEach((item) => recordSyncTombstone(item.id)); // Phase 1
     state.trash = [];
     render();
     persistWorkspace();
     showToast("Trash emptied.");
     return true;
+  }
+
+  // Phase 1 — database domain functions (audit C3). Shared by the plugin
+  // host API and the sandboxed RPC. Values are validated with the same
+  // rules as the feature-suite sanitizer; rollup columns are computed and
+  // cannot be written.
+  const DATABASE_STATUSES = ["Not started", "In progress", "Done"];
+  function findDatabaseTable(tableId) {
+    const table = state.features.tables.find((item) => item.id === tableId);
+    if (!table) throw new Error(`Unknown xPin database: ${tableId}`);
+    return table;
+  }
+
+  function validateDatabaseRowValues(table, values) {
+    if (!values || typeof values !== "object" || Array.isArray(values)) {
+      throw new TypeError("Database row values must be an object.");
+    }
+    const set = {};
+    const unset = [];
+    for (const [columnId, value] of Object.entries(values)) {
+      const column = table.columns.find((item) => item.id === columnId);
+      if (!column) throw new TypeError(`Unknown database column: ${columnId}`);
+      if (column.type === "rollup") throw new TypeError("Rollup columns are computed and cannot be written.");
+      if (value === undefined || value === null || value === "") {
+        unset.push(columnId);
+        continue;
+      }
+      if (column.type === "text") {
+        if (typeof value !== "string" || value.length > 2000) throw new TypeError("Text values must be under 2,000 characters.");
+        set[columnId] = value;
+      } else if (column.type === "status") {
+        if (typeof value !== "string" || !DATABASE_STATUSES.includes(value)) {
+          throw new TypeError(`Status values must be one of: ${DATABASE_STATUSES.join(", ")}.`);
+        }
+        set[columnId] = value;
+      } else if (column.type === "date") {
+        if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+          throw new TypeError("Date values must use YYYY-MM-DD.");
+        }
+        set[columnId] = value;
+      } else if (column.type === "number") {
+        if (typeof value !== "number" || !Number.isFinite(value)) throw new TypeError("Number values must be finite numbers.");
+        set[columnId] = Math.max(-1_000_000, Math.min(1_000_000, value));
+      } else if (column.type === "relation") {
+        if (typeof value !== "string" || value.length > 100) throw new TypeError("Relation values must be a record id.");
+        const exists = column.targetTableId === "notes"
+          ? state.notes.some((note) => note.id === value)
+          : state.features.tables.find((item) => item.id === column.targetTableId)?.rows.some((row) => row.id === value);
+        if (!exists) throw new Error("That related record no longer exists.");
+        set[columnId] = value;
+      }
+    }
+    return { set, unset };
+  }
+
+  function listDatabaseTables() {
+    return state.features.tables.map((table) => ({
+      id: table.id,
+      name: table.name,
+      view: table.view,
+      columns: table.columns.map((column) => ({ id: column.id, name: column.name, type: column.type })),
+      rowCount: table.rows.length
+    }));
+  }
+
+  function readDatabaseRows(tableId) {
+    const table = findDatabaseTable(tableId);
+    return table.rows.map((row) => ({ id: row.id, values: { ...row.values } }));
+  }
+
+  function addDatabaseRow(tableId, values) {
+    const table = findDatabaseTable(tableId);
+    if (table.rows.length >= 5000) throw new Error("This database already has 5,000 rows.");
+    const { set } = validateDatabaseRowValues(table, values ?? {});
+    table.columns.forEach((column) => {
+      if (column.type === "status" && set[column.id] === undefined) set[column.id] = "Not started";
+    });
+    const row = { id: makeId("row"), values: set };
+    table.rows.push(row);
+    pluginManager?.emit("database:row:changed", { tableId, rowId: row.id, action: "added" });
+    persistWorkspace();
+    featureSuite?.render?.();
+    return { id: row.id, values: { ...row.values } };
+  }
+
+  function updateDatabaseRow(tableId, rowId, values) {
+    const table = findDatabaseTable(tableId);
+    const row = table.rows.find((item) => item.id === rowId);
+    if (!row) throw new Error(`Unknown database row: ${rowId}`);
+    const { set, unset } = validateDatabaseRowValues(table, values ?? {});
+    Object.assign(row.values, set);
+    unset.forEach((columnId) => delete row.values[columnId]);
+    pluginManager?.emit("database:row:changed", { tableId, rowId, action: "updated" });
+    persistWorkspace();
+    featureSuite?.render?.();
+    return { id: row.id, values: { ...row.values } };
   }
 
   function createPluginHost() {
@@ -4683,7 +5965,58 @@
         },
         select: selectNote,
         create: (options) => createNote(options),
+        update: (id, patch) => updateNote(id, patch),
+        delete: (id, options) => deleteNote(id, options ?? {}),
         openDaily: openDailyNote
+      }),
+      // Phase 1 (audit C3) — folders, databases, canvas, templates, export.
+      folders: Object.freeze({
+        list: () => state.folders.map((folder) => ({ ...folder })),
+        create: (name) => {
+          const folder = createFolderRecord(name);
+          persistWorkspace();
+          render();
+          return folder;
+        },
+        rename: (id, name) => {
+          const folder = renameFolderRecord(id, name);
+          persistWorkspace();
+          render();
+          return folder;
+        },
+        delete: (id) => {
+          const folder = deleteFolderRecord(id);
+          persistWorkspace();
+          render();
+          return folder;
+        }
+      }),
+      databases: Object.freeze({
+        list: listDatabaseTables,
+        rows: readDatabaseRows,
+        addRow: addDatabaseRow,
+        updateRow: updateDatabaseRow
+      }),
+      canvas: Object.freeze({
+        list: () => state.canvases.map((board) => ({
+          id: board.id, name: board.name, nodes: board.nodes.length, edges: board.edges.length
+        })),
+        open: (id) => {
+          const board = state.canvases.find((item) => item.id === id);
+          if (!board) throw new Error(`Unknown xPin canvas: ${id}`);
+          state.selectedCanvasId = board.id;
+          selectedCanvasNodeId = null;
+          switchView("canvas");
+          renderCanvas();
+          return { id: board.id, name: board.name };
+        }
+      }),
+      templates: Object.freeze({
+        list: () => state.templates.map((template) => ({ ...template }))
+      }),
+      importExport: Object.freeze({
+        exportNoteMarkdown: (note) => exportNoteMarkdown(note ?? undefined),
+        exportMarkdownZip: () => exportMarkdownZip()
       }),
       editor: Object.freeze({
         insertText(text) {
@@ -4762,6 +6095,7 @@
       state.selectedCanvasId = canvas.id;
       selectedCanvasNodeId = null;
       canvasViewportState = { x: 0, y: 0, zoom: 1 };
+      pluginManager?.emit("canvas:created", { id: canvas.id, name: canvas.name });
       switchView("canvas");
       renderCanvas();
       showToast(`${canvas.name} is ready.`);
@@ -4860,6 +6194,7 @@
         state.canvases.push(canvas);
         state.selectedCanvasId = canvas.id;
         selectedCanvasNodeId = null;
+        pluginManager?.emit("canvas:created", { id: canvas.id, name: canvas.name });
         switchView("canvas");
         renderCanvas();
         showToast(`${canvas.name} was imported.`);
@@ -5176,6 +6511,7 @@
     persist: persistWorkspace,
     flushSave,
     notify: showToast,
+    emit: (name, detail) => pluginManager?.emit(name, detail),
     render,
     extractTags,
     storageKey: STORAGE_KEY,
@@ -5205,10 +6541,26 @@
       renderEditorStatus();
     }
   });
+  // Phase 1 — first-party domain surface for the fabriX adapter (spec §10)
+  // and sync. First-party scripts only; plugins go through the host API /
+  // sandboxed RPC and never see this object.
+  window.xPinDomain = Object.freeze({
+    getState: () => state,
+    createNote,
+    updateNote,
+    deleteNote,
+    selectNote,
+    captureToInbox,
+    exportNoteMarkdown,
+    exportMarkdownZip,
+    publishCurrentNote,
+    on: (name, callback) => pluginManager?.on(name, callback)
+  });
   setupEvents();
   render();
   switchView(state.view);
   reconcileIdbStore(); // M4: migrate to / reconcile with IndexedDB (async, no-op without it)
+  setupDeepLinks(); // Phase 1: xpin:// links from the hash fallback + Capacitor App
   if (restoredFeatureView) featureSuite.open(restoredFeatureView);
   pluginManager.start().then(() => {
     state.plugins = pluginManager.serialize();

@@ -22,6 +22,39 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- Phase 1 — xpin:// deep links (xpin://capture?text=…&title=…,
+                 xpin://note/<id>). Delivered to the WebView via the
+                 Capacitor App plugin's appUrlOpen event (see app.js
+                 setupDeepLinks). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="xpin" />
+            </intent-filter>
+
+            <!-- Phase 1 — share-sheet receive target (text). Shared text is
+                 meant to land in the Inbox folder via captureToInbox.
+                 NOTE (unverified, no Android SDK on the build VM): the
+                 intent-filter registers xPin as a share target, and the JS
+                 side handles xpin:// URLs, but delivery of a SEND intent's
+                 text payload into the WebView is NOT verified — a native
+                 share handler (MainActivity / Capacitor plugin) is still
+                 needed to pass the shared text through, and must be tested
+                 on a real device build. Shared images are accepted by the
+                 filter below; xPin has no attachments yet (audit B1), so an
+                 image share currently has nowhere to store the image. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+
         </activity>
 
         <provider

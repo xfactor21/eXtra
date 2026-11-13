@@ -6,7 +6,7 @@
 // or any static host as-is.
 import { readdir, readFile, writeFile, mkdir, copyFile } from "node:fs/promises";
 import { execFile as execFileCb } from "node:child_process";
-import { createHash as createHashSync } from "node:crypto";
+import { createHash as createHashSync, sign as ed25519Sign, createPrivateKey } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -17,6 +17,12 @@ const repo = path.dirname(root);
 const oemDir = path.join(repo, "plugins", "oem");
 const outDir = root;
 const packagesDir = path.join(outDir, "packages");
+// Private signing key lives OUTSIDE the repo (never committed):
+// ~/workspace/xpin/marketplace-signing-key.pem (see marketplace/SIGNING.md).
+// Env override: XPIN_MARKETPLACE_SIGNING_KEY=/path/to/key.pem
+const SIGNING_KEY_PATH = process.env.XPIN_MARKETPLACE_SIGNING_KEY ||
+  path.join(process.env.HOME || process.env.USERPROFILE || "", "workspace", "xpin", "marketplace-signing-key.pem");
+const SIGNING_KEY_ID = "xpin-marketplace-1";
 
 const entries = (await readdir(oemDir, { withFileTypes: true }))
   .filter((e) => e.isDirectory())
@@ -51,6 +57,7 @@ for (const id of entries) {
     description: manifest.description,
     author: manifest.author,
     capabilities: manifest.permissions,
+    changelog: typeof manifest.changelog === "string" ? manifest.changelog.slice(0, 500) : "",
     downloadUrl: `packages/${outName}`,
     sha256,
     updated: new Date().toISOString().slice(0, 10),
@@ -66,6 +73,21 @@ const index = {
   installNote: "Packages install through xPin's review queue: Plugins → Marketplace → Install → Review → Approve. Nothing runs before you approve it.",
   plugins,
 };
+// Phase 1 (audit C6): Ed25519-sign the index. The signature covers the
+// canonical JSON of the index object WITHOUT the signature fields, so the
+// in-app client can verify it by deleting them and re-stringifying.
+// Without the private key the index is still written, but UNSIGNED — the
+// client fails closed on it (see app.js verifyMarketplaceIndex).
+try {
+  const privatePem = await readFile(SIGNING_KEY_PATH, "utf8");
+  const privateKey = createPrivateKey(privatePem);
+  const signature = ed25519Sign(null, Buffer.from(JSON.stringify(index), "utf8"), privateKey);
+  index.signature = signature.toString("base64");
+  index.signatureKeyId = SIGNING_KEY_ID;
+  console.log(`marketplace: index signed with ${SIGNING_KEY_ID}`);
+} catch (error) {
+  console.warn(`marketplace: WARNING — index is UNSIGNED (signing key not found at ${SIGNING_KEY_PATH}). The in-app client will refuse it.`);
+}
 await writeFile(path.join(outDir, "index.json"), JSON.stringify(index, null, 2) + "\n");
 await writeFile(path.join(outDir, "index.html"), directoryPage(plugins));
 console.log(`marketplace: wrote index.json + index.html (${plugins.length} plugins)`);

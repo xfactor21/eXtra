@@ -52,9 +52,24 @@ function matchesSimple(elm, sel) {
   }
   return true;
 }
+function splitSelectorParts(group) {
+  // Split on whitespace, but not inside [...] or quoted attribute values
+  const parts = [];
+  let cur = "", depth = 0, quote = null;
+  for (const ch of group.trim()) {
+    if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue; }
+    if (ch === "[") depth++;
+    if (ch === "]") depth--;
+    if (/\s/.test(ch) && depth === 0) { if (cur) { parts.push(cur); cur = ""; } continue; }
+    cur += ch;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
 function matchesSelector(elm, selector) {
   for (const group of selector.split(",")) {
-    const parts = group.trim().split(/\s+/).filter(Boolean);
+    const parts = splitSelectorParts(group);
     if (!parts.length) continue;
     let cur = elm;
     let i = parts.length - 1;
@@ -217,11 +232,13 @@ class FakeElement {
       this.children.push(n);
     }
     this._text = null;
+    if (this._doc && this._doc._notifyMutation) this._doc._notifyMutation(this);
     return nodes[0] ?? null;
   }
   removeChild(c) {
     const i = this.children.indexOf(c);
     if (i >= 0) { this.children.splice(i, 1); c.parentNode = null; }
+    if (this._doc && this._doc._notifyMutation) this._doc._notifyMutation(this);
     return c;
   }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
@@ -237,6 +254,7 @@ class FakeElement {
       n.parentNode = p;
       p.children.splice(i + k, 0, n);
     });
+    if (this._doc && this._doc._notifyMutation) this._doc._notifyMutation(p);
   }
   insertBefore(node, ref) {
     if (node.parentNode) node.parentNode.removeChild(node);
@@ -428,7 +446,7 @@ function makeEventClasses(win) {
   return { Event: FakeEvent, CustomEvent: FakeEvent, KeyboardEvent, MouseEvent, FocusEvent: FakeEvent, InputEvent: FakeEvent };
 }
 
-function buildContext(seedStorage) {
+function buildContext(seedStorage, opts) {
   const errors = [];
   const storageData = { ...(seedStorage || {}) };
   const storage = {
@@ -458,7 +476,10 @@ function buildContext(seedStorage) {
   win.localStorage = storage; win.sessionStorage = storage;
   win.navigator = { clipboard: { writeText: async () => {} }, onLine: true, userAgent: "smoke", platform: "Linux x86_64", language: "en-US", languages: ["en-US"] };
   win.crypto = webcrypto;
-  win.location = { hash: "", href: "http://localhost/", reload() {} };
+  win.location = { hash: (opts && opts.locationHash) || "", href: "http://localhost/", reload() {} };
+  // Phase 1: test-only marketplace public-key override (lets the suite sign
+  // mock indexes with its own keypair); the app never sets this itself.
+  if (opts && opts.marketplacePublicKey) win.__xPinMarketplacePublicKey = opts.marketplacePublicKey;
   win.history = { replaceState() {}, pushState() {} };
   win.innerWidth = 1280; win.innerHeight = 800; win.devicePixelRatio = 1;
   win.requestAnimationFrame = (fn) => setTimeout(fn, 0);
@@ -471,7 +492,30 @@ function buildContext(seedStorage) {
   win.open = () => null;
   win.scrollTo = () => {};
   win.fetch = () => Promise.reject(new Error("network disabled in smoke test"));
-  win.MutationObserver = class { observe() {} disconnect() {} };
+  // Minimal functional MutationObserver (childList only): the app keeps its
+  // settings sections in place with one, so the suite must deliver
+  // notifications like a real browser (batched via microtask).
+  const mutationObservers = [];
+  let mutationFlushScheduled = false;
+  doc._mutationObservers = mutationObservers;
+  doc._notifyMutation = (target) => {
+    const interested = mutationObservers.filter((o) => o.target === target && o.options && o.options.childList);
+    if (!interested.length) return;
+    if (mutationFlushScheduled) return;
+    mutationFlushScheduled = true;
+    queueMicrotask(() => {
+      mutationFlushScheduled = false;
+      for (const o of [...interested]) {
+        try { o.cb([{ type: "childList", target }]); } catch { /* observer errors must not break the app */ }
+      }
+    });
+  };
+  win.MutationObserver = class {
+    constructor(cb) { this._cb = cb; }
+    observe(target, options) { mutationObservers.push({ target, cb: this._cb, options }); }
+    disconnect() { for (let i = mutationObservers.length - 1; i >= 0; i--) if (mutationObservers[i].cb === this._cb) mutationObservers.splice(i, 1); }
+    takeRecords() { return []; }
+  };
   win.Node = FakeNode; win.Element = FakeNode; win.HTMLElement = FakeNode;
   win.CSS = { escape: (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, (c) => "\\" + c), supports: () => false };  win.ResizeObserver = class { observe() {} disconnect() {} };
   win.IntersectionObserver = class { observe() {} disconnect() {} };
@@ -501,6 +545,7 @@ function buildContext(seedStorage) {
   for (const k of ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "queueMicrotask", "structuredClone"])
     ctx[k] = globalThis[k].bind ? globalThis[k].bind(globalThis) : globalThis[k];
   ctx.crypto = webcrypto;
+  ctx.AbortController = globalThis.AbortController;
   ctx.performance = globalThis.performance;
   ctx.TextEncoder = globalThis.TextEncoder;
   ctx.TextDecoder = globalThis.TextDecoder;
@@ -514,9 +559,11 @@ function buildContext(seedStorage) {
   return { ctx, win, doc, errors, storageData, createdURLs, workers };
 }
 
-function boot(seedStorage) {
-  const b = buildContext(seedStorage);
-  const files = ["plugin-sandbox.js", "plugin-system.js", "plugins.js", "feature-suite.js", "app.js"];
+function boot(seedStorage, opts) {
+  const b = buildContext(seedStorage, opts);
+  const files = ["plugin-sandbox.js", "plugin-system.js", "plugins.js",
+    "sync/sync.js", "sync/transports.js", "sync/credentials.js", "sync/publish.js",
+    "feature-suite.js", "app.js"];
   for (const f of files) {
     const code = fs.readFileSync(REPO + "/" + f, "utf8");
     try {
@@ -1367,10 +1414,22 @@ async function main() {
   /* T28-T36: marketplace browser + OEM plugins end-to-end.
      The directory index fetch is mocked (a canned JSON index), which is the
      only faked part: every app code path (render, search, install, review,
-     approve, sandbox RPC, plugin execution) runs for real. */
+     approve, sandbox RPC, plugin execution) runs for real.
+     Phase 1: mock indexes are Ed25519-signed with a suite-local keypair
+     (the app verifies signatures and fails closed on unsigned indexes). */
+  const { generateKeyPairSync, sign: edSign, createPublicKey } = require("crypto");
+  const MARKETPLACE_TEST_KEYS = generateKeyPairSync("ed25519");
+  const MARKETPLACE_TEST_PUBLIC_B64 = MARKETPLACE_TEST_KEYS.publicKey
+    .export({ type: "spki", format: "der" }).toString("base64");
+  function signMockIndex(index) {
+    const signature = edSign(null, Buffer.from(JSON.stringify(index), "utf8"),
+      MARKETPLACE_TEST_KEYS.privateKey).toString("base64");
+    return { ...index, signature, signatureKeyId: "xpin-marketplace-1" };
+  }
+  const bootSigned = (seed, opts) => boot(seed, { ...(opts || {}), marketplacePublicKey: MARKETPLACE_TEST_PUBLIC_B64 });
 
   function mockIndex(plugins) {
-    return { name: "xPin Plugin Directory", version: 1, plugins };
+    return signMockIndex({ name: "xPin Plugin Directory", version: 1, plugins });
   }
   function mockPluginEntry(over) {
     return {
@@ -1412,7 +1471,7 @@ async function main() {
 
   /* T28: marketplace tab renders the directory listing */
   {
-    const b = boot(null);
+    const b = bootSigned(null);
     simSandbox(b);
     await flush(120);
     const { doc } = b;
@@ -1436,7 +1495,7 @@ async function main() {
 
   /* T29: marketplace search filters the listing */
   {
-    const b = boot(null);
+    const b = bootSigned(null);
     simSandbox(b);
     await flush(120);
     const { doc, win } = b;
@@ -1463,7 +1522,7 @@ async function main() {
 
   /* T30: marketplace install stages into the Pending queue — never auto-runs */
   {
-    const b = boot(null);
+    const b = bootSigned(null);
     simSandbox(b);
     await flush(120);
     const { doc, win } = b;
@@ -1493,7 +1552,7 @@ async function main() {
 
   /* T31: a marketplace-installed OEM plugin (case-converter) runs end-to-end */
   {
-    const b = boot(null);
+    const b = bootSigned(null);
     simSandbox(b);
     await flush(120);
     const { doc, win } = b;
@@ -1533,7 +1592,7 @@ async function main() {
     const cached = mockIndex([mockPluginEntry({ id: "cached-one", name: "Cached One" })]);
     const seed = {};
     seed[marketplaceCacheKey(DEFAULT_DIR)] = JSON.stringify({ ...cached, _cachedAt: new Date().toISOString() });
-    const b = boot(seed); // fetch stays at its default: always rejects (offline)
+    const b = bootSigned(seed); // fetch stays at its default: always rejects (offline)
     simSandbox(b);
     await flush(120);
     const { doc } = b;
@@ -1549,7 +1608,7 @@ async function main() {
 
   /* T33: directory add validates URLs and persists */
   {
-    const b = boot(null);
+    const b = bootSigned(null);
     simSandbox(b);
     await flush(120);
     const { doc, win } = b;
@@ -1901,6 +1960,397 @@ async function main() {
     check("T43: the only console error is the expected quota log",
       b.errors.length === 1 && /Could not save the xPin workspace/.test(b.errors[0]),
       b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T44 (Phase 1): sync envelope round-trip, merge, conflict-to-history, idempotency, tombstone, bundle */
+  {
+    const b = boot(null);
+    await flush(120);
+    const S = b.win.xPinSync;
+    const pass = "sync-passphrase-123";
+    const salt = S.newSalt();
+    const key = await S.deriveSyncKey(pass, salt);
+    const deviceA = "xpin-aaaa";
+    const deviceB = "xpin-bbbb";
+    const base = { id: "note-sync-1", title: "Sync note", body: "hello", folderId: null, parentNoteId: null, pinned: false, metadata: {}, createdAt: "2026-11-13T00:00:00.000Z", updatedAt: "2026-11-13T00:00:00.000Z", versions: [], syncVersion: { lamport: 0, deviceId: "" } };
+    const localA = { notes: [{ ...base }], trash: [] };
+    const env1 = await S.makeEnvelope({ key, deviceId: deviceA, lamport: 1, note: localA.notes[0], op: "upsert" });
+    check("T44: envelope carries version + op", env1.envelopeVersion === 1 && env1.op === "upsert" && env1.noteId === "note-sync-1");
+    check("T44: envelope payload is ciphertext, not plaintext", !JSON.stringify(env1.payload).includes("hello"));
+    const localB = { notes: [], trash: [] };
+    const r1 = await S.applyEnvelopes([env1], localB, key, []);
+    check("T44: envelope inserts the note on the other device",
+      r1.results[0].outcome === "inserted" && localB.notes[0].body === "hello",
+      JSON.stringify(r1.results));
+    const r2 = await S.applyEnvelopes([env1], localB, key, r1.seen);
+    check("T44: re-applying the same envelope is a no-op (idempotency)",
+      r2.results[0].outcome === "duplicate" && localB.notes.length === 1,
+      JSON.stringify(r2.results));
+    localB.notes[0].body = "B wins";
+    localB.notes[0].syncVersion = { lamport: 5, deviceId: deviceB };
+    const envOld = await S.makeEnvelope({ key, deviceId: deviceA, lamport: 3, note: { ...base, body: "A older" }, op: "upsert" });
+    const r3 = await S.applyEnvelopes([envOld], localB, key, r2.seen);
+    check("T44: older envelope loses but is preserved in version history",
+      r3.results[0].outcome === "ignored-newer" && localB.notes[0].body === "B wins" &&
+      localB.notes[0].versions.some((v) => v.body === "A older"),
+      JSON.stringify(r3.results));
+    const envNew = await S.makeEnvelope({ key, deviceId: deviceA, lamport: 9, note: { ...base, body: "A newer" }, op: "upsert" });
+    const r4 = await S.applyEnvelopes([envNew], localB, key, r3.seen);
+    check("T44: newer envelope wins and the local version joins history",
+      r4.results[0].outcome === "updated" && localB.notes[0].body === "A newer" &&
+      localB.notes[0].versions.some((v) => v.body === "B wins"),
+      JSON.stringify(r4.results));
+    const envTomb = await S.makeEnvelope({ key, deviceId: deviceA, lamport: 10, note: localB.notes[0], op: "tombstone" });
+    const r5 = await S.applyEnvelopes([envTomb], localB, key, r4.seen);
+    check("T44: tombstone removes the note",
+      r5.results[0].outcome === "tombstoned" && localB.notes.length === 0,
+      JSON.stringify(r5.results));
+    const bundle = S.exportBundle([env1], deviceA);
+    const parsedBundle = S.importBundle(bundle);
+    check("T44: bundle round-trips envelopes",
+      parsedBundle.format === "xpin-sync-bundle" && parsedBundle.envelopes.length === 1 &&
+      parsedBundle.envelopes[0].id === env1.id);
+    const wrongKey = await S.deriveSyncKey("different-passphrase-123", salt);
+    const r6 = await S.applyEnvelopes([env1], { notes: [], trash: [] }, wrongKey, []);
+    check("T44: an envelope from another passphrase fails structured, not silent",
+      r6.results[0].outcome === "error", JSON.stringify(r6.results));
+    check("T44: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T45 (Phase 1): connector tier — validation, allowlisted fetch, credential encryption, sandbox stays offline */
+  {
+    const b = boot(null);
+    await flush(120);
+    const SB = b.win.xPinSandbox;
+    let threw = "";
+    try {
+      SB.validatePackage({ manifest: { id: "bad-conn", name: "Bad", version: "1.0.0", description: "x", author: "t", permissions: ["network:fetch"] }, source: "xPinPlugin.register({ activate() {} });" });
+    } catch (e) { threw = e.message; }
+    check("T45: sandboxed plugin cannot declare network:fetch", /connector tier/.test(threw), threw);
+    const conn = SB.validatePackage({ manifest: { id: "good-conn", name: "Good", version: "1.0.0", description: "x", author: "t", tier: "connector", networkOrigins: ["https://api.example.com"], permissions: ["network:fetch", "credentials:get"] }, source: "xPinPlugin.register({ activate() {} });" });
+    check("T45: connector manifest validates with tier + origins",
+      conn.manifest.tier === "connector" && conn.manifest.networkOrigins[0] === "https://api.example.com");
+    const C = b.win.xPinCredentials;
+    const saltB64 = b.win.xPinSync.bytesToBase64(b.win.xPinSync.newSalt());
+    await C.unlock("credential-passphrase-123", saltB64, null);
+    const env = await C.encryptSecret("api-key-123");
+    check("T45: credential ciphertext differs from plaintext", !JSON.stringify(env).includes("api-key-123"));
+    check("T45: credential decrypts back", (await C.decryptSecret(env)) === "api-key-123");
+    check("T45: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    win.fetch = async () => ({
+      ok: true, status: 200,
+      headers: { get: () => "application/json" },
+      arrayBuffer: async () => new TextEncoder().encode('{"hello":1}'),
+    });
+    const pkg = {
+      manifest: {
+        id: "t45-conn", name: "T45 conn", version: "1.0.0", description: "connector probe", author: "smoke",
+        tier: "connector", networkOrigins: ["https://api.example.com"],
+        permissions: ["commands:register", "network:fetch", "credentials:set", "credentials:get", "ui:notify"],
+      },
+      source: `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "fetch-ok", name: "T45 fetch ok", run: async () => { const r = await api.network.fetch("https://api.example.com/data"); await api.ui.notify("fetch:" + r.status + ":" + r.body); } });
+        api.commands.add({ id: "fetch-evil", name: "T45 fetch evil", run: async () => { await api.network.fetch("https://evil.example.com/data"); } });
+        api.commands.add({ id: "cred", name: "T45 cred", run: async () => { await api.credentials.set("token", "secret-xyz"); const v = await api.credentials.get("token"); await api.ui.notify("cred:" + v); } });
+      }});`,
+    };
+    await importPackage(b, pkg);
+    await openReview(b, "Review");
+    await approveInModal(b);
+    const ext = storedExtensions(b);
+    check("T45: connector approved with its origin",
+      ext[0].approvedOrigins.includes("https://api.example.com"),
+      JSON.stringify(ext[0].approvedOrigins));
+    const saltB64 = b.win.xPinSync.bytesToBase64(b.win.xPinSync.newSalt());
+    await b.win.xPinCredentials.unlock("connector-passphrase-123", saltB64, null);
+    await runPaletteCommand(b, "T45 fetch ok");
+    check("T45: connector fetch to an allowed origin works",
+      doc.getElementById("toast").textContent.includes('fetch:200:{"hello":1}'),
+      doc.getElementById("toast").textContent);
+    await runPaletteCommand(b, "T45 cred");
+    check("T45: credential round-trip through the sandbox",
+      doc.getElementById("toast").textContent.includes("cred:secret-xyz"),
+      doc.getElementById("toast").textContent);
+    const ws = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    // The test plugin's own source code legitimately contains the literal
+    // "secret-xyz" (it is the value the plugin passes to credentials:set),
+    // so the leak scan excludes the installed-plugin records and checks
+    // everything else — above all the credential store itself.
+    const { extensions, ...wsWithoutPlugins } = ws;
+    check("T45: secret never lands in the plaintext workspace blob",
+      !JSON.stringify(wsWithoutPlugins).includes("secret-xyz") &&
+      !JSON.stringify(ws.connectorCredentials).includes("secret-xyz"),
+      "secret leaked into workspace JSON");
+    await runPaletteCommand(b, "T45 fetch evil");
+    await flush(300);
+    check("T45: fetch to a non-allowlisted origin is rejected",
+      doc.getElementById("toast").textContent.includes("not approved"),
+      doc.getElementById("toast").textContent);
+    check("T45: the only console error is the expected command failure",
+      b.errors.length === 1 && /not approved/.test(b.errors[0]),
+      b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T46 (Phase 1): new events fire from the real mutation sites */
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    const seen = [];
+    b.win.xPinDomain.on("folder:created", (d) => seen.push(`folder:created:${d.name}`));
+    b.win.xPinDomain.on("database:created", (d) => seen.push(`database:created:${d.name}`));
+    b.win.xPinDomain.on("template:created", (d) => seen.push(`template:created:${d.name}`));
+    b.win.xPinDomain.on("tag:changed", (d) => seen.push(`tag:changed:${d.tags.join(",")}`));
+    b.win.xPinDomain.on("settings:changed", (d) => seen.push(`settings:changed:${d.section}`));
+    b.win.xPinDomain.on("save:completed", () => seen.push("save:completed"));
+    b.win.xPinDomain.on("canvas:created", (d) => seen.push(`canvas:created:${d.name}`));
+    // folder via the sidebar button (prompt stub returns "smoke-passphrase")
+    click(doc.getElementById("new-folder"));
+    await flush(100);
+    check("T46: folder:created fires", seen.some((s) => s === "folder:created:smoke-passphrase"), seen.join(" | "));
+    // database via the Databases view (prompt stub names the table)
+    click(doc.querySelector('[data-feature-view="database"]'));
+    await flush(100);
+    const addTable = [...doc.querySelectorAll("[data-action]")].find((el) => el.dataset.action === "add-table");
+    click(addTable);
+    await flush(100);
+    check("T46: database:created fires", seen.some((s) => s === "database:created:smoke-passphrase"), seen.join(" | "));
+    // template via the settings view form
+    click(doc.querySelector('[data-feature-view="settings"]'));
+    await flush(150);
+    const nameInput = doc.querySelector(".template-name-input");
+    const contentInput = doc.querySelector(".template-content-input");
+    type(nameInput, "T46 template");
+    type(contentInput, "hello");
+    const addTemplate = [...doc.querySelectorAll("button")].find((el) => el.textContent === "Add template");
+    click(addTemplate);
+    await flush(100);
+    check("T46: template:created fires", seen.some((s) => s === "template:created:T46 template"), seen.join(" | "));
+    // settings:changed via the accent picker
+    const accent = doc.querySelector('[data-action="accent"]');
+    accent.value = "violet";
+    accent.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(100);
+    check("T46: settings:changed fires", seen.some((s) => s === "settings:changed:appearance"), seen.join(" | "));
+    // tag:changed by typing a hashtag into a note
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-body"), "has #t46tag here");
+    await flush(100);
+    check("T46: tag:changed fires", seen.some((s) => s.startsWith("tag:changed:") && s.includes("#t46tag")), seen.join(" | "));
+    check("T46: save:completed fires on persist", seen.includes("save:completed"), seen.join(" | "));
+    // canvas via the Canvas view (prompt stub names the board)
+    click(doc.getElementById("canvas-nav"));
+    await flush(100);
+    click(doc.getElementById("new-canvas"));
+    await flush(100);
+    check("T46: canvas:created fires", seen.some((s) => s === "canvas:created:smoke-passphrase"), seen.join(" | "));
+    check("T46: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T47 (Phase 1): relay transport — push/pull against a stubbed relay, and not-configured stays off */
+  {
+    const b = boot(null);
+    await flush(120);
+    const T = b.win.xPinSyncTransports;
+    const S = b.win.xPinSync;
+    let threw = "";
+    try {
+      await T.createHttpRelayTransport("").push([]);
+    } catch (e) { threw = `${e.code}:${e.message}`; }
+    check("T47: no relay URL means not configured, never a connection attempt",
+      threw.startsWith("not_configured:"), threw);
+    const store = [];
+    b.win.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.endsWith("/v1/sync/push")) {
+        const body = JSON.parse(opts.body);
+        store.push(...body.envelopes);
+        return { ok: true, json: async () => ({ ok: true, accepted: body.envelopes.length, serverLamport: 1 }) };
+      }
+      if (u.includes("/v1/sync/pull")) {
+        const since = Number(new URL(u).searchParams.get("since") || "0");
+        return { ok: true, json: async () => ({ envelopes: store.filter((e) => e.lamport > since), serverLamport: 1 }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const relay = T.createHttpRelayTransport("http://127.0.0.1:8787");
+    const key = await S.deriveSyncKey("relay-passphrase-123", S.newSalt());
+    const note = { id: "note-relay-1", title: "Relay note", body: "via relay", folderId: null, parentNoteId: null, pinned: false, metadata: {}, createdAt: "2026-11-13T00:00:00.000Z", updatedAt: "2026-11-13T00:00:00.000Z", versions: [], syncVersion: { lamport: 0, deviceId: "" } };
+    const env = await S.makeEnvelope({ key, deviceId: "xpin-relay", lamport: 1, note, op: "upsert" });
+    const push = await relay.push([env]);
+    check("T47: relay push accepted", push.ok === true && push.accepted === 1, JSON.stringify(push));
+    const pulled = await relay.pull(0);
+    check("T47: relay pull returns the envelope", pulled.length === 1 && pulled[0].id === env.id);
+    const local = { notes: [], trash: [] };
+    const applied = await S.applyEnvelopes(pulled, local, key, []);
+    check("T47: pulled envelope merges", applied.results[0].outcome === "inserted" && local.notes[0].body === "via relay");
+    check("T47: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T48 (Phase 1): capture token generate/revoke + xpin:// deep links */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.querySelector('[data-feature-view="settings"]'));
+    await flush(150);
+    const gen = doc.querySelector('[data-action="capture-generate-token"]');
+    check("T48: capture token button exists in Sync settings", !!gen);
+    click(gen);
+    await flush(100);
+    const tokenInput = doc.querySelector('#sync-section input[aria-label="Capture token (shown once)"]');
+    check("T48: token generated and shown once",
+      !!tokenInput && tokenInput.value.startsWith("xpin_cap_") && tokenInput.value.length > 20,
+      tokenInput ? tokenInput.value.slice(0, 20) : "no token field");
+    const ws = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    check("T48: token persisted in sync state", ws.sync.captureToken === tokenInput.value);
+    click(doc.querySelector('[data-action="capture-revoke-token"]'));
+    await flush(100);
+    const ws2 = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    check("T48: token revoked", ws2.sync.captureToken === null);
+    check("T48: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+  {
+    // Deep link: boot with a capture hash → Inbox note created
+    const b = boot(null, { locationHash: "#xpin/capture?text=hello%20deep&title=Deep%20capture&source=Browser" });
+    await flush(120);
+    const ws = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    const inbox = ws.folders.find((f) => f.name === "Inbox");
+    const note = ws.notes.find((n) => n.title === "Deep capture");
+    check("T48: xpin://capture creates the Inbox folder", !!inbox);
+    check("T48: captured note lands in Inbox with source + marker",
+      !!note && note.folderId === inbox?.id && note.body.includes("hello deep") &&
+      note.body.includes("Source: Browser") && note.metadata?.captured === "true",
+      note ? JSON.stringify(note).slice(0, 200) : "no note");
+    check("T48: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T49 (Phase 1): marketplace — unsigned index fails closed; update check offers re-review */
+  {
+    const b = bootSigned(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc } = b;
+    b.win.fetch = mockFetchFor({ name: "xPin Plugin Directory", version: 1, plugins: [mockPluginEntry()] });
+    await openMarketplaceTab(b);
+    const listText = doc.getElementById("marketplace-list").textContent;
+    const statusText = doc.getElementById("marketplace-status").textContent;
+    check("T49: unsigned index lists nothing",
+      !listText.includes("Smoke Probe"), listText.slice(0, 200));
+    check("T49: status says unverified — installed plugins only",
+      /unverified/i.test(statusText) && /installed plugins only/i.test(statusText), statusText);
+    check("T49: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+  {
+    const b = bootSigned(null);
+    simSandbox(b);
+    await flush(120);
+    const { doc, win } = b;
+    const realTally = JSON.parse(fs.readFileSync(`${REPO}/marketplace/packages/word-tally-1.0.0.xpin.json`, "utf8"));
+    const dlUrl = "https://cdn.example.com/word-tally-1.0.0.xpin.json";
+    b.win.fetch = mockFetchFor(
+      mockIndex([mockPluginEntry({ id: "word-tally", name: "Word Tally", downloadUrl: dlUrl, capabilities: ["notes:read", "ui:status"] })]),
+      { [dlUrl]: realTally }
+    );
+    await openMarketplaceTab(b);
+    const card = [...doc.querySelectorAll("#marketplace-list .marketplace-card")]
+      .find((c) => c.textContent.includes("Word Tally"));
+    card.querySelector("button").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    await flush(600);
+    check("T49: v1.0.0 installed (pending)", storedExtensions(b)[0].manifest.version === "1.0.0");
+    // A newer index version appears, with a changelog line.
+    const v11 = JSON.parse(JSON.stringify(realTally));
+    v11.manifest.version = "1.1.0";
+    const dl11 = "https://cdn.example.com/word-tally-1.1.0.xpin.json";
+    b.win.fetch = mockFetchFor(
+      mockIndex([mockPluginEntry({ id: "word-tally", name: "Word Tally", version: "1.1.0", downloadUrl: dl11, changelog: "Faster counting, fewer words missed." })]),
+      { [dl11]: v11 }
+    );
+    await openMarketplaceTab(b);
+    // Force a refresh: otherwise the cached v1.0.0 index is reused.
+    doc.getElementById("marketplace-refresh").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    await flush(600);
+    const card2 = [...doc.querySelectorAll("#marketplace-list .marketplace-card")]
+      .find((c) => c.textContent.includes("Word Tally"));
+    const btn = card2.querySelector("button");
+    check("T49: update available with the new version",
+      btn.textContent.includes("Update available (v1.1.0)"), btn.textContent);
+    check("T49: changelog line shown", card2.textContent.includes("Faster counting"), card2.textContent.slice(0, 300));
+    btn.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    await flush(700);
+    const ext = storedExtensions(b);
+    check("T49: update stages the new version as pending re-review",
+      ext.length === 1 && ext[0].manifest.version === "1.1.0" && ext[0].reviewStatus === "pending",
+      JSON.stringify(ext.map((e) => ({ v: e.manifest.version, s: e.reviewStatus }))));
+    check("T49: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T50 (Phase 1): publish bundle — rendered HTML + manifest */
+  {
+    const b = boot(null);
+    await flush(120);
+    const P = b.win.xPinPublish;
+    const bundle = P.buildPublishBundle(
+      { id: "note-pub-1", title: "Pub Note", body: "# Hello\n\n- one" },
+      (md) => `<h1>Hello</h1><ul><li>one</li></ul>`
+    );
+    check("T50: bundle HTML renders Markdown, not raw text",
+      bundle.html.includes("<h1>Hello</h1>") && bundle.html.includes("<li>one</li>") && !bundle.html.includes("# Hello"));
+    check("T50: manifest carries note id, title, publishedAt, xPin version",
+      bundle.manifest.format === "xpin-publish-bundle" && bundle.manifest.noteId === "note-pub-1" &&
+      bundle.manifest.title === "Pub Note" && typeof bundle.manifest.publishedAt === "string" &&
+      bundle.manifest.xPinVersion === "1.0.0",
+      JSON.stringify(bundle.manifest));
+    check("T50: manifest is embedded in the page", bundle.html.includes("xpin-publish-manifest"));
+    // End-to-end through the app: publish the open note with the real renderer.
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Pub Note");
+    type(doc.getElementById("note-body"), "# Hello\n\n- one");
+    await flush(100);
+    const published = b.win.xPinDomain.publishCurrentNote();
+    const html = b.createdURLs[b.createdURLs.length - 1].parts[0];
+    check("T50: app publish downloads rendered HTML",
+      !!published && typeof html === "string" && /<h1>Hello<\/h1>/.test(html) && /<li>one<\/li>/.test(html),
+      String(html).slice(0, 200));
+    check("T50: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T51 (Phase 1, audit G4): new state keys survive a save/load round-trip */
+  {
+    const b = boot(null);
+    await flush(120);
+    const ws = JSON.parse(b.storageData["xPin.workspace.v1"]);
+    ws.integrations = { fabrix: { enabled: true, mystery: "keep-me" }, unknownTop: "drop-me" };
+    ws.sync.deviceId = "xpin-roundtrip";
+    ws.sync.relayUrl = "http://127.0.0.1:8787";
+    ws.connectorCredentials = { "some-plugin": { token: { iv: "aGVsbG8=", ciphertext: "d29ybGQ=" } } };
+    const b2 = boot({ "xPin.workspace.v1": JSON.stringify(ws) });
+    await flush(120);
+    const ws2 = JSON.parse(b2.storageData["xPin.workspace.v1"]);
+    check("T51: integrations.fabrix survives round-trip",
+      ws2.integrations?.fabrix?.enabled === true, JSON.stringify(ws2.integrations));
+    check("T51: unknown integrations sub-keys are dropped, not trusted",
+      !("unknownTop" in (ws2.integrations ?? {})), JSON.stringify(ws2.integrations));
+    check("T51: sync state survives round-trip",
+      ws2.sync?.deviceId === "xpin-roundtrip" && ws2.sync?.relayUrl === "http://127.0.0.1:8787",
+      JSON.stringify(ws2.sync));
+    check("T51: connector credential envelopes survive round-trip",
+      ws2.connectorCredentials?.["some-plugin"]?.token?.ciphertext === "d29ybGQ=",
+      JSON.stringify(ws2.connectorCredentials));
+    check("T51: no console errors", b2.errors.length === 0, b2.errors.slice(0, 3).join(" | "));
   }
 
   /* report */

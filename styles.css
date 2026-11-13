@@ -626,3 +626,11 @@ html[data-xPin-density="comfortable"] .feature-content { padding: 24px; }
 .marketplace-caps { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
 .marketplace-cap { padding: 2px 8px; border: 1px solid #2b4a54; border-radius: 20px; color: #9fd8e8; font-family: var(--mono); font-size: 8px; }
 .marketplace-card-actions { display: flex; justify-content: flex-end; }
+
+/* ---------- Phase 1: sync / connector / publish ---------- */
+.consent-origins-heading { margin: 10px 0 2px; color: #9fd8e8; font-size: 11px; font-weight: 600; }
+.plugin-tier-note { display: block; margin-top: 4px; color: #9fd8e8 !important; font-size: 10px; letter-spacing: .4px; }
+.plugin-origin-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
+.plugin-origin-row small { color: #9fd8e8; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.marketplace-changelog { display: block; margin-top: 8px; color: #c9a06a; font-size: 11px; line-height: 1.45; }
+#sync-section h3, #publish-section h3 { margin: 18px 0 4px; color: #d9e9eb; font-size: 13px; }

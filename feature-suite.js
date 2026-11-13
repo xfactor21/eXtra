@@ -223,6 +223,17 @@
       return featureState.tables.find((table) => table.id === id) ?? null;
     }
 
+    // Phase 1 (audit C2): event bus extension. The host emits note events
+    // from app.js; the feature suite emits database/canvas/template/tag/
+    // settings/save/sync events from its own mutation sites.
+    function emit(name, detail) {
+      try {
+        host.emit?.(name, detail);
+      } catch (error) {
+        console.error("xPin feature event failed.", error);
+      }
+    }
+
     function columnById(table, id) {
       return table.columns.find((column) => column.id === id) ?? null;
     }
@@ -930,6 +941,7 @@
         if (column.type === "status") values[column.id] = "Not started";
       });
       table.rows.push({ id: makeId("row"), values });
+      emit("database:row:changed", { tableId: table.id, rowId: table.rows[table.rows.length - 1].id, action: "added" });
       save();
       render();
       content.querySelector(".database-cell-input")?.focus();
@@ -948,6 +960,7 @@
         rows: []
       };
       featureState.tables.push(table);
+      emit("database:created", { id: table.id, name: table.name });
       save();
       render();
     }
@@ -958,6 +971,7 @@
       const clean = name.trim().slice(0, 80);
       if (!clean) return host.notify("Database names cannot be empty.");
       table.name = clean;
+      emit("database:updated", { id: table.id, name: table.name });
       save();
       render();
     }
@@ -985,6 +999,7 @@
       }
       featureState.tables = featureState.tables.filter((candidate) => candidate.id !== table.id);
       if (featureState.selectedTableId === table.id) featureState.selectedTableId = featureState.tables[0]?.id ?? null;
+      emit("database:deleted", { id: table.id, name: table.name });
       save();
       render();
     }
@@ -1050,6 +1065,7 @@
 
     function removeRow(table, rowId) {
       table.rows = table.rows.filter((row) => row.id !== rowId);
+      emit("database:row:changed", { tableId: table.id, rowId, action: "deleted" });
       featureState.tables.forEach((source) => source.columns.filter((column) =>
         column.type === "relation" && column.targetTableId === table.id
       ).forEach((column) => source.rows.forEach((row) => {
@@ -1081,6 +1097,12 @@
       }
       if (value === "") delete row.values[column.id];
       else row.values[column.id] = value;
+      // Row edits from a select (status/relation) commit on change; text
+      // cells commit on every keystroke and are covered by save:completed
+      // instead, so listeners are not spammed per keystroke.
+      if (target.tagName === "SELECT") {
+        emit("database:row:changed", { tableId: table.id, rowId: row.id, action: "updated" });
+      }
       save();
       if (target.tagName === "SELECT") render();
     }
@@ -1310,10 +1332,12 @@
         } else if (action === "cell-change") updateCell(event);
         else if (action === "accent" && Object.hasOwn(ACCENTS, target.value)) {
           featureState.theme.accent = target.value;
+          emit("settings:changed", { section: "appearance", key: "accent" });
           save();
           applyTheme();
         } else if (action === "density" && ["comfortable", "compact"].includes(target.value)) {
           featureState.theme.density = target.value;
+          emit("settings:changed", { section: "appearance", key: "density" });
           save();
           applyTheme();
         } else if (action === "backup-file") {

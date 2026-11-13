@@ -12,9 +12,17 @@ const webFiles = [
   "plugin-system.js",
   "plugins.js",
   "feature-suite.js",
+  "sync/sync.js",
+  "sync/transports.js",
+  "sync/credentials.js",
+  "sync/publish.js",
   "favicon.svg"
 ];
 
 await mkdir(webDirectory, { recursive: true });
-await Promise.all(webFiles.map((file) => copyFile(path.join(root, "..", file), path.join(webDirectory, file))));
+await Promise.all(webFiles.map(async (file) => {
+  const target = path.join(webDirectory, file);
+  await mkdir(path.dirname(target), { recursive: true });
+  await copyFile(path.join(root, "..", file), target);
+}));
 console.log(`Prepared ${webFiles.length} xPin web assets for Android.`);

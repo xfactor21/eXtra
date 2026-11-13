@@ -1,0 +1,53 @@
+/* xPin sync relay — POST /v1/sync/push (Vercel serverless function).
+ *
+ * Deployed as api/v1/sync/push.js, so with the relay base URL
+ * https://<project>.vercel.app/api the app's HttpRelayTransport calls
+ * <base>/v1/sync/push — the same path the local dev harness serves.
+ * Accepts {envelopes: [...]}; re-pushes are idempotent (same envelope id
+ * is a no-op). Body cap 5 MB is enforced by Vercel's default limits;
+ * batches are capped at 500 envelopes by validatePushBody.
+ */
+
+import { getSql } from "../../_lib/db.mjs";
+import { validatePushBody } from "../../_lib/envelopes.mjs";
+import { pushEnvelopes } from "../../_lib/store.mjs";
+
+function send(res, status, body) {
+  res.status(status).setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
+}
+
+function readBody(req) {
+  // Vercel parses JSON bodies for application/json automatically.
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === "string") return JSON.parse(req.body);
+    return req.body;
+  }
+  return {};
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return send(res, 405, { ok: false, error: "Method not allowed." });
+  }
+  let body;
+  try {
+    body = readBody(req);
+  } catch {
+    return send(res, 400, { ok: false, error: "Push body is not valid JSON." });
+  }
+  let envelopes;
+  try {
+    envelopes = validatePushBody(body);
+  } catch (error) {
+    return send(res, 400, { ok: false, error: error.message });
+  }
+  try {
+    const { accepted, duplicates } = await pushEnvelopes(getSql(), envelopes);
+    return send(res, 200, { ok: true, accepted, duplicates });
+  } catch (error) {
+    console.error("sync push failed:", error);
+    return send(res, 500, { ok: false, error: "Sync relay push failed." });
+  }
+}

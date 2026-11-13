@@ -39,14 +39,96 @@ The supported capabilities are:
 | `notes:read` | Read note titles and content |
 | `notes:select` | Open an existing note |
 | `notes:create` | Create a note |
-| `notes:update` | Edit a note's title or body |
+| `notes:update` | Edit a note's title, body, folder, parent, pinned flag, or properties |
+| `notes:delete` | Move a note to Trash (or permanently delete it from Trash, with a confirm) |
+| `folders:read` | List folders |
+| `folders:write` | Create, rename, or delete folders |
+| `databases:read` | List databases and read their rows |
+| `databases:write` | Add or update database rows |
+| `canvas:read` | List canvas boards |
+| `templates:read` | List note templates |
+| `export:note` | Export notes as Markdown or a Markdown .zip |
 | `editor:write` | Insert text into the open note |
 | `commands:register` | Add a command-palette action |
 | `ui:notify` | Show a xPin notification |
 | `ui:status` | Show a small item in the editor status bar |
 | `settings:read` / `settings:write` | Read or save this plugin's own settings |
+| `network:fetch` *(connector only)* | Fetch from approved https origins (host-side) |
+| `credentials:set` / `credentials:get` / `credentials:delete` *(connector only)* | Store, read, or delete a secret in the encrypted credential store |
 
-Plugins have no filesystem or network API. They execute outside the main app in a sandboxed, opaque-origin frame and a dedicated worker. The frame uses a restrictive Content Security Policy; the worker has no DOM or `localStorage`, and the host validates every message, checks grants for every capability, limits package size and command count, rate-limits messages, and stops a worker that does not start or whose command exceeds its time limit. No package is fetched from a URL.
+Plugins have no filesystem API. The sandboxed tier has no network API at
+all. They execute outside the main app in a sandboxed, opaque-origin frame
+and a dedicated worker. The frame uses a restrictive Content Security
+Policy; the worker has no DOM or `localStorage`, and the host validates
+every message, checks grants for every capability, limits package size and
+command count, rate-limits messages, and stops a worker that does not start
+or whose command exceeds its time limit. No package is fetched from a URL.
+
+## Connector tier (Phase 1)
+
+Most plugins stay sandboxed. A plugin that needs to talk to an outside
+service (calendar, email, tasks, AI) declares the **connector tier**:
+
+```json
+{
+  "manifest": {
+    "id": "calendar-link",
+    "name": "Calendar Link",
+    "version": "1.0.0",
+    "description": "Reads today's events from your calendar.",
+    "author": "Example author",
+    "tier": "connector",
+    "networkOrigins": ["https://calendar.example.com"],
+    "permissions": ["network:fetch", "credentials:get", "commands:register", "ui:notify"]
+  },
+  "source": "…"
+}
+```
+
+Rules:
+
+- `tier` is `"sandboxed"` (default) or `"connector"`. Only connector
+  plugins may declare `network:fetch` or `credentials:*`, and only
+  connector plugins may declare `networkOrigins`. A sandboxed plugin
+  asking for any of those is rejected at import.
+- `networkOrigins` is a list of at most 10 bare `https:` origins (no path,
+  query, or credentials). A connector plugin with `network:fetch` must
+  declare at least one origin.
+- **Each origin is approved individually** in the review dialog (origins
+  start pre-checked, like capabilities — uncheck any origin the plugin
+  should not reach). Approved origins are listed in the plugin catalogue
+  with a per-origin **Revoke** button; revocation takes effect
+  immediately, including for a running plugin.
+- **The worker never touches the network.** `api.network.fetch(url,
+  options)` asks the *host* to fetch. The host enforces: exact origin
+  match against approved origins, `https:` only, 10 s timeout, 1 MB
+  response cap. The sandboxed tier keeps every network API neutered and
+  the iframe CSP keeps `connect-src 'none'`.
+- **Credential store.** `api.credentials.set(key, value)` /
+  `get(key)` / `delete(key)` are connector-only. Secrets are encrypted
+  with the workspace passphrase envelope (AES-256-GCM + PBKDF2-SHA-256,
+  310k iterations — the same construction as the encrypted backup) and
+  stored as ciphertext only; they never appear in the plaintext workspace
+  blob, are never logged, and are never returned to non-connector
+  plugins. If no passphrase is set, credential storage is unavailable
+  with an honest error — secrets are never stored as plaintext. The
+  passphrase unlocks the store for the session only (set it in Workspace
+  tools → Sync); a page reload locks it again. Intended use: the user's
+  own cloud AI keys (BYOK — Claude is the natural default, plus
+  OpenAI/Gemini), stored on-device; there is no hosted AI and no key
+  ever leaves the device except to the provider the plugin calls.
+- **Events.** Plugins can subscribe to more than note CRUD now:
+  `folder:created/updated/deleted`, `database:created/updated/deleted`,
+  `database:row:changed`, `canvas:created/updated/deleted`,
+  `template:created/updated/deleted`, `tag:changed`,
+  `settings:changed`, `save:completed`, `sync:completed` — alongside the
+  existing `note:created/updated/deleted/opened`.
+- **Host API.** Built-in plugins get `api.folders` (list/create/rename/
+  delete), `api.databases` (list tables, read rows, add/update row),
+  `api.canvas` (list/open), `api.templates` (list), and
+  `api.importExport` (exportNoteMarkdown, exportMarkdownZip). Imported
+  plugins use the same surface through `api.folders`, `api.databases`,
+  `api.canvas`, `api.templates`, and `api.export`.
 
 The package filename and SHA-256 fingerprint are shown during review and in the plugin list. The fingerprint is calculated from xPin's normalized manifest and source payload; it is not a publisher signature, and the manifest author is self-reported. Browser workers do not expose a hard memory quota, so this prototype is not a substitute for OS-level process isolation. Only run code you trust. Imported packages are stored locally in the browser workspace; uninstalling removes the package and its plugin settings.
 
@@ -102,6 +184,10 @@ error naming the exact problem):
 - `name`, `version`, `author`: non-empty text, max 80 characters.
 - `description`: non-empty text, max 240 characters.
 - `permissions`: unique list of capability names from the table above.
+  Connector permissions (`network:fetch`, `credentials:*`) need
+  `"tier": "connector"` in the manifest.
+- `tier`: `"sandboxed"` (default) or `"connector"`.
+- `networkOrigins`: connector only — up to 10 bare `https:` origins.
 - `source`: 1–64,000 characters of JavaScript that calls
   `xPinPlugin.register({ activate(api) { … } })` exactly once. Whole package
   (JSON file) must stay under 100 KB.
@@ -170,13 +256,25 @@ button; one click downloads the package and drops it into the existing
 **Pending** review queue — nothing runs before you approve it.
 
 **`index.json` schema:**
-`{ name, version, updated, plugins: [{ id, name, version, description,
-author, capabilities[], downloadUrl, sha256, updated }] }`.
+`{ name, version, updated, signature, signatureKeyId, plugins: [{ id, name, version, description,
+author, capabilities[], changelog, downloadUrl, sha256, updated }] }`.
 `downloadUrl` may be relative (resolved against the directory URL).
 
 **Offline/unreachable:** the last successfully fetched index is cached in
 the workspace, so previously listed plugins remain browsable offline;
 a refresh failure shows a friendly message instead of a stack trace.
+
+**Signed index:** `index.json` carries an Ed25519 signature (see
+`marketplace/SIGNING.md`). The in-app client verifies the signature
+against the bundled public key before trusting an index — fetched or
+cached. A bad or missing signature fails closed: the directory shows
+"unverified — showing installed plugins only" and no installs are offered
+from it. Per-package SHA-256 checks still apply on install.
+
+**Update checks:** the client compares installed plugin versions against
+the index. An available update shows "Update available" with the version
+and changelog line; updating routes through the review queue (the changed
+package is re-reviewed before it can run again).
 
 **Security note:** fetching a directory only downloads JSON, which is
 schema-validated before display — the actual plugin code still travels
