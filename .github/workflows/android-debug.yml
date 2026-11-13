@@ -4,6 +4,10 @@ name: Android debug build
 # Runs on every push to main and on manual trigger. No signing: the debug
 # APK uses the automatic debug key. A signed release build is a separate
 # step (needs a keystore) and is not done here.
+#
+# NOTE: setup-android must stay on v4+. v3 installs the retired SDK
+# "tools" package (Google removed it 2026-09-15), so the SDK step failed
+# with "Failed to find package 'tools'". v4 drops it.
 on:
   push:
     branches: [main]
@@ -35,7 +39,11 @@ jobs:
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          api-level: 36
+          build-tools-version: 36.0.0
+          packages: platform-tools platforms;android-36 build-tools;36.0.0
 
       - name: Build debug APK
         run: npm run android:debug
