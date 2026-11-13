@@ -6,12 +6,13 @@
   "scripts": {
     "build:web": "node scripts/prepare-web.mjs",
     "android:sync": "npm run build:web && cap sync android",
-    "android:debug": "npm run android:sync && cd android && ./gradlew assembleDebug",
-    "android:debug:win": "npm run android:sync && cd android && gradlew.bat assembleDebug",
+    "android:debug": "npm run android:sync && node scripts/run-gradlew.mjs assembleDebug",
+    "android:debug:win": "npm run android:sync && node scripts/run-gradlew.mjs assembleDebug",
     "test:smoke": "node tests/smoke-headless.cjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.6.0",
+    "@capacitor/app": "^8.1.2",
     "@capacitor/core": "^8.6.0"
   },
   "devDependencies": {

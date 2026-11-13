@@ -1,0 +1,6 @@
+{
+  "algorithm": "Ed25519",
+  "keyId": "xpin-marketplace-1",
+  "created": "2026-11-13T09:16:20.935Z",
+  "publicKeySpkiPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAbp+0jHeAGI96yYl8G2hQubegyisqk8oeKtXncDa6A+U=\n-----END PUBLIC KEY-----\n"
+}

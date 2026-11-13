@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#07151d">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https:; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; frame-src 'self' https://www.youtube-nocookie.com https://www.figma.com https://drive.google.com https://form.typeform.com; object-src 'none'; base-uri 'self'; form-action 'none'">
     <title>xPin — a place for your thoughts</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -25,11 +25,17 @@
           <button class="nav-item is-active" data-filter="all" type="button" aria-label="All notes"><span class="nav-icon" aria-hidden="true">▤</span><span>All notes</span><span class="nav-count" id="all-count">0</span></button>
           <button class="nav-item" data-filter="pinned" type="button" aria-label="Pinned"><span class="nav-icon pin-nav-icon" aria-hidden="true">◆</span><span>Pinned</span><span class="nav-count" id="pinned-count">0</span></button>
           <button class="nav-item" data-filter="recent" type="button" aria-label="Recent notes"><span class="nav-icon" aria-hidden="true">◷</span><span>Recent notes</span></button>
+          <button class="nav-item" data-filter="trash" type="button" aria-label="Trash"><span class="nav-icon" aria-hidden="true">⌫</span><span>Trash</span><span class="nav-count" id="trash-count">0</span></button>
           <button class="nav-item" id="canvas-nav" data-view="canvas" type="button" aria-label="Canvas"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
           <button class="nav-item" data-feature-view="database" type="button" aria-label="Databases"><span class="nav-icon" aria-hidden="true">▦</span><span>Databases</span></button>
           <button class="nav-item" data-feature-view="graph" type="button" aria-label="Graph"><span class="nav-icon" aria-hidden="true">◎</span><span>Graph</span></button>
+          <button class="nav-item" data-phase2-view="capture" type="button" aria-label="Capture and smarts"><span class="nav-icon" aria-hidden="true">✦</span><span>Capture &amp; smarts</span></button>
+          <button class="nav-item" data-phase2-view="readlater" type="button" aria-label="Read later"><span class="nav-icon" aria-hidden="true">◐</span><span>Read later</span><span class="nav-count" id="readlater-count">0</span></button>
+          <button class="nav-item" data-phase2-view="flashcards" type="button" aria-label="Flashcards"><span class="nav-icon" aria-hidden="true">▧</span><span>Flashcards</span><span class="nav-count" id="flashcards-due-count">0</span></button>
+          <button class="nav-item" data-phase3-view="power" type="button" aria-label="Power and polish"><span class="nav-icon" aria-hidden="true">⚡</span><span>Power &amp; polish</span></button>
           <button class="nav-item" data-feature-view="settings" type="button" aria-label="Workspace tools"><span class="nav-icon" aria-hidden="true">⚙</span><span>Workspace tools</span></button>
         </nav>
+        <div class="daily-strip-wrap"><div class="nav-label">THIS WEEK</div><div class="daily-strip" id="daily-strip" aria-label="Daily notes this week"></div></div>
         <div class="sidebar-bottom">
           <div class="sync-card"><span class="sync-indicator" aria-hidden="true"></span><span><strong>Just you and your notes</strong><small>Saved on this device</small></span></div>
           <div class="profile"><div class="avatar" aria-hidden="true">Y</div><span><strong>Your workspace</strong><small>Personal space</small></span></div>
@@ -65,6 +71,7 @@
               <div id="editor-fields" class="editor-fields">
                 <label class="sr-only" for="note-title">Note title</label><input id="note-title" class="note-title" type="text" placeholder="Untitled note" maxlength="120" spellcheck="false">
                 <div class="note-meta"><span class="meta-glyph" aria-hidden="true">◷</span><span id="note-meta-date">Created just now</span><span class="meta-divider">·</span><label for="note-folder">IN</label><select id="note-folder" aria-label="Move note to folder"></select><label for="note-parent">PARENT</label><select id="note-parent" aria-label="Set parent page"></select></div>
+                <div id="note-properties" class="note-properties"></div>
                 <div class="editor-rule"></div>
                 <div class="editor-page-tools">
                   <button class="editor-tool-button" id="create-child-page" type="button">＋ Sub-page</button>
@@ -77,13 +84,20 @@
                     </select>
                   </label>
                   <button class="editor-tool-button" id="insert-code-block" type="button">＋ Code block</button>
+                  <button class="editor-tool-button" id="attach-file" type="button">＋ Attach file</button>
+                  <input id="attachment-file-input" type="file" multiple hidden>
+                  <button class="editor-tool-button" id="export-note-markdown" type="button">Export .md</button>
                   <button class="editor-tool-button" id="toggle-preview" type="button" aria-pressed="false">Preview</button>
+                  <button class="editor-tool-button" id="toggle-split-preview" type="button" aria-pressed="false" title="Side-by-side edit and preview">Split</button>
+                  <button class="editor-tool-button" id="share-note" type="button" title="Share this note">Share</button>
+                  <button class="editor-tool-button" id="voice-capture" type="button" title="Record a quick voice memo into this note">🎙 Voice</button>
                 </div>
                 <label class="sr-only" for="note-body">Note content</label><textarea id="note-body" class="note-body" placeholder="Every good idea starts somewhere..."></textarea>
                 <article id="markdown-preview" class="markdown-preview" aria-label="Markdown preview" hidden></article>
                 <div class="editor-bottom"><span>MARKDOWN FRIENDLY <span class="editor-bottom-dot">·</span> JUST START TYPING</span><span id="editor-status"></span></div>
               </div>
               <div id="plugin-panels" class="plugin-panels"></div>
+              <div id="note-comments" class="note-comments" hidden></div>
             </section>
           </div>
           <section class="canvas-view" id="canvas-view" aria-label="Canvas workspace" hidden>
@@ -118,6 +132,8 @@
           <section class="feature-view" id="feature-view" aria-label="Workspace tools" hidden>
             <div class="feature-content" id="feature-content"></div>
           </section>
+          <section class="phase2-view" id="phase2-view" aria-label="Capture and smarts" hidden></section>
+          <section class="phase3-view" id="phase3-view" aria-label="Power and polish" hidden></section>
         </section>
       </main>
       <div class="modal-backdrop" id="plugins-modal" hidden>
@@ -196,7 +212,25 @@
     <script src="plugin-sandbox.js"></script>
     <script src="plugin-system.js"></script>
     <script src="plugins.js"></script>
+    <script src="sync/sync.js"></script>
+    <script src="sync/transports.js"></script>
+    <script src="sync/credentials.js"></script>
+    <script src="sync/publish.js"></script>
+    <script src="phase2.js"></script>
+    <script src="phase3.js"></script>
     <script src="feature-suite.js"></script>
+    <!-- fabriX integration adapter (integrations/fabrix/). Disabled by default; -->
+    <!-- the app works fully without it. Loaded before app.js so the adapter -->
+    <!-- exists when app.js attaches the domain. -->
+    <script src="integrations/fabrix/state.js"></script>
+    <script src="integrations/fabrix/crypto.js"></script>
+    <script src="integrations/fabrix/permissions.js"></script>
+    <script src="integrations/fabrix/transport.js"></script>
+    <script src="integrations/fabrix/mock-transport.js"></script>
+    <script src="integrations/fabrix/domain.js"></script>
+    <script src="integrations/fabrix/capabilities.js"></script>
+    <script src="integrations/fabrix/adapter.js"></script>
+    <script src="integrations/fabrix/settings.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

@@ -1,7 +1,7 @@
 {
   "name": "xPin Plugin Directory",
   "version": 1,
-  "updated": "2026-11-02T00:57:02.021Z",
+  "updated": "2026-11-13T09:16:55.775Z",
   "installNote": "Packages install through xPin's review queue: Plugins → Marketplace → Install → Review → Approve. Nothing runs before you approve it.",
   "plugins": [
     {
@@ -20,7 +20,7 @@
       ],
       "downloadUrl": "packages/backlinks-quick-1.0.0.xpin.json",
       "sha256": "cb1cb548331622db472a46dde8b02f01bb35341bc23fdb96516f2fca64c8775e",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Backlinks Quick\n\nBacklink helpers for the note you have open. A \"backlink\" is any note whose\nbody contains `[[<your note's title>]]`.\n\n## Commands\n\n- **Count backlinks** — toasts how many notes link to the current note.\n- **Jump to next backlink** — opens the next note that links here, cycling\n  through all of them and wrapping around. The position in the cycle is kept\n  in the plugin's settings, so it survives restarts and switching notes\n  (each note gets its own cycle position).\n\n## Permissions used\n\n`commands:register`, `notes:read`, `notes:select`, `ui:notify`,\n`settings:read`, `settings:write`\n\n## Notes for builders\n\n- `[[Title]]` matching is an exact, case-sensitive substring match on the\n  note body, using a literal (non-regex) search.\n- The cycle key is `backlinkIndex:<noteId>` so positions don't collide.\n"
     },
     {
@@ -37,7 +37,7 @@
       ],
       "downloadUrl": "packages/case-converter-1.0.0.xpin.json",
       "sha256": "71f5f5cce5db41e331189e743d76c23ddc9c753e9cf57a1b3c60bfbbafda524c",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Case Converter\n\nThree command-palette commands that transform the **title and body** of the\nnote currently open in the editor, in place:\n\n- **UPPERCASE note** — everything to upper case\n- **lowercase note** — everything to lower case\n- **Title Case note** — first letter of each word capitalized\n\nEach command confirms with a short toast (or reports the error). The\ntransformation is applied via `notes:update`, so it respects the app's\nnormal note-update path (history, sync, re-render).\n\nPermissions: `notes:read`, `notes:update`, `commands:register`, `ui:notify`.\n"
     },
     {
@@ -56,7 +56,7 @@
       ],
       "downloadUrl": "packages/daily-goal-1.0.0.xpin.json",
       "sha256": "2a5c8f5691d5e1fe717211813675602c13dcb336e2de0932b609283dbb342722",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Daily Word Goal\n\nA daily writing target across all your notes.\n\n**Commands:** `Set daily word goal` (cycles 100/250/500/1000/2000), `Refresh goal progress`.\n\n**How it works:** every 30s it sums the words in notes created or updated today and shows `312/500 words today` in the status bar. The first time the total reaches the goal each day, you get a celebration toast (tracked with a per-day flag, local time). Goal persists in plugin settings.\n\nPack: `node plugins/pack.mjs plugins/oem/daily-goal`\n"
     },
     {
@@ -72,7 +72,7 @@
       ],
       "downloadUrl": "packages/duplicate-titles-1.0.0.xpin.json",
       "sha256": "0a2dd163fe6457cbda2a68ea85461546dda0dce0c53690e7666d6a24c88ba1e2",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Duplicate Titles\n\nOne command-palette command: **Find duplicate titles**.\n\nScans every note (up to 500 via `notes:list()`), groups by normalized\ntitle (trimmed, case-insensitive — \"Ideas\" and \"ideas\" are duplicates),\nand reports via toast, e.g.:\n\n`3 duplicate titles: Ideas, Meeting notes, +1 more`\n\nThe title list is truncated so the whole message always fits the\n200-character toast limit. Untitled notes are skipped.\n\nPermissions: `notes:read`, `commands:register`, `ui:notify`.\n"
     },
     {
@@ -88,7 +88,7 @@
       ],
       "downloadUrl": "packages/link-checker-1.0.0.xpin.json",
       "sha256": "bbf08b322ee7bddb16a508c6c270d22c52351a9e04e2f9f816b3117d6400c14b",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Link Checker\n\nFind dead `[[wiki-links]]` in your notes.\n\n## Commands\n\n- **Find broken links** — scans every note body for `[[Some Title]]`\n  references whose target doesn't match any existing note's exact title,\n  then toasts the count plus the first 2–3 broken targets so you can fix them.\n\n## Permissions used\n\n`commands:register`, `notes:read`, `ui:notify`\n\n## Notes for builders\n\n- Wikilinks are extracted with a simple regex (`/\\[\\[([^\\][]+)\\]\\]/g`);\n  targets are trimmed and matched exactly (case-sensitive) against titles.\n- Dedupe targets so each broken link is counted once, and sort them for a\n  stable, readable report.\n"
     },
     {
@@ -105,7 +105,7 @@
       ],
       "downloadUrl": "packages/meeting-notes-1.0.0.xpin.json",
       "sha256": "0139d56414233ec39d6ea48aa9728a787d3c50712444427e01039003484d373a",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Meeting Notes\n\nOne command to be meeting-ready.\n\n**Commands:** `New meeting note`.\n\n**How it works:** creates a note titled `Meeting — <today's date>` with Attendees / Agenda / Notes / Action items sections, opens it in the editor, and confirms with a toast. Minimal permissions by design.\n\nPack: `node plugins/pack.mjs plugins/oem/meeting-notes`\n"
     },
     {
@@ -122,7 +122,7 @@
       ],
       "downloadUrl": "packages/note-streak-1.0.0.xpin.json",
       "sha256": "493554411ec0134d1acfe2f5cad236d1988a858c730dc1828094b17b70b3d9da",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Note Streak\n\nYour consecutive-days writing streak in the status bar.\n\n**Commands:** `Show streak details` (current streak, longest streak, total notes).\n\n**How it works:** refreshes every 60s — a day counts when at least one note was created on it (local time). If today has no notes yet, the streak counts back from yesterday so you aren't reset mid-morning. All date math is DST-safe.\n\nPack: `node plugins/pack.mjs plugins/oem/note-streak`\n"
     },
     {
@@ -140,7 +140,7 @@
       ],
       "downloadUrl": "packages/pomodoro-focus-1.0.0.xpin.json",
       "sha256": "9e73255353bdf81b9cc7e76387d83da889d2f45fbe3089ed607a1999b10a32ad",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Pomodoro Focus Timer\n\nA Pomodoro timer in the xPin status bar.\n\n**Commands:** `Start focus (25m)`, `Start break (5m)`, `Stop timer`, `Set focus length` (cycles 15/25/45/60 min), `Set break length` (cycles 5/10/15 min).\n\n**How it works:** a 1-second worker-side interval updates the status bar (`Focus 24:59`); when the session ends you get a toast and the timer clears itself. Durations persist in plugin settings. Starting a new timer always replaces the running one. Disabling the plugin stops the interval.\n\nPack: `node plugins/pack.mjs plugins/oem/pomodoro-focus`\n"
     },
     {
@@ -157,7 +157,7 @@
       ],
       "downloadUrl": "packages/random-note-1.0.0.xpin.json",
       "sha256": "9d369d137bac5404cfbc4d0c4a087c2a4c3e12d890086cf9fd720d5460dc7742",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Random Note\n\nJump to a **uniformly random note** from your whole collection with a single\ncommand-palette action. A nice way to rediscover old ideas.\n\n## Commands\n\n- **Open random note** — picks one note at random and opens it in the editor,\n  notifying you of its title. If you have no notes yet, you get a toast saying\n  so instead.\n\n## Permissions used\n\n`commands:register`, `notes:read`, `notes:select`, `ui:notify`\n\n## Notes for builders\n\n- The draw uses `Math.random()` against the full list returned by\n  `api.notes.list()` (up to 500 notes), so every note is equally likely.\n- Every `run()` is wrapped in `try/catch` so failures surface as toasts.\n"
     },
     {
@@ -176,7 +176,7 @@
       ],
       "downloadUrl": "packages/reading-list-1.0.0.xpin.json",
       "sha256": "3e899832bd5b71b4b7cd20d5aeced4afebea00cc780bc63f7d3a8e3b490ea366",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Reading List\n\nA simple **read-later queue** stored in the plugin's settings.\n\n## Commands\n\n- **Add current note to reading list** — queues the open note. Duplicates\n  are skipped, so adding the same note twice won't pile up.\n- **Open next in reading list** — opens the head of the queue, then rotates\n  it to the back (round-robin). Notes that were deleted in the meantime are\n  dropped automatically.\n- **Reading list size** — toasts how many notes are queued (after cleaning\n  out any that no longer exist).\n\n## Permissions used\n\n`commands:register`, `notes:read`, `notes:select`, `ui:notify`,\n`settings:read`, `settings:write`\n\n## Notes for builders\n\n- The queue is an array of note ids under the `queue` settings key.\n- `notes:select` on the head of the queue is only ever done after verifying\n  the id still exists in `notes:list()`.\n"
     },
     {
@@ -191,7 +191,7 @@
       ],
       "downloadUrl": "packages/reading-time-1.0.0.xpin.json",
       "sha256": "85c93c4bfaf0704a221b530067089d399e87ac1c707b8dce3e523f567002d120",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Reading Time\n\nLive reading-time estimate for the note currently open in the editor,\nshown in the status bar and refreshed every 2 seconds.\n\n- **Status item id:** `reading-time`\n- **Rate:** 200 words per minute; rounds up, minimum \"1 min read\"\n  for any non-empty note.\n- Cleared automatically when no note is open.\n\nPermissions: `notes:read`, `ui:status`.\n"
     },
     {
@@ -208,7 +208,7 @@
       ],
       "downloadUrl": "packages/table-formatter-1.0.0.xpin.json",
       "sha256": "c9b18ba9b7df270ade4c8fa8aa1ae337967189033595f467bae3bc2d7860ce69",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Table Formatter\n\nOne command-palette command: **Format markdown tables**.\n\nScans the body of the note currently open in the editor for GitHub-flavored\npipe tables (consecutive `|…|` lines with a `---` separator row) and\nrewrites each with columns padded to equal widths so the raw markdown\nlines up, e.g.:\n\n```\n| Name  | Age |\n| ----- | --- |\n| Ada   | 36  |\n| Grace | 85  |\n```\n\nAlignment markers (`:---`, `---:`, `:---:`) are preserved. Blocks that\naren't valid tables (ragged columns, no separator row) are left untouched.\nThe toast reports how many tables were formatted, or \"No tables found.\"\n\nPermissions: `notes:read`, `notes:update`, `commands:register`, `ui:notify`.\n"
     },
     {
@@ -226,7 +226,7 @@
       ],
       "downloadUrl": "packages/tag-manager-1.0.1.xpin.json",
       "sha256": "2456a9f2dee4e16b10c2939d10f8b535874ccdb3206d9964b345d16916fe0e9d",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Tag Manager\n\nAudit your `#hashtag` usage across all notes.\n\n## Commands\n\n- **Tag census** — counts distinct `#tags` across all notes and toasts the\n  total plus the top 5 by usage, e.g. `12 tags · top: #work(8), #ideas(5), …`.\n- **Create tag index note** — writes a \"Tag index\" note listing every tag\n  with its note count, most-used first, and opens it.\n\n## Permissions used\n\n`commands:register`, `notes:create`, `notes:read`, `ui:notify`\n\n## Notes for builders\n\n- xPin has no `note.tags` field: tags are `#hashtags` in the title/body text,\n  extracted with the host's own pattern `/(?:^|\\s)#([a-z0-9][a-z0-9/_-]*)/gi`\n  and lowercased, so the census agrees with xPin's tag filter.\n- Renaming a tag would need a prompt API (which doesn't exist), so this\n  plugin reports and indexes instead of renaming.\n- Toast text is kept under the 200-char limit by truncating the top-5 list.\n"
     },
     {
@@ -242,7 +242,7 @@
       ],
       "downloadUrl": "packages/template-inserter-1.0.0.xpin.json",
       "sha256": "63f4c03fb9819b12ba4da7d99308fb93382c8b86e9af8a45de672c53a7ca360d",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Template Inserter\n\nFour markdown skeletons at the cursor.\n\n**Commands:** `Insert meeting template`, `Insert daily log template`, `Insert decision record`, `Insert book notes template`.\n\n**How it works:** each inserts a compact, dated skeleton via `editor:write`. If no note is open, the insert creates one. No notes are read and no settings are stored.\n\nPack: `node plugins/pack.mjs plugins/oem/template-inserter`\n"
     },
     {
@@ -259,7 +259,7 @@
       ],
       "downloadUrl": "packages/text-stats-1.0.0.xpin.json",
       "sha256": "db8cf95a7cd2925841118af0d08ea0359f291090dcf01f0ab5a98ec580818c5a",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Text Statistics\n\nTwo command-palette commands for the note currently open in the editor:\n\n1. **Show text statistics** — a compact one-line toast:\n   `123 words · 456 chars · 7 sentences · 3 paragraphs`\n2. **Insert statistics report** — writes a fuller markdown table report\n   (words, characters with/without spaces, sentences, paragraphs, lines)\n   at the cursor position.\n\nBoth commands are fully automatic (no dialogs exist in the sandbox) and\nreport failures as toasts instead of failing silently.\n\nPermissions: `notes:read`, `commands:register`, `ui:notify`, `editor:write`.\n"
     },
     {
@@ -278,7 +278,7 @@
       ],
       "downloadUrl": "packages/untagged-finder-1.0.1.xpin.json",
       "sha256": "ace8f4f253ed71b93ad51c9ae770facbeff2d18be3d19374bd73ae2f5199e098",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Untagged Finder\n\nHunt down notes that have no `#hashtags`.\n\n## Commands\n\n- **Count untagged notes** — toasts how many notes contain no `#tag`.\n- **Open next untagged note** — opens the next untagged note, cycling through\n  all of them and wrapping around, so you can tag them one by one. The cycle\n  position is stored in settings and survives restarts.\n\n## Permissions used\n\n`commands:register`, `notes:read`, `notes:select`, `ui:notify`,\n`settings:read`, `settings:write`\n\n## Notes for builders\n\n- A note is \"untagged\" when its title+body contain no `#hashtag` matching the\n  host's tag pattern `/(?:^|\\s)#([a-z0-9][a-z0-9/_-]*)/gi` (xPin has no\n  `note.tags` field — tags are inline in the text).\n- The cycle order is by `updatedAt` (newest first) and the stored index is\n  normalized with modulo, so deleted/retagged notes can't break it.\n"
     },
     {
@@ -297,7 +297,7 @@
       ],
       "downloadUrl": "packages/word-sprint-1.0.0.xpin.json",
       "sha256": "851c48c8484368bda038142870932b9231d2885dca454a22e923868e1a04fcb7",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Word Sprint\n\nTimed writing sprints on the open note.\n\n**Commands:** `Start word sprint`, `Stop word sprint`, `Set sprint word target` (100/300/500/750/1000), `Set sprint length` (5/10/15/25/30 min).\n\n**How it works:** starting a sprint snapshots the open note's word count; the status bar shows `123/300 · 12:34 left` as you write. Hit the target and you're congratulated; run out of time and you get your final tally. Switching to a different note mid-sprint shows \"paused\" instead of counting the wrong note.\n\nPack: `node plugins/pack.mjs plugins/oem/word-sprint`\n"
     },
     {
@@ -312,8 +312,10 @@
       ],
       "downloadUrl": "packages/word-tally-1.0.0.xpin.json",
       "sha256": "687eeb14ac6ed07e3a405ffd516bb5a4509985a51149ab07e1591b7e990fc68d",
-      "updated": "2026-11-02",
+      "updated": "2026-11-13",
       "readme": "# Word Tally\n\nLive word + character count of the note currently open in the editor,\nshown in the status bar and refreshed every 2 seconds.\n\n- **Status item id:** `word-tally`\n- **Format:** `12 words · 345 chars`\n- The item is cleared automatically when no note is open.\n- Poll failures are swallowed silently; the next tick retries.\n\nPermissions: `notes:read`, `ui:status`.\n"
     }
-  ]
+  ],
+  "signature": "BK+T2sxuc9z56u4ZbIuens8vp7abNVDLjLKD6r7I9YRwSbMyzX9zW26xATgP0ymKPk5vuh8fuMxq4/5TVpm9Cw==",
+  "signatureKeyId": "xpin-marketplace-1"
 }

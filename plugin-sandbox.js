@@ -9,13 +9,34 @@
     "notes:select": "Open a note in the editor",
     "notes:create": "Create a note",
     "notes:update": "Edit a note's title or body",
+    "notes:delete": "Move a note to Trash (or permanently delete it from Trash)",
     "editor:write": "Insert text into the open note",
     "commands:register": "Add actions to the command palette",
     "ui:notify": "Show xPin notifications",
     "ui:status": "Show a small item in the editor status bar",
     "settings:read": "Read this plugin's own settings",
-    "settings:write": "Save this plugin's own settings"
+    "settings:write": "Save this plugin's own settings",
+    // Phase 1 (audit C2/C3): host API for folders, databases, canvas,
+    // templates, and export — available to both tiers, gated like the rest.
+    "folders:read": "List folders",
+    "folders:write": "Create, rename, or delete folders",
+    "databases:read": "List databases and read their rows",
+    "databases:write": "Add or update database rows",
+    "canvas:read": "List canvas boards",
+    "templates:read": "List note templates",
+    "export:note": "Export notes as Markdown or a Markdown .zip",
+    // Connector tier only (manifest tier: "connector"). The sandboxed tier
+    // never gets these: the worker's own fetch/XHR/WebSocket stay neutered
+    // and every network call goes through a host-side gated RPC instead.
+    "network:fetch": "Fetch from approved https origins (host performs the request)",
+    "credentials:set": "Store a secret in the encrypted credential store",
+    "credentials:get": "Read a stored secret back",
+    "credentials:delete": "Delete a stored secret"
   });
+  // Permissions only a connector-tier plugin may declare. A sandboxed
+  // plugin asking for one is rejected at validation time.
+  const CONNECTOR_PERMISSIONS = new Set(["network:fetch", "credentials:set", "credentials:get", "credentials:delete"]);
+  const MAX_NETWORK_ORIGINS = 10;
 
   const WORKER_PRELUDE = `
     const __xPinState = { definition: null, commands: new Map(), pending: new Map(), sequence: 0 };
@@ -31,7 +52,8 @@
         current: () => __xPinRequest("notes:read", { action: "current" }),
         select: (id) => __xPinRequest("notes:select", { id }),
         create: (options) => __xPinRequest("notes:create", { options }),
-        update: (id, patch) => __xPinRequest("notes:update", { id, patch })
+        update: (id, patch) => __xPinRequest("notes:update", { id, patch }),
+        delete: (id, options) => __xPinRequest("notes:delete", { id, permanent: options?.permanent === true })
       }),
       editor: Object.freeze({
         insertText: (text) => __xPinRequest("editor:write", { text })
@@ -61,6 +83,41 @@
       settings: Object.freeze({
         get: (key, fallback) => __xPinRequest("settings:read", { key, fallback }),
         set: (key, value) => __xPinRequest("settings:write", { key, value })
+      }),
+      // Phase 1 (audit C3): folders, databases, canvas, templates, export.
+      folders: Object.freeze({
+        list: () => __xPinRequest("folders:read", { action: "list" }),
+        create: (name) => __xPinRequest("folders:write", { action: "create", name }),
+        rename: (id, name) => __xPinRequest("folders:write", { action: "rename", id, name }),
+        delete: (id) => __xPinRequest("folders:write", { action: "delete", id })
+      }),
+      databases: Object.freeze({
+        list: () => __xPinRequest("databases:read", { action: "list" }),
+        rows: (tableId) => __xPinRequest("databases:read", { action: "rows", tableId }),
+        addRow: (tableId, values) => __xPinRequest("databases:write", { action: "add-row", tableId, values }),
+        updateRow: (tableId, rowId, values) => __xPinRequest("databases:write", { action: "update-row", tableId, rowId, values })
+      }),
+      canvas: Object.freeze({
+        list: () => __xPinRequest("canvas:read", { action: "list" })
+      }),
+      templates: Object.freeze({
+        list: () => __xPinRequest("templates:read", { action: "list" })
+      }),
+      export: Object.freeze({
+        noteMarkdown: (id) => __xPinRequest("export:note", { action: "note-markdown", id }),
+        markdownZip: () => __xPinRequest("export:note", { action: "markdown-zip" })
+      }),
+      // Connector tier only. The worker never touches the network itself:
+      // network:fetch asks the HOST to fetch (allowlist + timeout + size
+      // cap enforced there), and credentials:* read/write the encrypted
+      // store through the host. Sandboxed plugins are rejected by the host.
+      network: Object.freeze({
+        fetch: (url, options) => __xPinRequest("network:fetch", { url, options: options ?? {} })
+      }),
+      credentials: Object.freeze({
+        set: (key, value) => __xPinRequest("credentials:set", { key, value }),
+        get: (key) => __xPinRequest("credentials:get", { key }),
+        delete: (key) => __xPinRequest("credentials:delete", { key })
       })
     });
     Object.defineProperty(self, "xPinPlugin", {
@@ -186,6 +243,48 @@
     if (unknown !== undefined) {
       throw new TypeError(`Unknown plugin permission "${String(unknown).slice(0, 60)}". Supported: ${Object.keys(PERMISSIONS).join(", ")}.`);
     }
+    // Connector tier (Phase 1, audit C1/C4): manifest declares
+    // tier: "connector" plus an explicit networkOrigins allowlist. Any
+    // other tier (or no tier) is the sandboxed tier and may NOT declare
+    // connector permissions — the sandbox keeps its network neutering.
+    const tier = manifest.tier === undefined || manifest.tier === "sandboxed" ? "sandboxed"
+      : manifest.tier === "connector" ? "connector" : null;
+    if (tier === null) {
+      throw new TypeError('Plugin tier must be "sandboxed" or "connector".');
+    }
+    const connectorPermission = manifest.permissions.find((permission) => CONNECTOR_PERMISSIONS.has(permission));
+    if (tier !== "connector" && connectorPermission !== undefined) {
+      throw new TypeError(`Permission "${connectorPermission}" needs the connector tier (manifest tier: "connector"). Sandboxed plugins cannot reach the network or the credential store.`);
+    }
+    let networkOrigins = [];
+    if (manifest.networkOrigins !== undefined && !(Array.isArray(manifest.networkOrigins) && manifest.networkOrigins.length === 0)) {
+      if (tier !== "connector") {
+        throw new TypeError("Only connector-tier plugins may declare networkOrigins.");
+      }
+      if (!Array.isArray(manifest.networkOrigins) || manifest.networkOrigins.length > MAX_NETWORK_ORIGINS) {
+        throw new TypeError(`networkOrigins must be a list of at most ${MAX_NETWORK_ORIGINS} origins.`);
+      }
+      networkOrigins = manifest.networkOrigins.map((origin) => {
+        if (typeof origin !== "string") throw new TypeError("networkOrigins entries must be origin strings.");
+        let parsed;
+        try {
+          parsed = new URL(origin);
+        } catch {
+          throw new TypeError(`networkOrigins entry "${origin.slice(0, 80)}" is not a valid URL.`);
+        }
+        if (parsed.protocol !== "https:") throw new TypeError(`networkOrigins entry "${origin.slice(0, 80)}" must use https.`);
+        if (parsed.pathname !== "/" || parsed.search || parsed.hash || parsed.username || parsed.password) {
+          throw new TypeError(`networkOrigins entry "${origin.slice(0, 80)}" must be a bare origin (no path, query, or credentials).`);
+        }
+        return parsed.origin;
+      });
+      if (new Set(networkOrigins).size !== networkOrigins.length) {
+        throw new TypeError("networkOrigins must not repeat an origin.");
+      }
+    }
+    if (tier === "connector" && manifest.permissions.includes("network:fetch") && !networkOrigins.length) {
+      throw new TypeError('A connector plugin with "network:fetch" must declare at least one networkOrigins entry.');
+    }
     if (!value.source.trim() || value.source.length > MAX_SOURCE_LENGTH) {
       throw new TypeError(`Plugin source must be 1–${MAX_SOURCE_LENGTH} characters of JavaScript calling xPinPlugin.register().`);
     }
@@ -196,7 +295,9 @@
         version: manifest.version.trim(),
         description: manifest.description.trim(),
         author: manifest.author.trim(),
-        permissions: [...manifest.permissions]
+        permissions: [...manifest.permissions],
+        tier,
+        networkOrigins
       },
       source: value.source
     };
@@ -204,7 +305,19 @@
 
   async function digestPackage(plugin) {
     if (!globalThis.crypto?.subtle) return null;
-    const bytes = new TextEncoder().encode(JSON.stringify({ manifest: plugin.manifest, source: plugin.source }));
+    // Digest covers only the fields that existed before the connector tier
+    // (Phase 1): tier/networkOrigins are validated separately and must NOT
+    // invalidate previously approved fingerprints — a plugin approved
+    // before Phase 1 keeps its stored SHA-256.
+    const stableManifest = {
+      id: plugin.manifest.id,
+      name: plugin.manifest.name,
+      version: plugin.manifest.version,
+      description: plugin.manifest.description,
+      author: plugin.manifest.author,
+      permissions: plugin.manifest.permissions
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify({ manifest: stableManifest, source: plugin.source }));
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   }

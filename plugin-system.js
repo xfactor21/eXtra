@@ -54,6 +54,13 @@
         notes: host.notes,
         editor: host.editor,
         tags: host.tags,
+        // Phase 1 (audit C3): host API for folders, databases, canvas,
+        // templates, and import/export — present when the host provides them.
+        folders: host.folders,
+        databases: host.databases,
+        canvas: host.canvas,
+        templates: host.templates,
+        importExport: host.importExport,
         ui: Object.freeze({
           notify: host.notify,
           openPluginManager: host.openPluginManager,
@@ -200,6 +207,21 @@
       }
     }
 
+    // Phase 1 — first-party event subscription (the fabriX adapter and
+    // other first-party modules subscribe here; plugins use api.events.on).
+    function on(name, callback) {
+      if (typeof name !== "string" || typeof callback !== "function") {
+        throw new TypeError("An event listener needs a name and callback.");
+      }
+      const handlers = listeners.get(name) ?? new Set();
+      handlers.add(callback);
+      listeners.set(name, handlers);
+      return () => {
+        handlers.delete(callback);
+        if (handlers.size === 0) listeners.delete(name);
+      };
+    }
+
     return Object.freeze({
       start,
       setEnabled,
@@ -217,6 +239,7 @@
       panels: () => [...panels.values()],
       statusItems: () => [...statusItems.values()],
       emit,
+      on,
       serialize: () => clone(preferences)
     });
   }

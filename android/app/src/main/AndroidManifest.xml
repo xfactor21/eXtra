@@ -22,6 +22,43 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- Phase 1 — xpin:// deep links (xpin://capture?text=…&title=…,
+                 xpin://note/<id>). Delivered to the WebView via the
+                 Capacitor App plugin's appUrlOpen event (see app.js
+                 setupDeepLinks). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="xpin" />
+            </intent-filter>
+
+            <!-- Phase 1 — share-sheet receive target (text). Shared text is
+                 meant to land in the Inbox folder via captureToInbox.
+                 Phase 3 status (still unverified, no Android SDK on the
+                 build VM): the intent-filter registers xPin as a share
+                 target, and the JS side handles xpin:// URLs plus the
+                 launch URL (see phase3.js setupAndroid) and the
+                 captureSharedText() receiving flow. But delivery of a SEND
+                 intent's text payload into the WebView is NOT verified —
+                 Capacitor's App plugin only delivers VIEW intents, so a
+                 small native share handler (MainActivity / Capacitor
+                 plugin) is still needed to pass the shared text through,
+                 and must be tested on a real device build. Shared images
+                 are accepted by the filter below; Phase 2 attachments
+                 exist now, so an image share has somewhere to store the
+                 image once the native handler passes it through. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+
         </activity>
 
         <provider
