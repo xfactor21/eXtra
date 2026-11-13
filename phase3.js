@@ -50,6 +50,17 @@
     return `${y}-${m}-${d}`;
   }
 
+  // UTC calendar day (YYYY-MM-DD). Note timestamps are stored as ISO UTC
+  // strings, so query date comparisons use the UTC day. Comparing instants
+  // against a local-midnight literal drops notes created in the first hours
+  // of the UTC day (e.g. 00:00Z is 18:00 the day before in CST).
+  function utcDateKey(date) {
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(date.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
   function parseDateKey(value) {
     if (typeof value !== "string") return null;
     const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -611,9 +622,9 @@
       const noteDate = new Date(note[cond.field === "created" ? "createdAt" : "updatedAt"]);
       const cmpDate = parseDateKey(cond.value) ?? new Date(cond.value);
       if (Number.isNaN(noteDate.getTime()) || Number.isNaN(cmpDate.getTime())) return false;
-      const a = noteDate.getTime();
-      const b = cmpDate.getTime();
-      if (cond.op === "=") return localDateKey(noteDate) === localDateKey(cmpDate);
+      const a = utcDateKey(noteDate);
+      const b = utcDateKey(cmpDate);
+      if (cond.op === "=") return a === b;
       if (cond.op === ">") return a > b;
       if (cond.op === "<") return a < b;
       if (cond.op === ">=") return a >= b;
