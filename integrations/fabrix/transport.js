@@ -121,6 +121,34 @@
       }
     }
 
+    // Version negotiation (spec §7.1): the contract document is fetched and
+    // must be compatible, or connect() fails closed with protocol_mismatch.
+    // A failed contract fetch is NOT swallowed — the adapter must not report
+    // "Connected" to a Bridge whose contract it could not read.
+    function checkContract(doc) {
+      if (!doc || typeof doc !== "object") {
+        throw FabrixError("protocol_mismatch", "The Bridge did not return a contract document.");
+      }
+      var schema = doc.manifest_schema;
+      if (typeof schema !== "string" || !schema) {
+        throw FabrixError("protocol_mismatch", "The Bridge contract does not declare a manifest_schema.");
+      }
+      if (majorVersion(schema) !== 1) {
+        throw FabrixError("protocol_mismatch", "The Bridge manifest schema is not version 1: " + schema.slice(0, 80));
+      }
+      if (typeof doc.schemaVersion === "string" && doc.schemaVersion && majorVersion(doc.schemaVersion) !== 1) {
+        throw FabrixError("protocol_mismatch", "The Bridge contract schemaVersion is not version 1: " + doc.schemaVersion.slice(0, 80));
+      }
+    }
+
+    // Tolerant major-version parse: "1.0" -> 1, "fabrix.manifest/1" -> 1,
+    // "v1" -> 1, "2.0" -> 2. Unparseable -> null (fail closed).
+    function majorVersion(value) {
+      var match = String(value).match(/(\d+)/);
+      if (!match) return null;
+      return Number(match[1]);
+    }
+
     return {
       name: "local",
       isConnected: function () { return connected; },
@@ -137,10 +165,13 @@
               if (!status.protocol_1_2) {
                 throw FabrixError("protocol_mismatch", "The Bridge did not report protocol compatibility (protocol_1_2 missing).");
               }
-              connected = true;
               return fetchJson(base() + "__fabrix/v1/bridge/contract", { headers: authHeaders() }, CALL_TIMEOUT_MS)
-                .then(function (doc) { contract = doc; return status; })
-                .catch(function () { contract = null; return status; });
+                .then(function (doc) {
+                  checkContract(doc);
+                  contract = doc;
+                  connected = true;
+                  return status;
+                });
             });
         }, true);
       },
@@ -219,6 +250,10 @@
       },
 
       // Direct invocation is only attempted when the contract advertises it.
+      // NOTE: the adapter never calls invoke() — it executes handlers
+      // locally and answers Bridge requests via pollRequests/postReceipt.
+      // invoke() exists for completeness of the transport interface and
+      // for tests; do not present it as an exercised path.
       invoke: function (envelope) {
         requireConfig();
         if (!contract || !contract.capability_routes || contract.capability_routes.invoke !== true) {

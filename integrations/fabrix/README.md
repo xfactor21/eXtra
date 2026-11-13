@@ -58,17 +58,25 @@ from the settings panel / mock transport.
 Deny by default. Read (`notes.search`, `notes.read`, `notes.export`,
 `projects.list`) and write (`notes.create`, `notes.update`,
 `artifacts.publish`) are separate grants, approved explicitly in Settings
-and revocable at any time. Search returns snippets only; `projects.list`
-returns metadata only. Every call — allowed or denied — records a receipt
-(Settings → Receipts, downloadable as JSON).
+and revocable at any time. Each grant records its own `grantedAt`,
+`grantedBy`, approval reason, and folder scope — set the scope (folder
+checkboxes) before approving if the grant should be limited; an empty scope
+means workspace-wide and is labeled as such. Search returns snippets only;
+`projects.list` returns metadata only. Every call — allowed or denied —
+records a receipt (Settings → Receipts, downloadable as JSON). Receipts
+and the idempotency log never contain note bodies: Bridge receipts carry
+only the outcome, and the idempotency log stores a redacted summary
+(≤ 4 KB) — a replay returns that summary, not the original body.
 
 ## Reliability
 
 - Version negotiation against the Bridge status/contract on connect; a
-  mismatch fails closed.
+  mismatch — or a contract document that cannot be fetched — fails closed.
 - Idempotency: every request carries `requestId` + `idempotencyKey`; a
-  repeated idempotency key returns the stored result instead of
-  re-executing.
+  repeated idempotency key returns the stored (redacted) result instead of
+  re-executing, and only after the enabled/grant/credential checks pass
+  again — revoking a grant or disabling the integration also blocks
+  replays.
 - Conflicts: `notes.update` accepts `expectedUpdatedAt`; a mismatch returns
   `conflict` with the current `updatedAt` and performs no write.
 - Retries: bounded (2), idempotent calls only, never after a permission or
@@ -87,6 +95,24 @@ returns metadata only. Every call — allowed or denied — records a receipt
   polling; polling starts only when the user clicks "Start listening".
 - The plugin sandbox is untouched: plugins still cannot reach the network
   and cannot reach the adapter's transport.
+
+## Known limitations (not bugs — documented in the spec)
+
+- **Registration (P1):** the Bridge's register shape expects a Windows
+  `.exe` (`native_path`); xPin registers as type `"web"` with no
+  `native_path`. A live Bridge will likely reject it — expect a 400
+  surfaced as `transport_unavailable` until the protocol decision (P1)
+  lands.
+- **Direct invoke is not an exercised path:** the adapter executes handlers
+  locally and answers Bridge requests via poll/receipt. `transport.invoke()`
+  exists for interface completeness only.
+- **Cloud pairing / device identity / credential encryption are deferred**
+  (spec §7.3, §13): no pairing flow, no `xpin-android-<random>` device id,
+  and the persisted credential block is not yet AES-256-GCM encrypted.
+  None of it is testable without a live Cloud Bridge, and the cloud
+  transport is a stub. The Ed25519 helpers exist and are probed via
+  `crypto.probeEd25519()`; `supported()` alone only proves WebCrypto
+  exists.
 
 ## Tests
 

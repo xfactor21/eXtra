@@ -15,6 +15,7 @@
 
   var MAX_RECEIPTS = 200;
   var MAX_IDEMPOTENCY_ENTRIES = 100;
+  var MAX_IDEMPOTENCY_RESULT_BYTES = 4096;
   var MAX_ARTIFACTS = 50;
   var MAX_STRING = 500;
 
@@ -31,17 +32,86 @@
     return value === true;
   }
 
+  function defaultGrant() {
+    return { granted: false, grantedAt: "", grantedBy: "", reason: "", scope: { folderIds: [] } };
+  }
+
   function defaultState() {
     return {
       enabled: false,
       transport: "local", // "local" | "cloud" | "mock"
       local: { port: "", token: "" },
       cloud: { url: "", deviceId: "", deviceToken: "", pairedAt: "" },
-      grants: { read: false, write: false, grantedAt: "", scope: { folderIds: [] } },
+      // Grants are per group (read/write separately authorized, spec §6).
+      // Each group records who granted it, when, why, and its folder scope.
+      grants: { read: defaultGrant(), write: defaultGrant() },
       receipts: [],
       idempotency: {},
       artifacts: []
     };
+  }
+
+  // Redacts a handler result for the idempotency log: note bodies (and any
+  // nested `body` key) are stripped, long strings are truncated, and the
+  // whole value is capped at MAX_IDEMPOTENCY_RESULT_BYTES. A replay returns
+  // this redacted summary — never a stored note body (spec §6: receipts and
+  // the idempotency log never contain note bodies or credentials). It also
+  // bounds the persisted workspace blob (the ~5 MB localStorage ceiling).
+  function redactResult(value) {
+    var cleaned;
+    try {
+      cleaned = JSON.parse(JSON.stringify(value));
+    } catch (error) {
+      return { redacted: true };
+    }
+    function strip(node) {
+      if (node !== null && typeof node === "object") {
+        if (Array.isArray(node)) {
+          node.forEach(strip);
+          return;
+        }
+        Object.keys(node).forEach(function (key) {
+          if (key === "body") {
+            node[key] = "[redacted]";
+          } else if (typeof node[key] === "string" && node[key].length > 256) {
+            node[key] = node[key].slice(0, 256) + "…";
+          } else {
+            strip(node[key]);
+          }
+        });
+      }
+    }
+    strip(cleaned);
+    var json = "";
+    try { json = JSON.stringify(cleaned); } catch (error) { json = ""; }
+    if (json.length > MAX_IDEMPOTENCY_RESULT_BYTES) {
+      var keys = cleaned !== null && typeof cleaned === "object" ? Object.keys(cleaned) : [];
+      return { redacted: true, keys: keys };
+    }
+    return cleaned;
+  }
+
+  function sanitizeGrant(value) {
+    var next = defaultGrant();
+    // Migration: the Phase 2 shape stored plain booleans
+    // (grants: {read: bool, write: bool}). A boolean true becomes a granted
+    // record with no provenance; false stays ungranted.
+    if (typeof value === "boolean") {
+      next.granted = value;
+      return next;
+    }
+    if (!isPlainObject(value)) return next;
+    next.granted = cleanBool(value.granted);
+    next.grantedAt = cleanString(value.grantedAt, 40);
+    next.grantedBy = cleanString(value.grantedBy, 40);
+    next.reason = cleanString(value.reason, 300);
+    if (isPlainObject(value.scope) && Array.isArray(value.scope.folderIds)) {
+      next.scope.folderIds = value.scope.folderIds
+        .filter(function (id) { return typeof id === "string" && id.length > 0; })
+        .slice(0, 50)
+        .map(function (id) { return id.slice(0, 120); });
+    }
+    return next;
   }
 
   function sanitizeReceipt(value) {
@@ -57,6 +127,7 @@
       receiptId: receiptId,
       requestId: requestId,
       capability: capability,
+      action: cleanString(value.action, 40) || "invoke",
       status: status,
       startedAt: cleanString(value.startedAt, 40),
       completedAt: cleanString(value.completedAt, 40),
@@ -99,15 +170,22 @@
       next.cloud.pairedAt = cleanString(value.cloud.pairedAt, 40);
     }
     if (isPlainObject(value.grants)) {
-      next.grants.read = cleanBool(value.grants.read);
-      next.grants.write = cleanBool(value.grants.write);
-      next.grants.grantedAt = cleanString(value.grants.grantedAt, 40);
-      if (isPlainObject(value.grants.scope) && Array.isArray(value.grants.scope.folderIds)) {
-        next.grants.scope.folderIds = value.grants.scope.folderIds
+      // Migration: the Phase 2 shape was flat
+      // ({read, write, grantedAt, scope}). A flat grantedAt/scope carries
+      // onto both groups when the group itself has no provenance yet.
+      var flatGrantedAt = cleanString(value.grants.grantedAt, 40);
+      var flatScope = isPlainObject(value.grants.scope) && Array.isArray(value.grants.scope.folderIds)
+        ? value.grants.scope.folderIds
           .filter(function (id) { return typeof id === "string" && id.length > 0; })
           .slice(0, 50)
-          .map(function (id) { return id.slice(0, 120); });
-      }
+          .map(function (id) { return id.slice(0, 120); })
+        : [];
+      ["read", "write"].forEach(function (group) {
+        var grant = sanitizeGrant(value.grants[group]);
+        if (!grant.grantedAt && flatGrantedAt && grant.granted) grant.grantedAt = flatGrantedAt;
+        if (grant.scope.folderIds.length === 0 && flatScope.length > 0) grant.scope.folderIds = flatScope.slice();
+        next.grants[group] = grant;
+      });
     }
     if (Array.isArray(value.receipts)) {
       next.receipts = value.receipts
@@ -121,7 +199,7 @@
         var entry = value.idempotency[key];
         if (isPlainObject(entry) && typeof entry.result !== "undefined") {
           next.idempotency[key.slice(0, 80)] = {
-            result: entry.result,
+            result: redactResult(entry.result),
             at: cleanString(entry.at, 40)
           };
         }
@@ -139,9 +217,11 @@
   window.xPinFabrixState = Object.freeze({
     defaultState: defaultState,
     sanitize: sanitize,
+    redactResult: redactResult,
     limits: Object.freeze({
       maxReceipts: MAX_RECEIPTS,
       maxIdempotencyEntries: MAX_IDEMPOTENCY_ENTRIES,
+      maxIdempotencyResultBytes: MAX_IDEMPOTENCY_RESULT_BYTES,
       maxArtifacts: MAX_ARTIFACTS
     })
   });

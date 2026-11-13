@@ -7,6 +7,7 @@
 const fs = require("fs");
 const vm = require("vm");
 const { webcrypto } = require("crypto");
+const { execSync } = require("child_process");
 
 const REPO = require("path").resolve(__dirname, "..");
 const results = [];
@@ -501,6 +502,7 @@ function buildContext(seedStorage) {
   for (const k of ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "queueMicrotask", "structuredClone"])
     ctx[k] = globalThis[k].bind ? globalThis[k].bind(globalThis) : globalThis[k];
   ctx.crypto = webcrypto;
+  ctx.AbortController = globalThis.AbortController;
   ctx.performance = globalThis.performance;
   ctx.TextEncoder = globalThis.TextEncoder;
   ctx.TextDecoder = globalThis.TextDecoder;
@@ -527,6 +529,62 @@ function boot(seedStorage) {
   }
   return b;
 }
+
+// fabriX boot: same as boot(), but the adapter scripts load before app.js
+// (the order in index.html) so app.js can attach the domain at boot.
+function bootFabrix(seedStorage) {
+  const b = buildContext(seedStorage);
+  const files = [
+    "plugin-sandbox.js", "plugin-system.js", "plugins.js", "feature-suite.js",
+    "integrations/fabrix/state.js", "integrations/fabrix/crypto.js",
+    "integrations/fabrix/permissions.js", "integrations/fabrix/transport.js",
+    "integrations/fabrix/mock-transport.js", "integrations/fabrix/domain.js",
+    "integrations/fabrix/capabilities.js", "integrations/fabrix/adapter.js",
+    "integrations/fabrix/settings.js", "app.js"
+  ];
+  for (const f of files) {
+    const code = fs.readFileSync(REPO + "/" + f, "utf8");
+    try {
+      vm.runInContext(code, b.ctx, { filename: f });
+    } catch (e) {
+      b.errors.push(`LOAD ${f}: ${e.message}`);
+    }
+  }
+  return b;
+}
+
+// Runs an expression inside the vm context and awaits it (adapter calls
+// return promises). Rejections surface as errors with a .code property.
+function fabrixEval(b, expr) {
+  return vm.runInContext(expr, b.ctx);
+}
+
+// Seeded workspace for fabriX tests: two folders, three notes (one per
+// folder + one unfiled), built from a real fresh boot so the shape is the
+// app's own.
+function fabrixSeed() {
+  const seedBoot = bootFabrix(null);
+  const ws = JSON.parse(seedBoot.storageData["xPin.workspace.v1"]);
+  ws.folders = [
+    { id: "folder-a", name: "Folder A" },
+    { id: "folder-b", name: "Folder B" }
+  ];
+  const now = new Date().toISOString();
+  ws.notes = [
+    { id: "note-a", title: "Alpha note", body: "alpha body with #work tag", folderId: "folder-a", parentNoteId: null, pinned: false, createdAt: now, updatedAt: now, metadata: {} },
+    { id: "note-b", title: "Beta note", body: "beta body with #home tag", folderId: "folder-b", parentNoteId: null, pinned: false, createdAt: now, updatedAt: now, metadata: {} },
+    { id: "note-c", title: "Gamma note", body: "gamma body links [[Alpha note]]", folderId: null, parentNoteId: null, pinned: false, createdAt: now, updatedAt: now, metadata: {} }
+  ];
+  return { "xPin.workspace.v1": JSON.stringify(ws) };
+}
+
+// Enables the adapter and grants read+write in a booted context.
+async function fabrixEnableAll(b) {
+  await fabrixEval(b, `window.xPinFabrix.setEnabled(true)`);
+  await fabrixEval(b, `window.xPinFabrix.grant("read")`);
+  await fabrixEval(b, `window.xPinFabrix.grant("write")`);
+}
+
 function flush(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /* ---------------- faithful iframe+Worker simulation ----------------
@@ -1644,6 +1702,422 @@ async function main() {
     const openTitle = doc.getElementById("note-title").value;
     check("T36: editor shows the announced note", !!announced && openTitle === announced[1], openTitle);
     check("T36: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F1: manifest parses, matches the Bridge registration shape, and the
+   * embedded fallback matches manifest.json */
+  {
+    const fileManifest = JSON.parse(fs.readFileSync(REPO + "/integrations/fabrix/manifest.json", "utf8"));
+    const expectedCaps = ["notes.search", "notes.read", "notes.create", "notes.update", "notes.export", "projects.list", "artifacts.publish"];
+    check("F1: manifest id is xpin", fileManifest.id === "xpin", fileManifest.id);
+    check("F1: manifest schemaVersion/version are 1.0/1.0.0", fileManifest.schemaVersion === "1.0" && fileManifest.version === "1.0.0");
+    check("F1: manifest has the Bridge registration fields",
+      ["name", "type", "category", "description", "mcp", "licensing"].every((k) => k in fileManifest),
+      Object.keys(fileManifest).join(","));
+    check("F1: manifest licensing is product authority, not required",
+      fileManifest.licensing && fileManifest.licensing.authority === "product" && fileManifest.licensing.required === false);
+    check("F1: manifest declares the seven capabilities",
+      JSON.stringify(fileManifest.fabrix.capabilities.map((c) => c.name)) === JSON.stringify(expectedCaps));
+    check("F1: manifest risk groups match the permission model",
+      fileManifest.fabrix.capabilities.filter((c) => c.risk === "read").map((c) => c.name).join(",") === "notes.search,notes.read,notes.export,projects.list" &&
+      fileManifest.fabrix.capabilities.filter((c) => c.risk === "write").map((c) => c.name).join(",") === "notes.create,notes.update,artifacts.publish");
+
+    // getManifest() with a fetch that serves the file returns the file.
+    const b = bootFabrix(null);
+    await flush(80);
+    b.win.fetch = async (url) => {
+      if (String(url).includes("manifest.json")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify(fileManifest), json: async () => fileManifest };
+      }
+      return { ok: false, status: 404, text: async () => "not found", json: async () => null };
+    };
+    const fetched = await fabrixEval(b, `window.xPinFabrix.getManifest()`);
+    check("F1: getManifest returns the file manifest", JSON.stringify(fetched) === JSON.stringify(fileManifest));
+    check("F1: boot with adapter is clean", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+
+    // getManifest() with a dead fetch falls back to the embedded copy — and
+    // the embedded capabilities match the file exactly (compared
+    // field-by-field: the file's keys are alphabetical, the embedded copy's
+    // are name/risk/description, so a raw stringify would differ).
+    const b2 = bootFabrix(null);
+    await flush(80);
+    const embedded = await fabrixEval(b2, `window.xPinFabrix.getManifest()`);
+    const capTuple = (caps) => JSON.stringify(caps.map((c) => [c.name, c.risk, c.description]));
+    check("F1: embedded manifest matches the file manifest",
+      capTuple(embedded.fabrix.capabilities) === capTuple(fileManifest.fabrix.capabilities),
+      JSON.stringify(embedded.fabrix.capabilities));
+    check("F1: adapter attached but disabled by default",
+      (await fabrixEval(b2, `window.xPinFabrix.getStatus()`)).enabled === false);
+  }
+
+  /* F2: disabled mode — no network, no timers, handlers reject */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    let fetchCalls = 0;
+    b.win.fetch = () => { fetchCalls += 1; return Promise.reject(new Error("network disabled in smoke test")); };
+    let err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", {})`); } catch (e) { err = e; }
+    check("F2: disabled invoke rejects permission_denied", err && err.code === "permission_denied", err && (err.code + ": " + err.message));
+    check("F2: disabled invoke makes no network calls", fetchCalls === 0, "fetch calls: " + fetchCalls);
+    check("F2: no polling timer while disabled",
+      (await fabrixEval(b, `window.xPinFabrix.getStatus()`)).polling === false);
+    check("F2: disabled boot has no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F3: permission boundaries — read != write, revocation takes effect */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(true)`);
+    await fabrixEval(b, `window.xPinFabrix.grant("read")`);
+    const search = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { query: "alpha body" })`);
+    check("F3: read grant allows notes.search", search.status === "ok" && search.result.notes.length === 1);
+    let err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "x", body: "y" })`); } catch (e) { err = e; }
+    check("F3: read grant does NOT allow notes.create", err && err.code === "permission_denied", err && err.code);
+    await fabrixEval(b, `window.xPinFabrix.grant("write", { reason: "test approval" })`);
+    const created = await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "WriteNote", body: "written" })`);
+    check("F3: write grant allows notes.create", created.status === "ok" && created.result.note.title === "WriteNote");
+    const grants = await fabrixEval(b, `window.xPinFabrix.getState()`);
+    check("F3: grant records grantedAt/grantedBy/reason",
+      !!grants.grants.write.grantedAt && grants.grants.write.grantedBy === "user" && grants.grants.write.reason === "test approval",
+      JSON.stringify(grants.grants.write));
+    await fabrixEval(b, `window.xPinFabrix.revoke("read")`);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" })`); } catch (e) { err = e; }
+    check("F3: revoking read blocks notes.read", err && err.code === "permission_denied", err && err.code);
+    const stillWrite = await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "StillWrite", body: "ok" })`);
+    check("F3: revoking read leaves write intact", stillWrite.status === "ok");
+    await fabrixEval(b, `window.xPinFabrix.setReason("write", "recorded first")`);
+    const afterReason = await fabrixEval(b, `window.xPinFabrix.getState()`);
+    check("F3: setReason records a reason without granting",
+      afterReason.grants.write.reason === "recorded first" && afterReason.grants.write.granted === true,
+      JSON.stringify(afterReason.grants.write));
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(false)`);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "z", body: "z" })`); } catch (e) { err = e; }
+    check("F3: disabling blocks even granted capabilities", err && err.code === "permission_denied", err && err.code);
+    check("F3: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F4: folder scoping — search filters, out-of-scope reads as not_found */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(true)`);
+    await fabrixEval(b, `window.xPinFabrix.grant("read", { folderIds: ["folder-a"] })`);
+    const scoped = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", {})`);
+    check("F4: scoped search returns only in-scope notes",
+      scoped.result.notes.length === 1 && scoped.result.notes[0].id === "note-a",
+      JSON.stringify(scoped.result.notes.map((n) => n.id)));
+    let err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { folderId: "folder-b" })`); } catch (e) { err = e; }
+    check("F4: explicitly out-of-scope folder is permission_denied", err && err.code === "permission_denied", err && err.code);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-b" })`); } catch (e) { err = e; }
+    check("F4: out-of-scope read is not_found (no existence leak)", err && err.code === "not_found", err && err.code);
+    const inScope = await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" })`);
+    check("F4: in-scope read works", inScope.status === "ok" && inScope.result.note.id === "note-a");
+    await fabrixEval(b, `window.xPinFabrix.grant("write", { folderIds: ["folder-a"] })`);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "t", body: "b", folderId: "folder-b" })`); } catch (e) { err = e; }
+    check("F4: scoped write rejects the other folder", err && err.code === "permission_denied", err && err.code);
+    await fabrixEval(b, `window.xPinFabrix.setScope("read", [])`);
+    const wide = await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-b" })`);
+    check("F4: clearing the scope restores workspace-wide read", wide.status === "ok");
+    check("F4: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F5: the seven handlers against the seeded workspace */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEnableAll(b);
+    const search = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { query: "alpha body" })`);
+    check("F5: search finds by text", search.result.notes.length === 1 && search.result.notes[0].id === "note-a");
+    check("F5: search returns snippets, not bodies",
+      !("body" in search.result.notes[0]) && (search.result.notes[0].snippet || "").includes("alpha"),
+      JSON.stringify(search.result.notes[0]));
+    const byTag = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { tag: "#work" })`);
+    check("F5: search finds by tag", byTag.result.notes.length === 1 && byTag.result.notes[0].id === "note-a");
+    const read = await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" })`);
+    check("F5: read returns the full note", read.result.note.body === "alpha body with #work tag");
+    check("F5: read extracts tags", (read.result.note.tags || []).includes("#work"), JSON.stringify(read.result.note.tags));
+    const readLinks = await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-c" })`);
+    check("F5: read resolves [[links]] to note ids",
+      (readLinks.result.note.links || []).some((l) => l.target === "Alpha note" && l.noteId === "note-a"),
+      JSON.stringify(readLinks.result.note.links));
+    let err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-nope" })`); } catch (e) { err = e; }
+    check("F5: read of a missing note is not_found", err && err.code === "not_found", err && err.code);
+    const created = await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "Created", body: "fresh body", folderId: "folder-a", tags: ["#new"] })`);
+    check("F5: create appends missing tags to the body",
+      created.result.note.body.includes("#new"), created.result.note.body);
+    check("F5: create stamps fabriX provenance",
+      created.result.note.provenance && created.result.note.provenance.source === "fabrix",
+      JSON.stringify(created.result.note.provenance));
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "t", body: "b", folderId: "folder-nope" })`); } catch (e) { err = e; }
+    check("F5: create with an unknown folder is validation_error", err && err.code === "validation_error", err && err.code);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "t", body: "b", parentNoteId: "note-nope" })`); } catch (e) { err = e; }
+    check("F5: create with an unknown parent is validation_error", err && err.code === "validation_error", err && err.code);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "t", body: "b", tags: [null] })`); } catch (e) { err = e; }
+    check("F5: tags [null] is validation_error, not a TypeError", err && err.code === "validation_error", err && (err.code + ": " + err.message));
+    const before = await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" })`);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.update", { id: "note-a", title: "Changed", expectedUpdatedAt: "2000-01-01T00:00:00.000Z" })`); } catch (e) { err = e; }
+    check("F5: stale expectedUpdatedAt is a conflict", err && err.code === "conflict" && !!err.currentUpdatedAt, err && err.code);
+    const afterConflict = await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" })`);
+    check("F5: conflict performs no write", afterConflict.result.note.title === before.result.note.title);
+    const updated = await fabrixEval(b, `(async () => {
+      const read = await window.xPinFabrix.invoke("notes.read", { id: "note-a" });
+      return window.xPinFabrix.invoke("notes.update", { id: "note-a", title: "Alpha renamed", tags: ["#extra"], expectedUpdatedAt: read.result.note.updatedAt });
+    })()`);
+    check("F5: update with the current expectedUpdatedAt succeeds",
+      updated.status === "ok" && updated.result.note.title === "Alpha renamed", JSON.stringify(updated));
+    check("F5: update appends new tags", updated.result.note.body.includes("#extra"), updated.result.note.body);
+    const exported = await fabrixEval(b, `window.xPinFabrix.invoke("notes.export", { id: "note-a", format: "markdown" })`);
+    check("F5: export returns Markdown content",
+      exported.result.files.length === 1 && exported.result.files[0].name.endsWith(".md") && exported.result.files[0].content.includes("alpha body"),
+      JSON.stringify(exported.result.files[0]).slice(0, 120));
+    const exportedHtml = await fabrixEval(b, `window.xPinFabrix.invoke("notes.export", { id: "note-a", format: "html" })`);
+    check("F5: export renders HTML through the Markdown renderer",
+      exportedHtml.result.files[0].content.includes("<h1>Alpha renamed</h1>"),
+      exportedHtml.result.files[0].content.slice(0, 200));
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.export", { id: "note-a", ids: Array.from({ length: 100 }, (_, i) => "note-" + i) })`); } catch (e) { err = e; }
+    check("F5: export of 101 notes is validation_error (combined cap)", err && err.code === "validation_error", err && err.code);
+    const projects = await fabrixEval(b, `window.xPinFabrix.invoke("projects.list", {})`);
+    check("F5: projects.list returns metadata only",
+      Array.isArray(projects.result.projects) && projects.result.projects.length > 0 &&
+      projects.result.projects.every((p) => "rowCount" in p && !("rows" in p)),
+      JSON.stringify(projects.result.projects).slice(0, 200));
+    const published = await fabrixEval(b, `window.xPinFabrix.invoke("artifacts.publish", { id: "note-a" })`);
+    check("F5: artifacts.publish records a local artifact with no URL",
+      published.result.artifact && published.result.artifact.noteId === "note-a" && published.result.artifact.url === null,
+      JSON.stringify(published.result.artifact));
+    check("F5: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F6: idempotency — replay serves the redacted stored result, and only
+   * while the grant and the enabled flag still hold */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEnableAll(b);
+    const first = await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "Idem note", body: "idem body" }, { requestId: "request_idem_1" })`);
+    const second = await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "Idem note", body: "idem body" }, { requestId: "request_idem_1" })`);
+    check("F6: replay returns the same note id", second.replayed === true && second.result.note.id === first.result.note.id);
+    check("F6: replay returns a redacted summary, not the body",
+      second.result.note.body === "[redacted]", JSON.stringify(second.result.note));
+    const found = await fabrixEval(b, `window.xPinFabrix.invoke("notes.search", { query: "Idem note" })`);
+    check("F6: replay executed once (one note created)", found.result.notes.length === 1);
+    const stored = await fabrixEval(b, `window.xPinFabrix.getState()`);
+    check("F6: stored idempotency entry has no real body",
+      stored.idempotency["request_idem_1"] && stored.idempotency["request_idem_1"].result.note.body === "[redacted]");
+    check("F6: a replay records a receipt", stored.receipts.length >= 2, "receipts: " + stored.receipts.length);
+    check("F6: receipts carry an action", stored.receipts.every((r) => r.action === "invoke"), JSON.stringify(stored.receipts[0]));
+    await fabrixEval(b, `window.xPinFabrix.revoke("write")`);
+    let err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "Idem note", body: "idem body" }, { requestId: "request_idem_1" })`); } catch (e) { err = e; }
+    check("F6: replay after revocation is denied, not served", err && err.code === "permission_denied", err && err.code);
+    await fabrixEval(b, `window.xPinFabrix.grant("write")`);
+    await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" }, { requestId: "request_idem_2" })`);
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(false)`);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.read", { id: "note-a" }, { requestId: "request_idem_2" })`); } catch (e) { err = e; }
+    check("F6: replay after disabling is denied", err && err.code === "permission_denied", err && err.code);
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(true)`);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "t", body: "b", apiKey: "secret-key" })`); } catch (e) { err = e; }
+    check("F6: credential-shaped input field is rejected", err && err.code === "validation_error", err && err.code);
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.invoke("notes.create", { title: "t", body: "b", accessToken: "secret-key" })`); } catch (e) { err = e; }
+    check("F6: camelCase credential field (accessToken) is rejected", err && err.code === "validation_error", err && err.code);
+    check("F6: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F7: mock transport round-trip — status/contract/register/request/receipt */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(true)`);
+    await fabrixEval(b, `window.xPinFabrix.grant("read")`);
+    await fabrixEval(b, `window.xPinFabrix.setTransport("mock", {})`);
+    const status = await fabrixEval(b, `window.xPinFabrix.connect()`);
+    check("F7: mock connect returns a mock status",
+      status && status.ok === true && status.mock === true && status.build_id === "mock-rc19.8", JSON.stringify(status));
+    check("F7: mock status capability_routes is an object",
+      status.capability_routes && typeof status.capability_routes === "object" && status.capability_routes.requests === true,
+      JSON.stringify(status.capability_routes));
+    const reg = await fabrixEval(b, `window.xPinFabrix.register()`);
+    check("F7: mock register accepts the manifest", reg && reg.ok === true && reg.registered === "xpin", JSON.stringify(reg));
+    const snake = await fabrixEval(b, `window.xPinFabrixMock.createMockBridge({}).postReceipt({ request_id: "req-snake-1", receipt_id: "rc-1", capability: "notes.read", status: "ok" })`);
+    check("F7: mock accepts snake_case receipts", snake && snake.ok === true, JSON.stringify(snake));
+    await fabrixEval(b, `window.xPinFabrix.getTransport().enqueueRequest({ requestId: "request_mock_1", capability: "notes.search", inputs: { query: "alpha" } })`);
+    const polled = await fabrixEval(b, `window.xPinFabrix.pollOnce()`);
+    check("F7: pollOnce handles a queued Bridge request",
+      polled.handled === 1 && polled.outcomes[0].status === "ok", JSON.stringify(polled));
+    const internals = await fabrixEval(b, `window.xPinFabrix.getTransport()._internals()`);
+    check("F7: the Bridge receipt was recorded",
+      internals.receipts.length === 1 && internals.receipts[0].requestId === "request_mock_1",
+      JSON.stringify(internals.receipts));
+    check("F7: Bridge receipts carry no result or body",
+      !("result" in internals.receipts[0]) && JSON.stringify(internals.receipts[0]).indexOf("alpha body") === -1,
+      JSON.stringify(internals.receipts[0]));
+    await fabrixEval(b, `window.xPinFabrix.getTransport().pollRequests = () => Promise.resolve({ routing: "advertised", requests: [{ capability: "notes.search", inputs: {} }] })`);
+    const skipped = await fabrixEval(b, `window.xPinFabrix.pollOnce()`);
+    check("F7: a malformed Bridge request is skipped, not executed",
+      skipped.handled === 1 && skipped.outcomes[0].status === "skipped", JSON.stringify(skipped));
+    check("F7: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F8: offline operation + version negotiation (fail closed) */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEval(b, `window.xPinFabrix.setEnabled(true)`);
+    let err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.connect()`); } catch (e) { err = e; }
+    check("F8: connect with no port/token is transport_unavailable", err && err.code === "transport_unavailable", err && err.code);
+    await fabrixEval(b, `window.xPinFabrix.setTransport("local", { port: "51234", token: "x".repeat(20) })`);
+    // Bridge answers status but the contract fetch 404s -> fail closed.
+    b.win.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("__fabrix/v1/bridge/contract")) return { ok: false, status: 404, text: async () => "not found" };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, build_id: "rc19.8", protocol_1_2: "1.0", manifest_schema: "fabrix.manifest/1" }) };
+    };
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.connect()`); } catch (e) { err = e; }
+    check("F8: unreadable contract fails closed (transport_unavailable)", err && err.code === "transport_unavailable", err && err.code);
+    // Contract with a version-2 schema -> protocol_mismatch, no retry.
+    b.win.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("__fabrix/v1/bridge/contract")) return { ok: true, status: 200, text: async () => JSON.stringify({ manifest_schema: "fabrix.manifest/2", schemaVersion: "2.0" }) };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, build_id: "rc19.8", protocol_1_2: "1.0", manifest_schema: "fabrix.manifest/2" }) };
+    };
+    err = null;
+    try { await fabrixEval(b, `window.xPinFabrix.connect()`); } catch (e) { err = e; }
+    check("F8: incompatible manifest_schema is protocol_mismatch", err && err.code === "protocol_mismatch", err && err.code);
+    // Compatible contract -> connects.
+    b.win.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("__fabrix/v1/bridge/contract")) return { ok: true, status: 200, text: async () => JSON.stringify({ manifest_schema: "fabrix.manifest/1", schemaVersion: "1.0", capability_routes: { requests: true, receipts: true } }) };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, build_id: "rc19.8", protocol_1_2: "1.0", manifest_schema: "fabrix.manifest/1" }) };
+    };
+    const status = await fabrixEval(b, `window.xPinFabrix.connect()`);
+    check("F8: compatible contract connects", status && status.ok === true && status.build_id === "rc19.8", JSON.stringify(status));
+    // The app itself is unaffected by transport trouble.
+    const { doc, win } = b;
+    clickEl(doc.getElementById("new-note"), win);
+    typeInto(doc.getElementById("note-title"), "Offline note", win);
+    const listText = doc.getElementById("note-list").textContent;
+    check("F8: the app still creates notes while the transport is down", listText.includes("Offline note"), listText.slice(0, 200));
+    check("F8: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F9: state sanitizer — drops unknowns, migrates the flat grant shape,
+   * redacts stored bodies; enabled + grants survive save/load */
+  {
+    const b = bootFabrix(null);
+    await flush(80);
+    const clean = await fabrixEval(b, `window.xPinFabrixState.sanitize({ enabled: true, transport: "mock", unknownField: 1, grants: { read: true, write: false, grantedAt: "2026-01-01T00:00:00.000Z", scope: { folderIds: ["folder-a"] } }, receipts: [{ receiptId: "r1", requestId: "q1", capability: "notes.read", status: "ok" }], idempotency: { k1: { result: { note: { id: "n1", body: "SECRET BODY" } }, at: "2026-01-01T00:00:00.000Z" } } })`);
+    check("F9: sanitizer drops unknown fields", !("unknownField" in clean));
+    check("F9: sanitizer migrates the flat Phase 2 grant shape",
+      clean.grants.read.granted === true && clean.grants.read.grantedAt === "2026-01-01T00:00:00.000Z" && clean.grants.read.scope.folderIds[0] === "folder-a",
+      JSON.stringify(clean.grants));
+    check("F9: sanitizer defaults a missing receipt action to invoke",
+      clean.receipts[0].action === "invoke", JSON.stringify(clean.receipts[0]));
+    check("F9: sanitizer redacts bodies in stored idempotency entries",
+      clean.idempotency.k1.result.note.body === "[redacted]", JSON.stringify(clean.idempotency.k1));
+    const big = await fabrixEval(b, `(function () { var o = {}; for (var i = 0; i < 30; i++) o["k" + i] = new Array(301).join("x"); return window.xPinFabrixState.redactResult(o); })()`);
+    check("F9: redactResult caps an oversized result",
+      big && big.redacted === true && Array.isArray(big.keys) && big.keys.length === 30,
+      JSON.stringify(big).slice(0, 120));
+    const b2 = bootFabrix(fabrixSeed());
+    await flush(80);
+    await fabrixEval(b2, `window.xPinFabrix.setEnabled(true)`);
+    await fabrixEval(b2, `window.xPinFabrix.grant("read", { folderIds: ["folder-a"] })`);
+    const saved = b2.storageData["xPin.workspace.v1"];
+    const b3 = bootFabrix({ "xPin.workspace.v1": saved });
+    await flush(80);
+    const status3 = await fabrixEval(b3, `window.xPinFabrix.getStatus()`);
+    check("F9: enabled + grant survive save/load",
+      status3.enabled === true && status3.grants.read === true && status3.scopes.read[0] === "folder-a",
+      JSON.stringify(status3));
+    check("F9: no console errors", b.errors.length === 0 && b3.errors.length === 0,
+      (b.errors.concat(b3.errors)).slice(0, 3).join(" | "));
+  }
+
+  /* F10: crypto helpers — probe, canonical JSON, Ed25519 round-trip */
+  {
+    const b = bootFabrix(null);
+    await flush(80);
+    const probe = await fabrixEval(b, `window.xPinFabrixCrypto.probeEd25519()`);
+    check("F10: Ed25519 probe succeeds in this runtime", probe === true);
+    check("F10: canonical JSON sorts keys recursively",
+      (await fabrixEval(b, `window.xPinFabrixCrypto.canonical({ b: 1, a: { d: 4, c: 3 } })`)) === '{"a":{"c":3,"d":4},"b":1}');
+    const roundTrip = await fabrixEval(b, `(async () => {
+      const pair = await window.xPinFabrixCrypto.generateKeyPair();
+      const pub = await window.xPinFabrixCrypto.importPublicKey(pair.publicKey);
+      const sig = await window.xPinFabrixCrypto.sign(pair.privateKey, { capability: "notes.read" });
+      return window.xPinFabrixCrypto.verify(pub, { capability: "notes.read" }, sig);
+    })()`);
+    check("F10: Ed25519 sign/verify round-trips", roundTrip === true);
+    check("F10: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F11: settings panel renders in the fake DOM — enable, scope, reason */
+  {
+    const b = bootFabrix(fabrixSeed());
+    await flush(80);
+    const { doc, win } = b;
+    await fabrixEval(b, `document.body.append(window.xPinFabrix.renderSettingsSection(document))`);
+    let section = doc.getElementById("fabrix-settings");
+    check("F11: settings panel renders", !!section && section.textContent.includes("fabriX integration"));
+    const enableBtn = [...section.querySelectorAll("button")].find((el) => /Enable fabriX/.test(el.textContent));
+    check("F11: enable button is present", !!enableBtn);
+    clickEl(enableBtn, win);
+    check("F11: clicking Enable enables the adapter",
+      (await fabrixEval(b, `window.xPinFabrix.getStatus()`)).enabled === true);
+    section = doc.getElementById("fabrix-settings");
+    const scopeBoxes = [...doc.querySelectorAll("input")].filter((el) => (el.getAttribute("aria-label") || "").startsWith("Scope fabriX read to folder "));
+    check("F11: panel re-renders with a scope checkbox per folder",
+      scopeBoxes.length === 2 &&
+      scopeBoxes.some((el) => el.getAttribute("aria-label").includes("Folder A")) &&
+      scopeBoxes.some((el) => el.getAttribute("aria-label").includes("Folder B")),
+      scopeBoxes.map((el) => el.getAttribute("aria-label")).join(" | "));
+    const scopeBox = [...doc.querySelectorAll("input")].find((el) => el.getAttribute("aria-label") === "Scope fabriX read to folder Folder A");
+    check("F11: read scope checkbox exists per folder", !!scopeBox);
+    scopeBox.checked = true;
+    scopeBox.dispatchEvent(new win.Event("change", { bubbles: true }));
+    const scopes = (await fabrixEval(b, `window.xPinFabrix.getStatus()`)).scopes;
+    check("F11: checking a scope box limits the read scope", (scopes.read || []).includes("folder-a"), JSON.stringify(scopes));
+    const reasonInput = [...doc.querySelectorAll("input")].find((el) => el.getAttribute("aria-label") === "Write approval reason");
+    check("F11: write reason field exists", !!reasonInput);
+    reasonInput.value = "Hub filing";
+    reasonInput.dispatchEvent(new win.Event("change", { bubbles: true }));
+    const state = await fabrixEval(b, `window.xPinFabrix.getState()`);
+    check("F11: reason is recorded without granting write",
+      state.grants.write.reason === "Hub filing" && state.grants.write.granted === false,
+      JSON.stringify(state.grants.write));
+    check("F11: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* F12: prepare-web copies all 10 adapter files (incl. manifest.json) */
+  {
+    const fileManifest = JSON.parse(fs.readFileSync(REPO + "/integrations/fabrix/manifest.json", "utf8"));
+    execSync("node scripts/prepare-web.mjs", { cwd: REPO, stdio: "pipe" });
+    const built = JSON.parse(fs.readFileSync(REPO + "/www/integrations/fabrix/manifest.json", "utf8"));
+    check("F12: prepare-web copies manifest.json to www/",
+      JSON.stringify(built) === JSON.stringify(fileManifest));
+    const expected = ["state.js", "crypto.js", "permissions.js", "transport.js", "mock-transport.js", "domain.js", "capabilities.js", "adapter.js", "settings.js", "manifest.json"];
+    check("F12: all 10 adapter files land in www/integrations/fabrix/",
+      expected.every((f) => fs.existsSync(REPO + "/www/integrations/fabrix/" + f)),
+      expected.filter((f) => !fs.existsSync(REPO + "/www/integrations/fabrix/" + f)).join(","));
   }
 
   /* report */

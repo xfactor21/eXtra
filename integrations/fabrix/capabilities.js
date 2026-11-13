@@ -32,7 +32,7 @@
     if (tags === null || tags === undefined) return [];
     if (!Array.isArray(tags)) throw D.FabrixError("validation_error", "tags must be an array of #tag names.");
     if (tags.length > 50) throw D.FabrixError("validation_error", "At most 50 tags per call.");
-    return tags.map(function (tag) { return D.optionalTag(tag); });
+    return tags.map(function (tag) { return D.requireTag(tag); });
   }
 
   var handlers = {
@@ -42,8 +42,11 @@
       var tag = D.optionalTag(inputs.tag);
       var folderId = D.optionalId(inputs.folderId, "folderId");
       var limit = D.optionalLimit(inputs.limit);
-      if (folderId !== null) P.requireScope(fabrixState, folderId);
+      if (folderId !== null) P.requireScope(fabrixState, folderId, "notes.search");
       var matches = domain.searchNotes({ query: query, tag: tag, folderId: folderId, limit: limit });
+      // Folder scoping applies to the results too: a scoped grant searched
+      // with no folderId must not leak snippets from outside the scope.
+      matches = matches.filter(function (note) { return P.inScope(fabrixState, note.folderId, "notes.search"); });
       return {
         notes: matches.map(function (note) {
           return {
@@ -63,7 +66,9 @@
       var id = D.requireId(inputs.id, "id");
       var note = domain.readNote(id);
       if (!note) throw D.FabrixError("not_found", "No note with id " + id + ".");
-      P.requireScope(fabrixState, note.folderId);
+      // Out-of-scope reads as not_found: the caller cannot tell an
+      // out-of-scope note from a missing one.
+      P.requireScopeOrNotFound(fabrixState, note.folderId, "notes.read", id);
       return { note: D.publicNote(note, domain) };
     },
 
@@ -74,7 +79,7 @@
       var folderId = D.optionalId(inputs.folderId, "folderId");
       var parentNoteId = D.optionalId(inputs.parentNoteId, "parentNoteId");
       var tags = validateTags(inputs.tags);
-      if (folderId !== null) P.requireScope(fabrixState, folderId);
+      if (folderId !== null) P.requireScope(fabrixState, folderId, "notes.create");
       var finalBody = appendMissingTags(body || "", tags);
       var note = domain.createNote({
         title: title || "",
@@ -106,8 +111,8 @@
       if (inputs.body !== undefined) patch.body = D.requireBody(inputs.body);
       if (inputs.folderId !== undefined) patch.folderId = D.optionalId(inputs.folderId, "folderId");
       var tags = validateTags(inputs.tags);
-      if (patch.folderId !== undefined && patch.folderId !== null) P.requireScope(fabrixState, patch.folderId);
-      P.requireScope(fabrixState, existing.folderId);
+      if (patch.folderId !== undefined && patch.folderId !== null) P.requireScope(fabrixState, patch.folderId, "notes.update");
+      P.requireScopeOrNotFound(fabrixState, existing.folderId, "notes.update", id);
       if (tags.length > 0) {
         var baseBody = patch.body !== undefined ? patch.body : existing.body;
         patch.body = appendMissingTags(baseBody, tags);
@@ -129,15 +134,16 @@
       var ids = [];
       if (inputs.id !== undefined && inputs.id !== null) ids.push(D.requireId(inputs.id, "id"));
       if (Array.isArray(inputs.ids)) {
-        if (inputs.ids.length > 100) throw D.FabrixError("validation_error", "At most 100 notes per export call.");
         inputs.ids.forEach(function (id) { ids.push(D.requireId(id, "id")); });
       }
       if (ids.length === 0) throw D.FabrixError("validation_error", "notes.export requires id or ids.");
+      // The cap is on the combined list: id + 100 ids must not yield 101.
+      if (ids.length > 100) throw D.FabrixError("validation_error", "At most 100 notes per export call.");
       var files = [];
       ids.forEach(function (id) {
         var note = domain.readNote(id);
         if (!note) throw D.FabrixError("not_found", "No note with id " + id + ".");
-        P.requireScope(fabrixState, note.folderId);
+        P.requireScopeOrNotFound(fabrixState, note.folderId, "notes.export", id);
         files.push(domain.exportNote(id, format));
       });
       return { format: format, files: files };
@@ -155,7 +161,7 @@
       var title = D.optionalText(inputs.title, D.limits.maxTitle, "title");
       var note = domain.readNote(id);
       if (!note) throw D.FabrixError("not_found", "No note with id " + id + ".");
-      P.requireScope(fabrixState, note.folderId);
+      P.requireScopeOrNotFound(fabrixState, note.folderId, "artifacts.publish", id);
       // No publish target is configured today (spec §9, P2): the artifact is
       // recorded locally and returned. The adapter never claims an upload.
       var artifact = domain.publishArtifact(id, title === undefined ? null : title);

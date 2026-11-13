@@ -6,10 +6,15 @@
  * first 8 bytes of SHA-256 hex.
  *
  * WebCrypto does not expose Ed25519 in every browser yet, so every function
- * here feature-detects and reports `supported() === false` instead of
- * failing silently. The local loopback transport does not need signing
- * (Bearer token); signing is only needed for the Cloud Bridge pairing /
- * presence / receipt flow, which is not live (see transport.js).
+ * here feature-detects. `supported()` reports WebCrypto presence only — it
+ * does NOT prove Ed25519 availability; use the async `probeEd25519()` for
+ * that (it actually generates a keypair). There is no silent fallback
+ * algorithm: if Ed25519 is unavailable, pairing fails closed with
+ * `crypto_unavailable` (spec §10). The local loopback transport does not
+ * need signing (Bearer token); signing is only needed for the Cloud Bridge
+ * pairing / presence / receipt flow, which is not live and not implemented
+ * (spec §7.3 — deferred to the Cloud Bridge phase, with device identity and
+ * credential-block encryption).
  */
 (function () {
   "use strict";
@@ -21,6 +26,31 @@
 
   function supported() {
     return !!subtle();
+  }
+
+  // Actually proves Ed25519 availability by generating a keypair (cached).
+  // supported() alone only proves WebCrypto exists.
+  var ed25519Probe = null;
+  async function probeEd25519() {
+    if (ed25519Probe !== null) return ed25519Probe;
+    var cryptoSubtle = subtle();
+    if (!cryptoSubtle) {
+      ed25519Probe = false;
+      return false;
+    }
+    try {
+      await cryptoSubtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+      ed25519Probe = true;
+    } catch (error) {
+      ed25519Probe = false;
+    }
+    return ed25519Probe;
+  }
+
+  function cryptoUnavailableError() {
+    var error = new Error("Ed25519 is not available in this browser (WebCrypto missing or Ed25519 unsupported).");
+    error.code = "crypto_unavailable";
+    return error;
   }
 
   // Canonical JSON: object keys sorted recursively; arrays keep order.
@@ -80,15 +110,21 @@
 
   async function generateKeyPair() {
     var cryptoSubtle = subtle();
-    if (!cryptoSubtle) throw new Error("Ed25519 is not available in this browser (WebCrypto missing).");
-    var pair = await cryptoSubtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    if (!cryptoSubtle) throw cryptoUnavailableError();
+    var pair;
+    try {
+      pair = await cryptoSubtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    } catch (error) {
+      throw cryptoUnavailableError();
+    }
     var publicRaw = new Uint8Array(await cryptoSubtle.exportKey("raw", pair.publicKey));
     var privatePkcs8 = new Uint8Array(await cryptoSubtle.exportKey("pkcs8", pair.privateKey));
     return {
       publicKey: base64UrlEncode(publicRaw),
       publicKeyBytes: publicRaw,
       // PKCS#8 is stored only in memory for the session; it is never
-      // persisted in plaintext (see adapter.js pairing flow).
+      // persisted in plaintext. No pairing flow exists yet to consume it
+      // (spec §7.3 — deferred to the Cloud Bridge phase).
       privateKey: pair.privateKey,
       privateKeyPkcs8: base64UrlEncode(privatePkcs8)
     };
@@ -149,6 +185,7 @@
 
   window.xPinFabrixCrypto = Object.freeze({
     supported: supported,
+    probeEd25519: probeEd25519,
     canonical: canonical,
     base64UrlEncode: base64UrlEncode,
     base64UrlDecode: base64UrlDecode,

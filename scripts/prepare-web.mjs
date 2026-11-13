@@ -21,6 +21,7 @@ const webFiles = [
   "integrations/fabrix/capabilities.js",
   "integrations/fabrix/adapter.js",
   "integrations/fabrix/settings.js",
+  "integrations/fabrix/manifest.json",
   "favicon.svg"
 ];
 

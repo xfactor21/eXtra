@@ -59,7 +59,7 @@
         cloud_configured: false,
         cloud_enabled: false,
         products: Object.keys(registered).length + 1,
-        capability_routes: 7
+        capability_routes: { requests: true, receipts: true, invoke: true }
       };
     }
 
@@ -130,12 +130,30 @@
       },
 
       postReceipt: function (receipt) {
-        if (!receipt || typeof receipt.requestId !== "string") {
+        // Accepts both shapes: the adapter sends the cloud-style snake_case
+        // (request_id, receipt_id); tests may send camelCase. Either must
+        // carry a request id.
+        if (!receipt || typeof receipt !== "object") {
           return Promise.reject(FabrixError("validation_error", "Receipt requires a requestId."));
         }
-        var duplicate = receipts.some(function (item) { return item.requestId === receipt.requestId; });
+        var requestId = typeof receipt.requestId === "string" && receipt.requestId
+          ? receipt.requestId
+          : (typeof receipt.request_id === "string" ? receipt.request_id : "");
+        if (!requestId) {
+          return Promise.reject(FabrixError("validation_error", "Receipt requires a requestId."));
+        }
+        var normalized = {
+          requestId: requestId,
+          receiptId: typeof receipt.receiptId === "string" ? receipt.receiptId
+            : (typeof receipt.receipt_id === "string" ? receipt.receipt_id : ""),
+          capability: receipt.capability || "",
+          action: receipt.action || "",
+          status: receipt.status || "",
+          error: receipt.error || ""
+        };
+        var duplicate = receipts.some(function (item) { return item.requestId === requestId; });
         if (duplicate) return Promise.resolve({ ok: true, mock: true, duplicate: true });
-        receipts.push(receipt);
+        receipts.push(normalized);
         return Promise.resolve({ ok: true, mock: true });
       },
 

@@ -13,19 +13,26 @@
 (function () {
   "use strict";
 
+  // The document the panel renders into. renderSettingsSection sets this
+  // from its `doc` argument so test harnesses can pass a fake document;
+  // the live app passes the real one.
+  var activeDoc = typeof document !== "undefined" ? document : null;
+
   function el(tag, className, text) {
-    var node = document.createElement(tag);
+    var node = activeDoc.createElement(tag);
     if (className) node.className = className;
     if (text !== undefined && text !== null) node.textContent = text;
     return node;
   }
 
   function refreshSection(section) {
-    var next = renderSettingsSection(document);
+    var doc = section.ownerDocument || activeDoc;
+    var next = renderSettingsSection(doc);
     section.replaceWith(next);
   }
 
   function renderSettingsSection(doc) {
+    activeDoc = doc || activeDoc;
     var section = el("section", "tools-section");
     section.id = "fabrix-settings";
     section.append(el("h2", "", "fabriX integration"));
@@ -163,21 +170,26 @@
 
     if (status.connected && status.bridge) {
       var bridge = status.bridge;
+      var routes = bridge.capability_routes;
+      var routesText = routes == null ? "?" :
+        (typeof routes === "object" ? Object.keys(routes).filter(function (k) { return routes[k]; }).join(", ") || "none" : String(routes));
       section.append(el("p", "feature-help",
         "Bridge: build " + (bridge.build_id || "?") +
         (bridge.mock ? " (mock)" : "") +
         " · products " + (bridge.products == null ? "?" : bridge.products) +
-        " · capability routes " + (bridge.capability_routes == null ? "?" : bridge.capability_routes) +
+        " · capability routes " + routesText +
         " · cloud " + (bridge.cloud_enabled ? "enabled" : "not enabled") + "."));
     }
 
     // Permissions
     var grantsTitle = el("h3", "", "Permissions (deny by default)");
     section.append(grantsTitle);
+    var folders = [];
+    try { folders = adapter.getFolders() || []; } catch (error) { folders = []; }
     [["read", "Read — notes.search, notes.read, notes.export, projects.list"], ["write", "Write — notes.create, notes.update, artifacts.publish"]].forEach(function (pair) {
       var group = pair[0];
       var label = el("label", "", pair[1]);
-      var box = document.createElement("input");
+      var box = activeDoc.createElement("input");
       box.type = "checkbox";
       box.checked = !!status.grants[group];
       box.setAttribute("aria-label", "Grant fabriX " + group + " permission");
@@ -186,8 +198,59 @@
         else adapter.revoke(group);
         refreshSection(section);
       });
-      label.prepend(box);
+      label.insertBefore(box, label.firstChild || null);
       section.append(label);
+
+      var record = state.grants && state.grants[group];
+      if (record && record.granted) {
+        var meta = "Granted" + (record.grantedAt ? " " + record.grantedAt : "") +
+          (record.grantedBy ? " by " + record.grantedBy : "") +
+          (record.reason ? " — " + record.reason : "");
+        section.append(el("p", "feature-help", meta));
+      }
+
+      // Folder scope: check folders to limit this group to them; no boxes
+      // checked means workspace-wide (labeled as such). Scoping works
+      // before the grant is approved, so it can be set first.
+      if (folders.length > 0) {
+        var scopeLabel = el("p", "feature-help", group === "read" ? "Read scope (no folders checked = whole workspace):" : "Write scope (no folders checked = whole workspace):");
+        section.append(scopeLabel);
+        var scopeList = el("div", "");
+        folders.forEach(function (folder) {
+          var folderLabel = el("label", "", " " + folder.name);
+          var folderBox = activeDoc.createElement("input");
+          folderBox.type = "checkbox";
+          folderBox.checked = (status.scopes[group] || []).indexOf(folder.id) !== -1;
+          folderBox.setAttribute("aria-label", "Scope fabriX " + group + " to folder " + folder.name);
+          folderBox.addEventListener("change", function () {
+            var current = (adapter.getStatus().scopes[group] || []).slice();
+            var at = current.indexOf(folder.id);
+            if (folderBox.checked && at === -1) current.push(folder.id);
+            if (!folderBox.checked && at !== -1) current.splice(at, 1);
+            adapter.setScope(group, current);
+            refreshSection(section);
+          });
+          folderLabel.insertBefore(folderBox, folderLabel.firstChild || null);
+          scopeList.append(folderLabel);
+        });
+        section.append(scopeList);
+      }
+
+      // Write approval carries a reason (spec §6, approve/reject pattern).
+      if (group === "write") {
+        var reasonLabel = el("label", "", "Write approval reason");
+        var reasonInput = el("input", "feature-input");
+        reasonInput.type = "text";
+        reasonInput.value = (record && record.reason) || "";
+        reasonInput.placeholder = "e.g. Allow the Hub to file meeting notes";
+        reasonInput.setAttribute("aria-label", "Write approval reason");
+        reasonInput.addEventListener("change", function () {
+          adapter.setReason("write", reasonInput.value.trim());
+          refreshSection(section);
+        });
+        reasonLabel.append(reasonInput);
+        section.append(reasonLabel);
+      }
     });
     section.append(el("p", "feature-help", "Read never grants write. Grants are revocable here at any time; revocation takes effect immediately. Search returns snippets only — full note bodies need notes.read per note."));
 

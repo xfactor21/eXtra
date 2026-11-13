@@ -45,7 +45,8 @@
     plugins: { enabled: {}, settings: {} },
     // fabriX integration state. The sanitizer lives in integrations/fabrix/state.js;
     // without it (adapter files failed to load) the integration stays disabled.
-    integrations: { fabrix: sanitizeFabrixState(null) },
+    // sanitizeFabrixState already returns the { fabrix: ... } wrapper.
+    integrations: sanitizeFabrixState(null),
     extensions: [],
     marketplaceDirs: [],
     templates: seedTemplates(),
@@ -3781,6 +3782,15 @@
   function createNoteRecord({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
     // Data-only create (no view switch, no focus, no toast). Used by the
     // fabriX adapter; the UI path (createNote) is unchanged.
+    // Validate folder/parent here with the adapter's error codes: the
+    // builder below throws plain Error/TypeError, which the adapter would
+    // surface as internal_error.
+    if (folderId !== null && !state.folders.some((folder) => folder.id === folderId)) {
+      throw fabrixDomainError("validation_error", "Unknown xPin folder: " + folderId);
+    }
+    if (parentNoteId !== null && !state.notes.some((note) => note.id === parentNoteId)) {
+      throw fabrixDomainError("validation_error", "Unknown xPin parent page: " + parentNoteId);
+    }
     const note = buildNoteRecord({ title, body, folderId, parentNoteId, metadata });
     state.notes.push(note);
     pluginManager?.emit("note:created", { ...note });
@@ -3959,6 +3969,7 @@
       exportNote: exportNoteRecord,
       listProjects: listProjectRecords,
       publishArtifact: publishArtifactRecord,
+      listFolders: () => state.folders.map((folder) => ({ id: folder.id, name: folder.name })),
       extractTags,
       findNoteByTitleOrId: (target) => {
         if (typeof target !== "string") return null;
@@ -4497,8 +4508,13 @@
   });
   // fabriX adapter: hand it the domain + persisted state. The adapter does
   // nothing until the user enables it in Settings (flag defaults to OFF).
+  // Guarded: a failed adapter attach must never abort boot.
   if (window.xPinFabrix && typeof window.xPinFabrix.attachDomain === "function") {
-    window.xPinFabrix.attachDomain(createFabrixDomain(), state.integrations.fabrix);
+    try {
+      window.xPinFabrix.attachDomain(createFabrixDomain(), state.integrations.fabrix);
+    } catch (error) {
+      console.warn("fabriX adapter failed to attach; the app continues standalone.", error);
+    }
   }
   setupEvents();
   render();

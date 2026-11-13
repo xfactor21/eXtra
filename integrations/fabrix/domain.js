@@ -12,10 +12,14 @@
 (function () {
   "use strict";
 
+  // Keys are stored normalized: lowercase with _ and - stripped, so
+  // camelCase variants (accessToken, clientSecret, refreshToken, privateKey)
+  // match the same entries as their snake_case forms. Mirrors the Cloud
+  // Bridge protocol's `payloadContainsSecret` (cloudprotocol/types.go).
   var SECRET_KEYS = [
-    "token", "access_token", "refresh_token", "api_key", "apikey", "secret",
-    "client_secret", "password", "authorization", "cookie", "credential",
-    "credentials", "private_key"
+    "token", "accesstoken", "refreshtoken", "apikey", "secret",
+    "clientsecret", "password", "authorization", "cookie", "credential",
+    "credentials", "privatekey"
   ];
 
   var MAX_TITLE = 120;
@@ -31,7 +35,7 @@
   }
 
   function normalizeKey(key) {
-    return String(key).toLowerCase().replace(/-/g, "_").trim();
+    return String(key).toLowerCase().replace(/[_-]/g, "").trim();
   }
 
   function isSecretKey(key) {
@@ -123,6 +127,16 @@
     return value.toLowerCase();
   }
 
+  // Like optionalTag, but null/undefined inside an array is an error, not
+  // "absent" — validateTags must reject [null] instead of letting undefined
+  // through to appendMissingTags (which would crash on toLowerCase).
+  function requireTag(value) {
+    if (value === null || value === undefined) {
+      throw FabrixError("validation_error", "tag must use a #tag name.");
+    }
+    return optionalTag(value);
+  }
+
   function snippet(body, query) {
     var text = String(body || "").replace(/\s+/g, " ").trim();
     if (!query) return text.slice(0, 200);
@@ -194,6 +208,7 @@
     requireBody: requireBody,
     optionalLimit: optionalLimit,
     optionalTag: optionalTag,
+    requireTag: requireTag,
     snippet: snippet,
     extractLinks: extractLinks,
     provenance: provenance,

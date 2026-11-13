@@ -21,7 +21,6 @@
 (function () {
   "use strict";
 
-  var D = window.xPinFabrixDomain;
   var P = window.xPinFabrixPermissions;
   var T = window.xPinFabrixTransport;
 
@@ -54,13 +53,14 @@
     }
   }
 
-  function recordReceipt(requestId, capability, status, errorMessage) {
+  function recordReceipt(requestId, capability, action, status, errorMessage) {
     if (!fabrixState) return null;
     var now = new Date().toISOString();
     var receipt = {
       receiptId: "receipt_" + T.randomToken(8),
       requestId: requestId,
       capability: capability,
+      action: action || "invoke",
       status: status,
       startedAt: now,
       completedAt: now,
@@ -81,7 +81,12 @@
 
   function storeIdempotency(requestId, result) {
     if (!fabrixState) return;
-    fabrixState.idempotency[requestId] = { result: result, at: new Date().toISOString() };
+    // The log stores a redacted summary only (state.js redactResult): no
+    // note bodies, ≤ 4 KB per entry. A replay returns that summary.
+    fabrixState.idempotency[requestId] = {
+      result: window.xPinFabrixState.redactResult(result),
+      at: new Date().toISOString()
+    };
     var keys = Object.keys(fabrixState.idempotency);
     var max = window.xPinFabrixState.limits.maxIdempotencyEntries;
     if (keys.length > max) {
@@ -107,7 +112,14 @@
       enabled: fabrixState.enabled === true,
       connected: !!(transport && transport.isConnected()),
       transport: fabrixState.transport,
-      grants: { read: !!fabrixState.grants.read, write: !!fabrixState.grants.write },
+      grants: {
+        read: !!(fabrixState.grants.read && fabrixState.grants.read.granted),
+        write: !!(fabrixState.grants.write && fabrixState.grants.write.granted)
+      },
+      scopes: {
+        read: (fabrixState.grants.read && fabrixState.grants.read.scope && fabrixState.grants.read.scope.folderIds) || [],
+        write: (fabrixState.grants.write && fabrixState.grants.write.scope && fabrixState.grants.write.scope.folderIds) || []
+      },
       receipts: fabrixState.receipts.length,
       polling: pollTimer !== null,
       bridge: lastBridgeStatus,
@@ -132,11 +144,36 @@
     return getStatus();
   }
 
-  function grant(group) {
+  function grant(group, options) {
     requireAttached();
-    fabrixState = P.grant(fabrixState, group);
+    fabrixState = P.grant(fabrixState, group, options || {});
     persist();
     return getStatus();
+  }
+
+  function setScope(group, folderIds) {
+    requireAttached();
+    fabrixState = P.setScope(fabrixState, group, folderIds);
+    persist();
+    return getStatus();
+  }
+
+  function setReason(group, reason) {
+    requireAttached();
+    fabrixState = P.setReason(fabrixState, group, reason);
+    persist();
+    return getStatus();
+  }
+
+  function getFolders() {
+    requireAttached();
+    return domain.listFolders ? domain.listFolders() : [];
+  }
+
+  // Diagnostics / test hook: the live transport instance (or null). Used by
+  // the smoke suite to enqueue mock Bridge requests for pollOnce().
+  function getTransport() {
+    return transport;
   }
 
   function revoke(group) {
@@ -224,8 +261,33 @@
       : requestId;
     var startedAt = new Date().toISOString();
 
+    // Validate BEFORE the replay check: a stored result must never be
+    // served to a caller who no longer holds the grant, after the
+    // integration was disabled, or with credential-shaped inputs. The
+    // checks are re-run inside execute() as well; these are the gate.
+    if (fabrixState.enabled !== true) {
+      var disabledError = FabrixError("permission_denied", "The fabriX integration is disabled.");
+      recordReceipt(requestId, capability, "invoke", "denied", disabledError.message);
+      persist();
+      return Promise.reject(disabledError);
+    }
+    try {
+      P.requireGrant(fabrixState, capability);
+      window.xPinFabrixDomain.requireNoCredentialField(inputs || {});
+    } catch (error) {
+      var code = (error && error.code) || "internal_error";
+      var message = error && error.message ? error.message : "Unknown error.";
+      recordReceipt(requestId, capability, "invoke", code === "permission_denied" ? "denied" : "error", message);
+      persist();
+      return Promise.reject(error);
+    }
+
     var replayed = checkIdempotency(idempotencyKey);
     if (replayed !== null) {
+      // A replay is still a served call: record a receipt for it.
+      var replayReceipt = recordReceipt(requestId, capability, "invoke", "ok", "");
+      replayReceipt.startedAt = startedAt;
+      persist();
       return Promise.resolve({ requestId: requestId, status: "ok", result: replayed, replayed: true });
     }
 
@@ -233,14 +295,14 @@
     try {
       result = window.xPinFabrixCapabilities.execute(domain, fabrixState, capability, inputs || {}, { requestId: requestId });
     } catch (error) {
-      var code = (error && error.code) || "internal_error";
-      var message = error && error.message ? error.message : "Unknown error.";
-      recordReceipt(requestId, capability, code === "permission_denied" ? "denied" : "error", message);
+      var execCode = (error && error.code) || "internal_error";
+      var execMessage = error && error.message ? error.message : "Unknown error.";
+      recordReceipt(requestId, capability, "invoke", execCode === "permission_denied" ? "denied" : "error", execMessage);
       persist();
       return Promise.reject(error);
     }
     storeIdempotency(idempotencyKey, result);
-    var receipt = recordReceipt(requestId, capability, "ok", "");
+    var receipt = recordReceipt(requestId, capability, "invoke", "ok", "");
     receipt.startedAt = startedAt;
     persist();
     return Promise.resolve({ requestId: requestId, status: "ok", result: result });
@@ -260,15 +322,23 @@
       var chain = Promise.resolve();
       pending.forEach(function (request) {
         chain = chain.then(function () {
+          // Malformed Bridge requests are skipped, never executed: a
+          // request without an id or a capability cannot be receipted
+          // without an undefined request_id.
+          if (!request || typeof request.requestId !== "string" || !request.requestId ||
+              typeof request.capability !== "string" || !request.capability) {
+            outcomes.push({ requestId: null, status: "skipped", error: "Malformed Bridge request (missing requestId or capability)." });
+            return null;
+          }
           return invoke(request.capability, request.inputs || {}, {
             requestId: request.requestId,
             idempotencyKey: request.idempotencyKey
           }).then(function (response) {
             outcomes.push({ requestId: request.requestId, status: "ok" });
-            return postReceiptFor(request, "ok", response.result, "");
+            return postReceiptFor(request, "ok", "");
           }).catch(function (error) {
             outcomes.push({ requestId: request.requestId, status: "error", error: error && error.message });
-            return postReceiptFor(request, "error", null, error && error.message ? error.message : "Unknown error.");
+            return postReceiptFor(request, "error", error && error.message ? error.message : "Unknown error.");
           });
         });
       });
@@ -278,7 +348,9 @@
     });
   }
 
-  function postReceiptFor(request, status, result, errorMessage) {
+  // Bridge receipts carry NO result and NO note bodies (spec §6). Only the
+  // outcome is reported: request, capability, action, status, error.
+  function postReceiptFor(request, status, errorMessage) {
     if (!transport || typeof transport.postReceipt !== "function") return Promise.resolve(null);
     var receipt = {
       receipt_id: "receipt_" + T.randomToken(8),
@@ -286,8 +358,8 @@
       account_id: "",
       device_id: fabrixState.cloud.deviceId || "xpin",
       capability: request.capability,
+      action: "invoke",
       status: status,
-      result: result || undefined,
       error: errorMessage || undefined,
       started_at: new Date().toISOString(),
       completed_at: new Date().toISOString(),
@@ -337,6 +409,17 @@
   }
 
   function embeddedManifest() {
+    // Descriptions match manifest.json exactly (the file is the source of
+    // truth; the Phase 3 tests assert the two match).
+    var descriptions = {
+      "notes.search": "Search notes by text, tag, folder. Returns snippets only.",
+      "notes.read": "Read one note by stable id, with tags, links, and provenance.",
+      "notes.create": "Create a note (title, body, folder, parent, tags).",
+      "notes.update": "Update title/body/folder/tags of one note. Supports expectedUpdatedAt conflict checks.",
+      "notes.export": "Export one or more notes as Markdown or rendered HTML.",
+      "projects.list": "List xPin databases (projects) — metadata only, no row values.",
+      "artifacts.publish": "Publish a note as a static page artifact (local record; no upload target configured)."
+    };
     return {
       id: "xpin",
       name: "xPin",
@@ -351,7 +434,7 @@
         adapterVersion: "1.0.0",
         protocolVersion: "1.0",
         capabilities: window.xPinFabrixCapabilities.capabilityNames.map(function (name) {
-          return { name: name, risk: P.groupOf(name), description: "" };
+          return { name: name, risk: P.groupOf(name), description: descriptions[name] || "" };
         })
       }
     };
@@ -378,6 +461,10 @@
     getStatus: getStatus,
     setEnabled: setEnabled,
     grant: grant,
+    setScope: setScope,
+    setReason: setReason,
+    getFolders: getFolders,
+    getTransport: getTransport,
     revoke: revoke,
     setTransport: setTransport,
     connect: connect,
