@@ -481,6 +481,9 @@ function buildContext(seedStorage, opts) {
   // Phase 1: test-only marketplace public-key override (lets the suite sign
   // mock indexes with its own keypair); the app never sets this itself.
   if (opts && opts.marketplacePublicKey) win.__xPinMarketplacePublicKey = opts.marketplacePublicKey;
+  // Google sign-in test override: lets the suite boot with a client id
+  // (the app's baked-in GOOGLE_CLIENT_ID is empty until the owner sets it).
+  if (opts && opts.googleClientId) win.xPinGoogleClientIdOverride = opts.googleClientId;
   win.history = { replaceState() {}, pushState() {} };
   win.innerWidth = 1280; win.innerHeight = 800; win.devicePixelRatio = 1;
   win.requestAnimationFrame = (fn) => setTimeout(fn, 0);
@@ -2284,6 +2287,88 @@ async function main() {
     const applied = await S.applyEnvelopes(pulled, local, key, []);
     check("T47: pulled envelope merges", applied.results[0].outcome === "inserted" && local.notes[0].body === "via relay");
     check("T47: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T77 (Google sign-in): button hidden without a client id; with one, the
+   * stubbed GIS flow signs in, the transport carries the token, and a 401
+   * clears it so the next sync asks to sign in again. */
+  {
+    const click = (el, win) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const openSyncSettings = async (b) => {
+      click(b.doc.querySelector('[data-feature-view="settings"]'), b.win);
+      await flush(150);
+    };
+    // No client id configured: no sign-in button, short note instead.
+    {
+      const b = boot(null);
+      await flush(120);
+      await openSyncSettings(b);
+      check("T77: no sign-in button when Google is not configured",
+        !b.doc.querySelector('[data-action="google-signin"]'));
+      const note = b.doc.querySelector('[data-google-note="unconfigured"]');
+      check("T77: unconfigured note is shown instead",
+        !!note && /isn't configured/.test(note.textContent), note ? note.textContent : "no note");
+      check("T77: no console errors (unconfigured)", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+    }
+    // Client id configured: button appears; stubbed GIS signs in; the
+    // transport sends the token; a 401 clears it again.
+    {
+      const b = boot(null, { googleClientId: "test-client.apps.googleusercontent.com" });
+      await flush(120);
+      const seenHeaders = [];
+      b.win.fetch = async (url, opts) => {
+        seenHeaders.push({ url: String(url), auth: (opts?.headers || {}).Authorization || null });
+        const u = String(url);
+        if (u.endsWith("/v1/sync/push")) {
+          return { ok: false, status: 401, json: async () => ({ ok: false, error: "unauthorized" }) };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      };
+      // Stub GIS: prompt() immediately delivers a fake credential to the
+      // callback initialize() registered (real GIS calls it after the user
+      // picks an account in its popup).
+      const fakePayload = b.win.btoa(JSON.stringify({ email: "test@example.com", name: "Test User" }));
+      b.win.google = { accounts: { id: {
+        initialize(opts) { b.win.__gisCallback = opts.callback; },
+        prompt() { b.win.__gisCallback({ credential: `header.${fakePayload}.sig` }); }
+      } } };
+      await openSyncSettings(b);
+      const signInBtn = b.doc.querySelector('[data-action="google-signin"]');
+      check("T77: sign-in button appears when a client id is configured", !!signInBtn);
+      click(signInBtn, b.win);
+      await flush(150);
+      const signedIn = b.doc.querySelector('[data-google-note="signed-in"]');
+      check("T77: stubbed GIS sign-in shows the account",
+        !!signedIn && /test@example.com/.test(signedIn.textContent),
+        signedIn ? signedIn.textContent : "not signed in");
+      check("T77: sign-out button appears once signed in",
+        !!b.doc.querySelector('[data-action="google-signout"]'));
+      // Transport carries the token on push and pull.
+      const T = b.win.xPinSyncTransports;
+      const relay = T.createHttpRelayTransport("http://127.0.0.1:8787", { getIdToken: () => "test-id-token" });
+      let threw = "";
+      try { await relay.push([]); } catch (e) { threw = `${e.code}:${e.message}`; }
+      check("T77: transport sends the Authorization header",
+        seenHeaders.some((h) => h.auth === "Bearer test-id-token"),
+        JSON.stringify(seenHeaders));
+      check("T77: a 401 surfaces as unauthorized, not a generic transport error",
+        threw.startsWith("unauthorized:"), threw);
+      // Full syncNow path: set the passphrase, sync, get a 401, token cleared.
+      const passInput = b.doc.querySelector('#sync-section input[aria-label="Sync passphrase"]');
+      passInput.value = "correct-horse-battery-staple";
+      click(b.doc.querySelector('[data-action="sync-set-passphrase"]'), b.win);
+      await flush(900);
+      click(b.doc.querySelector('[data-action="sync-now"]'), b.win);
+      await flush(500);
+      check("T77: sync with a 401 flips back to the sign-in button",
+        !!b.doc.querySelector('[data-action="google-signin"]') &&
+        !b.doc.querySelector('[data-google-note="signed-in"]'));
+      // The 401 is an expected outcome, so the app logs exactly one error
+      // for it ("Sync failed ... sign in with Google again") and nothing else.
+      check("T77: only console error is the expected 401 log",
+        b.errors.length === 1 && /Sync failed/.test(b.errors[0]) && /sign in with Google again/.test(b.errors[0]),
+        b.errors.slice(0, 3).join(" | "));
+    }
   }
 
   /* T48 (Phase 1): capture token generate/revoke + xpin:// deep links */

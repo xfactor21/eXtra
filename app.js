@@ -9,6 +9,14 @@
   // instead. Envelopes are E2EE — the relay holds no keys and never sees
   // note content — and nothing syncs until you unlock with your passphrase.
   const DEFAULT_RELAY_URL = "https://xpin-sync-relay.vercel.app/api";
+  // Google sign-in for the relay (interim auth before Cloud Bridge). Empty
+  // until the owner supplies the real OAuth client id — never invent one.
+  // A pre-boot override (window.xPinGoogleClientIdOverride) lets tests and
+  // self-hosters inject their own client id without editing this file.
+  const GOOGLE_CLIENT_ID = (typeof window.xPinGoogleClientIdOverride === "string" &&
+    window.xPinGoogleClientIdOverride.trim())
+    ? window.xPinGoogleClientIdOverride.trim().slice(0, 200)
+    : "";
   // M4 — storage: IndexedDB is the primary store, localStorage keeps a backup
   // copy of the same JSON so one corrupt value cannot wipe the workspace.
   const IDB_NAME = "xpin";
@@ -236,6 +244,12 @@
   let phase3UI = null;
   // Phase 1 — sync session state (in-memory only; never persisted).
   let syncSessionKey = null;
+  // Google sign-in for the relay (interim auth before Cloud Bridge). The ID
+  // token only proves who you are to the relay — the passphrase still
+  // encrypts every envelope. Held in memory for this session only, cleared
+  // on Lock alongside the passphrase key. Never persisted.
+  let googleIdToken = null;
+  let googleProfile = null; // {email, name} decoded from the token, display only
   let captureTokenVisibleOnce = null; // token text shown once after generation
   let activeCommandIndex = 0;
   let canvasViewportState = { x: 0, y: 0, zoom: 1 };
@@ -5491,8 +5505,114 @@
 
   function lockSyncSession() {
     syncSessionKey = null;
+    googleIdToken = null;
+    googleProfile = null;
     window.xPinCredentials.lock();
     showToast("Sync locked. Enter your passphrase to sync again.");
+  }
+
+  // Google sign-in (Google Identity Services). The ID token is only the
+  // relay's "who is this" check — it never sees note content. The script
+  // loads lazily on the first sign-in attempt, never on page load, and the
+  // rendered Google button is what the user actually taps (GIS handles the
+  // account chooser in its own popup). Returns true on a successful sign-in.
+  function decodeGoogleProfile(token) {
+    try {
+      const payload = JSON.parse(atob(String(token).split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+      return {
+        email: typeof payload.email === "string" ? payload.email : null,
+        name: typeof payload.name === "string" ? payload.name : null
+      };
+    } catch {
+      return { email: null, name: null };
+    }
+  }
+
+  function ensureGoogleScript() {
+    if (window.google?.accounts?.id) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+      // The script may never load (offline, blocked) — time out instead of
+      // hanging the sign-in attempt forever.
+      setTimeout(() => finish(Boolean(window.google?.accounts?.id)), 15000);
+      try {
+        const script = document.createElement("script");
+        script.src = "https://accounts.google.com/gsi/client";
+        script.async = true;
+        script.defer = true;
+        script.onload = () => finish(Boolean(window.google?.accounts?.id));
+        script.onerror = () => finish(false);
+        (document.head || document.documentElement).appendChild(script);
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  async function signInWithGoogle() {
+    if (!GOOGLE_CLIENT_ID) {
+      showToast("Google sign-in isn't configured in this build yet.");
+      return false;
+    }
+    const loaded = await ensureGoogleScript();
+    if (!loaded || !window.google?.accounts?.id) {
+      showToast("Google sign-in could not load. Check your connection and try again.");
+      return false;
+    }
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: (response) => {
+          const token = response?.credential;
+          if (typeof token === "string" && token) {
+            googleIdToken = token;
+            googleProfile = decodeGoogleProfile(token);
+            renderCoreToolsSections(true);
+            showToast(googleProfile?.email
+              ? `Signed in with Google as ${googleProfile.email}.`
+              : "Signed in with Google.");
+            finish(true);
+          } else {
+            showToast("Google sign-in did not return a credential.");
+            finish(false);
+          }
+        }
+      });
+      // The rendered Google button opens the account chooser; this prompt
+      // call is the fallback path GIS offers for One Tap. Only act on
+      // skipped/dismissed/not-displayed moments — a displayed prompt is
+      // still waiting on the user, not a failure.
+      try {
+        window.google.accounts.id.prompt((notification) => {
+          if (done) return;
+          let terminal = false;
+          try {
+            terminal = Boolean(
+              (typeof notification?.isSkippedMoment === "function" && notification.isSkippedMoment()) ||
+              (typeof notification?.isDismissedMoment === "function" && notification.isDismissedMoment()) ||
+              (typeof notification?.isNotDisplayedMoment === "function" && notification.isNotDisplayedMoment())
+            );
+          } catch { terminal = false; }
+          if (terminal) {
+            showToast("Google sign-in didn't open — try again when ready.");
+            finish(false);
+          }
+        });
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  function signOutGoogle() {
+    googleIdToken = null;
+    googleProfile = null;
+    try { window.google?.accounts?.id?.disableAutoSelect?.(); } catch { /* ignore */ }
+    renderCoreToolsSections(true);
+    showToast("Signed out of Google. Relay sync will ask you to sign in again.");
   }
 
   // Build one envelope per live note (fresh lamport each) plus one tombstone
@@ -5536,7 +5656,10 @@
       let relayUsed = false;
       if (state.sync.relayUrl) {
         relayUsed = true;
-        const relay = window.xPinSyncTransports.createHttpRelayTransport(state.sync.relayUrl);
+        const relay = window.xPinSyncTransports.createHttpRelayTransport(
+          state.sync.relayUrl,
+          { getIdToken: () => googleIdToken }
+        );
         await relay.push(envelopes);
         pulled = await relay.pull(state.sync.lastSyncLamport ?? 0);
       }
@@ -5574,7 +5697,17 @@
       persistWorkspace();
       renderCoreToolsSections(true);
       pluginManager?.emit("sync:completed", { error: String(error.message || error).slice(0, 300) });
-      showToast(error.message || "Sync could not complete.");
+      // 401 from the relay: the Google token is gone or expired. Drop it
+      // so the next sync asks for a fresh sign-in instead of retrying
+      // a dead token.
+      if (error.code === "unauthorized") {
+        googleIdToken = null;
+        googleProfile = null;
+        renderCoreToolsSections(true);
+        showToast("Sign in again.");
+      } else {
+        showToast(error.message || "Sync could not complete.");
+      }
       return false;
     }
   }
@@ -5830,6 +5963,39 @@
     lockButton.addEventListener("click", () => { lockSyncSession(); renderCoreToolsSections(true); });
     passphraseRow.append(passphraseInput, setPassphrase, lockButton);
     section.append(passphraseRow);
+    // Google sign-in for the relay (interim auth before Cloud Bridge).
+    // The token only proves who you are to the relay; the passphrase
+    // still encrypts every envelope, and bundles work with no account.
+    const googleRow = document.createElement("div");
+    googleRow.className = "backup-actions";
+    if (!GOOGLE_CLIENT_ID) {
+      const note = document.createElement("p");
+      note.setAttribute("data-google-note", "unconfigured");
+      note.textContent = "Google sign-in isn't configured in this build yet.";
+      googleRow.append(note);
+    } else if (googleIdToken) {
+      const signedIn = document.createElement("p");
+      signedIn.setAttribute("data-google-note", "signed-in");
+      signedIn.textContent = googleProfile?.email
+        ? `Signed in with Google as ${googleProfile.email}.`
+        : "Signed in with Google.";
+      const signOut = document.createElement("button");
+      signOut.type = "button";
+      signOut.className = "feature-button";
+      signOut.textContent = "Sign out";
+      signOut.dataset.action = "google-signout";
+      signOut.addEventListener("click", () => signOutGoogle());
+      googleRow.append(signedIn, signOut);
+    } else {
+      const signIn = document.createElement("button");
+      signIn.type = "button";
+      signIn.className = "feature-button";
+      signIn.textContent = "Sign in with Google";
+      signIn.dataset.action = "google-signin";
+      signIn.addEventListener("click", () => { signInWithGoogle(); });
+      googleRow.append(signIn);
+    }
+    section.append(googleRow);
     const relayRow = document.createElement("div");
     relayRow.className = "backup-actions";
     const relayInput = document.createElement("input");

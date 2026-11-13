@@ -37,8 +37,27 @@
     }
   };
 
-  function createHttpRelayTransport(relayUrl) {
+  function createHttpRelayTransport(relayUrl, options) {
     const url = typeof relayUrl === "string" ? relayUrl.trim().replace(/\/+$/, "") : "";
+    // Google sign-in (interim relay auth): when the app holds an ID token,
+    // getIdToken() returns it fresh per request and it rides along as a
+    // Bearer token. No token = no header; the relay decides what that means
+    // (open mode accepts it; auth mode answers 401).
+    const getIdToken = options && typeof options.getIdToken === "function"
+      ? options.getIdToken
+      : null;
+    function authHeaders(extra) {
+      const headers = { ...(extra || {}) };
+      let token = null;
+      try { token = getIdToken ? getIdToken() : null; } catch { token = null; }
+      if (typeof token === "string" && token) headers.Authorization = `Bearer ${token}`;
+      return headers;
+    }
+    function unauthorizedError() {
+      const error = new Error("Relay sign-in expired or missing — sign in with Google again.");
+      error.code = "unauthorized";
+      return error;
+    }
     return {
       name: "http-relay",
       url: url || null,
@@ -50,7 +69,7 @@
         try {
           response = await fetch(`${url}/v1/sync/push`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: authHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ envelopes })
           });
         } catch (error) {
@@ -59,6 +78,7 @@
           throw err;
         }
         if (!response.ok) {
+          if (response.status === 401) throw unauthorizedError();
           const err = new Error(`Sync relay push failed (HTTP ${response.status}).`);
           err.code = "transport_unavailable";
           throw err;
@@ -85,7 +105,7 @@
         try {
           response = await fetch(`${url}/v1/sync/pull?since=${sinceValue}`, {
             method: "GET",
-            headers: { Accept: "application/json" }
+            headers: authHeaders({ Accept: "application/json" })
           });
         } catch (error) {
           const err = new Error(`Sync relay is unreachable: ${error.message}`);
@@ -93,6 +113,7 @@
           throw err;
         }
         if (!response.ok) {
+          if (response.status === 401) throw unauthorizedError();
           const err = new Error(`Sync relay pull failed (HTTP ${response.status}).`);
           err.code = "transport_unavailable";
           throw err;
