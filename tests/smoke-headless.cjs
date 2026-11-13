@@ -1646,6 +1646,263 @@ async function main() {
     check("T36: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
   }
 
+  /* T37 (Phase 0, M2): delete soft-deletes to Trash; restore brings it back; Ctrl+Z undoes a delete */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    const stored = () => JSON.parse(b.storageData["xPin.workspace.v1"]);
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "TrashMe");
+    type(doc.getElementById("note-body"), "do not lose me");
+    await flush(100);
+    click(doc.getElementById("delete-note"));
+    await flush(100);
+    check("T37: delete moves the note to Trash, not out of existence",
+      !stored().notes.some((n) => n.title === "TrashMe") &&
+      stored().trash.some((n) => n.title === "TrashMe" && n.body === "do not lose me"),
+      JSON.stringify({ notes: stored().notes.length, trash: stored().trash.length }));
+    check("T37: delete toast says Trash, not permanent loss",
+      doc.getElementById("toast").textContent.includes("Trash"), doc.getElementById("toast").textContent);
+    check("T37: sidebar Trash count is 1",
+      doc.getElementById("trash-count").textContent === "1", doc.getElementById("trash-count").textContent);
+    click(doc.querySelector('[data-filter="trash"]'));
+    await flush(100);
+    check("T37: Trash view lists the deleted note",
+      !!doc.querySelector(".trash-row") && doc.querySelector(".trash-row").textContent.includes("TrashMe"),
+      doc.getElementById("note-list").textContent.slice(0, 120));
+    click(doc.querySelector(".trash-restore"));
+    await flush(100);
+    check("T37: restore returns the note to the workspace",
+      stored().notes.some((n) => n.title === "TrashMe") && stored().trash.length === 0,
+      JSON.stringify({ notes: stored().notes.length, trash: stored().trash.length }));
+    click(doc.getElementById("delete-note"));
+    await flush(100);
+    check("T37: second delete re-trashes the note", stored().trash.length === 1,
+      JSON.stringify(stored().trash.length));
+    doc.getElementById("delete-note").focus(); // move focus out of the title input so Ctrl+Z is app undo, not text undo
+    doc.dispatchEvent(new win.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+    await flush(100);
+    check("T37: Ctrl+Z undoes the delete",
+      stored().notes.some((n) => n.title === "TrashMe") && stored().trash.length === 0,
+      JSON.stringify({ notes: stored().notes.length, trash: stored().trash.length }));
+    check("T37: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T38 (Phase 0, M2): editing a note builds a version history; restoring one brings the old body back */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    const stored = () => JSON.parse(b.storageData["xPin.workspace.v1"]);
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Versioned");
+    type(doc.getElementById("note-body"), "v1");
+    await flush(2300); // debounced autosave persists v1
+    type(doc.getElementById("note-body"), "v2");
+    await flush(2300); // autosave persists v2 and snapshots v1 as a version
+    const note = stored().notes.find((n) => n.title === "Versioned");
+    check("T38: one version kept, holding the earlier body",
+      note && note.versions.length === 1 && note.versions[0].body === "v1",
+      JSON.stringify(note && note.versions));
+    // Re-select the note so the editor (with its version history) renders.
+    const otherRow = [...doc.querySelectorAll(".note-row")].find((row) => !row.textContent.includes("Versioned"));
+    click(otherRow);
+    await flush(100);
+    const mineRow = [...doc.querySelectorAll(".note-row")].find((row) => row.textContent.includes("Versioned"));
+    click(mineRow);
+    await flush(100);
+    check("T38: version history is visible in the editor",
+      !!doc.querySelector(".version-history") &&
+      doc.querySelector(".version-history").textContent.includes("Version history · 1"),
+      (doc.querySelector(".version-history") || { textContent: "missing" }).textContent);
+    click(doc.querySelector(".version-restore"));
+    await flush(100);
+    check("T38: restoring the version brings back the old body",
+      doc.getElementById("note-body").value === "v1", doc.getElementById("note-body").value);
+    check("T38: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T39 (Phase 0, M3): per-note .md export carries frontmatter; the workspace .zip is a real zip */
+  {
+    const b0 = boot(null);
+    await flush(120);
+    const ws = JSON.parse(b0.storageData["xPin.workspace.v1"]);
+    ws.notes[0].title = "Export Me";
+    ws.notes[0].body = "# Hello\n\nWorld";
+    ws.notes[0].metadata = { status: "In progress", due: "2026-11-20" };
+    const b = boot({ "xPin.workspace.v1": JSON.stringify(ws) });
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.querySelector('[data-feature-view="settings"]'));
+    await flush(100);
+    const before = b.createdURLs.length;
+    click(doc.querySelector('[data-action="markdown-note"]'));
+    await flush(100);
+    const md = b.createdURLs[b.createdURLs.length - 1];
+    check("T39: per-note export downloads a .md blob",
+      b.createdURLs.length === before + 1 && typeof md.parts[0] === "string",
+      String(b.createdURLs.length - before));
+    check("T39: exported .md has frontmatter properties, title, and body",
+      /status: "In progress"/.test(md.parts[0]) && /due: "2026-11-20"/.test(md.parts[0]) &&
+      /# Export Me/.test(md.parts[0]) && /# Hello/.test(md.parts[0]),
+      md.parts[0].slice(0, 200));
+    click(doc.querySelector('[data-action="markdown-zip"]'));
+    await flush(100);
+    const zip = b.createdURLs[b.createdURLs.length - 1].parts[0];
+    // NB: the blob bytes live in the vm realm, so ArrayBuffer.isView (not instanceof) identifies them.
+    const isZip = ArrayBuffer.isView(zip) && zip[0] === 0x50 && zip[1] === 0x4b && zip[2] === 0x03 && zip[3] === 0x04;
+    const nameLen = isZip ? zip[26] | (zip[27] << 8) : 0;
+    const firstName = isZip ? Buffer.from(zip.slice(30, 30 + nameLen)).toString() : "";
+    check("T39: workspace export is a real zip whose first entry is a .md file",
+      isZip && firstName.endsWith(".md") && zip.length > 100,
+      `${firstName} (${zip.length} bytes)`);
+    check("T39: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T40 (Phase 0, M4): without IndexedDB the app falls back to localStorage and says so in the UI */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc } = b;
+    check("T40: fake DOM has no IndexedDB (the fallback condition)",
+      typeof b.win.indexedDB === "undefined", typeof b.win.indexedDB);
+    const indicator = doc.querySelector(".sync-card small").textContent;
+    check("T40: sidebar storage indicator names the localStorage fallback and a size",
+      /localStorage/.test(indicator) && /KB|MB/.test(indicator), indicator);
+    check("T40: workspace still persists to localStorage",
+      !!b.storageData["xPin.workspace.v1"] &&
+      JSON.parse(b.storageData["xPin.workspace.v1"]).notes.length >= 4,
+      String(Object.keys(b.storageData)));
+    check("T40: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T41 (Phase 0, M5): properties UI writes metadata; notes:update accepts patch.metadata and rejects bad keys */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const type = (el, t) => { el.value = t; el.dispatchEvent(new win.Event("input", { bubbles: true })); };
+    const stored = () => JSON.parse(b.storageData["xPin.workspace.v1"]);
+    click(doc.getElementById("new-note"));
+    type(doc.getElementById("note-title"), "Props");
+    await flush(100);
+    type(doc.querySelector(".property-key-input"), "status");
+    type(doc.querySelector(".property-add .property-value"), "In progress");
+    click(doc.querySelector(".property-add-button"));
+    await flush(2300); // debounced autosave persists the new property
+    check("T41: properties UI writes metadata.status",
+      stored().notes.find((n) => n.title === "Props")?.metadata?.status === "In progress",
+      JSON.stringify(stored().notes.find((n) => n.title === "Props")?.metadata));
+    const valueInput = doc.querySelectorAll("#note-properties .property-value")[0]; // first row is the status property; the add-row input comes after it
+    valueInput.value = "Done";
+    valueInput.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush(2300); // debounced autosave persists the edit
+    check("T41: editing a property value persists",
+      stored().notes.find((n) => n.title === "Props")?.metadata?.status === "Done",
+      JSON.stringify(stored().notes.find((n) => n.title === "Props")?.metadata));
+    check("T41: no console errors (UI half)", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+  {
+    const b = boot(null);
+    simSandbox(b);
+    await flush(120);
+    const probe = pluginPackage("t41-probe",
+      ["commands:register", "notes:read", "notes:update", "ui:notify"],
+      `xPinPlugin.register({ activate(api) {
+        api.commands.add({ id: "set-status", name: "T41 set status", run: async () => {
+          const notes = await api.notes.list();
+          const target = notes.find((n) => n.title === "Props") || notes[0];
+          await api.notes.update(target.id, { metadata: { status: "In progress", due: "2026-11-20" } });
+          await api.ui.notify("t41 status set");
+        }});
+        api.commands.add({ id: "bad-key", name: "T41 bad key", run: async () => {
+          try {
+            const notes = await api.notes.list();
+            await api.notes.update(notes[0].id, { metadata: { "1bad": "x" } });
+            await api.ui.notify("t41 bad unexpectedly ok");
+          } catch (err) { await api.ui.notify("t41 bad rejected"); }
+        }});
+      }});`);
+    await importPackage(b, probe);
+    await openReview(b, "Review");
+    await approveInModal(b);
+    const { doc } = b;
+    const stored = () => JSON.parse(b.storageData["xPin.workspace.v1"]);
+    await runPaletteCommand(b, "T41 set status");
+    check("T41: notes:update writes metadata fields",
+      stored().notes[0].metadata?.status === "In progress" &&
+      stored().notes[0].metadata?.due === "2026-11-20",
+      JSON.stringify(stored().notes[0].metadata));
+    check("T41: notes:update toast confirms the write",
+      doc.getElementById("toast").textContent.includes("t41 status set"),
+      doc.getElementById("toast").textContent);
+    await runPaletteCommand(b, "T41 bad key");
+    check("T41: notes:update rejects an invalid property key",
+      doc.getElementById("toast").textContent.includes("t41 bad rejected"),
+      doc.getElementById("toast").textContent);
+    check("T41: no console errors (plugin half)", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T42 (Phase 0, M6): static page export renders Markdown instead of dumping it raw */
+  {
+    const b0 = boot(null);
+    await flush(120);
+    const ws = JSON.parse(b0.storageData["xPin.workspace.v1"]);
+    ws.notes[0].title = "Rendered Page";
+    ws.notes[0].body = "# Hello\n\n- one\n- two";
+    const b = boot({ "xPin.workspace.v1": JSON.stringify(ws) });
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    click(doc.querySelector('[data-feature-view="settings"]'));
+    await flush(100);
+    click(doc.querySelector('[data-action="publish"]'));
+    await flush(100);
+    const html = b.createdURLs[b.createdURLs.length - 1].parts[0];
+    check("T42: exported page contains rendered HTML, not raw Markdown",
+      typeof html === "string" && /<h1>Hello<\/h1>/.test(html) && /<li>one<\/li>/.test(html) &&
+      !/# Hello/.test(html),
+      String(html).slice(0, 300));
+    check("T42: no console errors", b.errors.length === 0, b.errors.slice(0, 3).join(" | "));
+  }
+
+  /* T43 (Phase 0, M4): when the save fails, the app offers a Markdown backup download instead of only a toast */
+  {
+    const b = boot(null);
+    await flush(120);
+    const { doc, win } = b;
+    const click = (el) => el.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    const urlsBefore = b.createdURLs.length;
+    b.win.localStorage.setItem = () => { throw new Error("QuotaExceededError"); };
+    click(doc.getElementById("new-note"));
+    await flush(100);
+    check("T43: failed save reports Save failed in the status line",
+      doc.getElementById("save-label").textContent === "Save failed",
+      doc.getElementById("save-label").textContent);
+    const zip = b.createdURLs.length > urlsBefore
+      ? b.createdURLs[b.createdURLs.length - 1].parts[0]
+      : null;
+    check("T43: quota failure offers (and, on confirm, downloads) a Markdown .zip backup",
+      ArrayBuffer.isView(zip) && zip[0] === 0x50 && zip[1] === 0x4b,
+      `createdURLs grew by ${b.createdURLs.length - urlsBefore}`);
+    b.win.localStorage.setItem = (k, v) => { b.storageData[k] = String(v); };
+    click(doc.getElementById("new-note"));
+    await flush(100);
+    check("T43: saving recovers once storage works again",
+      doc.getElementById("save-label").textContent === "All changes saved",
+      doc.getElementById("save-label").textContent);
+    check("T43: the only console error is the expected quota log",
+      b.errors.length === 1 && /Could not save the xPin workspace/.test(b.errors[0]),
+      b.errors.slice(0, 3).join(" | "));
+  }
+
   /* report */
   const fails = results.filter((r) => !r.pass);
   console.log(`\n==== xPin smoke: ${results.length - fails.length}/${results.length} passed ====`);

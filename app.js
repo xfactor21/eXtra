@@ -4,6 +4,21 @@
   const STORAGE_KEY = "xPin.workspace.v1";
   const LEGACY_STORAGE_KEYS = ["xpin.workspace.v1", "pinboard.workspace.v1"]; // pre-rename keys; migrated once on first run, newest first
   const SAVE_DELAY = 2000;
+  // M4 — storage: IndexedDB is the primary store, localStorage keeps a backup
+  // copy of the same JSON so one corrupt value cannot wipe the workspace.
+  const IDB_NAME = "xpin";
+  const IDB_STORE = "workspace";
+  const IDB_KEY = "workspace-v1";
+  // M2 — safety net caps. Versions keep the body/title a note had before each
+  // save; trash keeps soft-deleted notes until restored or emptied.
+  const MAX_NOTE_VERSIONS = 20;
+  const MAX_TRASH_NOTES = 200;
+  const MAX_UNDO_STEPS = 20;
+  // M5 — note properties (frontmatter): keys start with a letter, then
+  // letters, digits, spaces, "_" or "-". Values are strings, numbers,
+  // booleans, null, or arrays of strings.
+  const METADATA_KEY_PATTERN = /^[A-Za-z][A-Za-z0-9 _-]{0,49}$/;
+  const MAX_METADATA_ENTRIES = 50;
   const SORTS = ["modified-desc", "modified-asc", "created-desc", "created-asc", "title-asc", "title-desc"];
   const MAX_CANVASES = 30;
   const MAX_CANVAS_NODES = 200;
@@ -45,6 +60,8 @@
     plugins: { enabled: {}, settings: {} },
     extensions: [],
     marketplaceDirs: [],
+    trash: [], // M2: soft-deleted notes ({...note, deletedAt}); restored or emptied, never silently lost
+    savedAt: null, // M4: ISO timestamp of the last successful persist; used to reconcile IndexedDB vs localStorage
     templates: seedTemplates(),
     features: window.xPinFeatures.initialState(),
     selectedCanvasId: "canvas-main",
@@ -109,6 +126,8 @@
     editorFolder: byId("editor-folder"),
     editorDate: byId("editor-date"),
     noteMetaDate: byId("note-meta-date"),
+    noteProperties: byId("note-properties"),
+    storageNote: document.querySelector(".sync-card small"),
     saveState: byId("save-state"),
     saveLabel: byId("save-label"),
     pinButton: byId("pin-note"),
@@ -156,6 +175,15 @@
 
   let state = loadWorkspace();
   let selectedNoteId = state.notes[0]?.id ?? null;
+  let storageBackend = "localStorage"; // "indexeddb" once a write there succeeds
+  let storageBytes = JSON.stringify(state).length;
+  let storageRecoveryOffered = false;
+  let idbOpenPromise = null;
+  // M2 — version baselines (last persisted title/body per note) and the
+  // structural-action undo stack (snapshots of notes/folders/trash).
+  const versionBaselines = new Map();
+  const undoStack = [];
+  initVersionBaselines();
   let saveTimer = null;
   let toastTimer = null;
   let pluginManager = null;
@@ -283,6 +311,83 @@
     });
   }
 
+  // M5 — note properties: keep only well-formed frontmatter entries. Anything
+  // else (nested objects, weird keys, oversize values) is dropped on load
+  // rather than trusted. `dailyDate` is an ordinary property and survives.
+  function sanitizeNoteMetadata(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const clean = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (Object.keys(clean).length >= MAX_METADATA_ENTRIES) break;
+      if (!METADATA_KEY_PATTERN.test(key)) continue;
+      if (typeof item === "string") clean[key] = item.slice(0, 2000);
+      else if (typeof item === "number" && Number.isFinite(item)) clean[key] = item;
+      else if (typeof item === "boolean" || item === null) clean[key] = item;
+      else if (Array.isArray(item) && item.length <= 20 && item.every((entry) => typeof entry === "string")) {
+        clean[key] = item.map((entry) => entry.slice(0, 200));
+      }
+    }
+    return clean;
+  }
+
+  // M2 — per-note version history: [{ title, body, updatedAt }], newest last.
+  function sanitizeNoteVersions(value) {
+    if (!Array.isArray(value)) return [];
+    return value.slice(-MAX_NOTE_VERSIONS).flatMap((version) => {
+      if (!version || typeof version !== "object" ||
+        typeof version.title !== "string" || typeof version.body !== "string") return [];
+      return [{
+        title: version.title.slice(0, 120),
+        body: version.body.slice(0, 100_000),
+        updatedAt: typeof version.updatedAt === "string" && Number.isFinite(Date.parse(version.updatedAt))
+          ? version.updatedAt
+          : new Date(0).toISOString()
+      }];
+    });
+  }
+
+  function sanitizeNoteRecord(raw, folderIds) {
+    if (!raw || typeof raw !== "object" || typeof raw.id !== "string" || !raw.id ||
+      typeof raw.title !== "string") return null;
+    const validDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value))
+      ? value
+      : new Date(0).toISOString();
+    return {
+      id: raw.id,
+      title: raw.title,
+      body: typeof raw.body === "string" ? raw.body : "",
+      folderId: typeof raw.folderId === "string" && folderIds.has(raw.folderId) ? raw.folderId : null,
+      pinned: raw.pinned === true,
+      parentNoteId: typeof raw.parentNoteId === "string" ? raw.parentNoteId : null,
+      createdAt: validDate(raw.createdAt),
+      updatedAt: validDate(raw.updatedAt),
+      metadata: sanitizeNoteMetadata(raw.metadata),
+      versions: sanitizeNoteVersions(raw.versions)
+    };
+  }
+
+  function sanitizeTrash(value, folderIds, liveNoteIds) {
+    if (!Array.isArray(value)) return [];
+    const knownIds = new Set(liveNoteIds);
+    const records = [];
+    for (const raw of value.slice(-MAX_TRASH_NOTES)) {
+      const note = sanitizeNoteRecord(raw, folderIds);
+      if (!note) continue;
+      knownIds.add(note.id);
+      records.push({
+        ...note,
+        deletedAt: typeof raw.deletedAt === "string" && Number.isFinite(Date.parse(raw.deletedAt))
+          ? raw.deletedAt
+          : note.updatedAt
+      });
+    }
+    // A trashed note keeps its parent only when the parent still exists.
+    records.forEach((note) => {
+      if (note.parentNoteId && !knownIds.has(note.parentNoteId)) note.parentNoteId = null;
+    });
+    return records;
+  }
+
   function loadWorkspace() {
     try {
       let saved = null;
@@ -325,25 +430,10 @@
       const folderIds = new Set(folders.map((folder) => folder.id));
       const noteIds = new Set();
       const notes = parsed.notes.flatMap((note) => {
-        if (!note || typeof note.id !== "string" || !note.id ||
-          typeof note.title !== "string" || noteIds.has(note.id)) return [];
-        noteIds.add(note.id);
-        const validDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value))
-          ? value
-          : new Date(0).toISOString();
-        return [{
-          id: note.id,
-          title: note.title,
-          body: typeof note.body === "string" ? note.body : "",
-          folderId: typeof note.folderId === "string" && folderIds.has(note.folderId) ? note.folderId : null,
-          pinned: note.pinned === true,
-          parentNoteId: typeof note.parentNoteId === "string" ? note.parentNoteId : null,
-          createdAt: validDate(note.createdAt),
-          updatedAt: validDate(note.updatedAt),
-          metadata: note.metadata && typeof note.metadata === "object" && !Array.isArray(note.metadata)
-            ? note.metadata
-            : {}
-        }];
+        const clean = sanitizeNoteRecord(note, folderIds);
+        if (!clean || noteIds.has(clean.id)) return [];
+        noteIds.add(clean.id);
+        return [clean];
       });
       notes.forEach((note) => {
         if (!noteIds.has(note.parentNoteId) || note.parentNoteId === note.id) note.parentNoteId = null;
@@ -361,8 +451,12 @@
       return {
         notes,
         folders,
+        trash: sanitizeTrash(parsed.trash, folderIds, noteIds),
+        savedAt: typeof parsed.savedAt === "string" && Number.isFinite(Date.parse(parsed.savedAt))
+          ? parsed.savedAt
+          : null,
         sort: SORTS.includes(parsed.sort) ? parsed.sort : "modified-desc",
-        filter: ["all", "pinned", "recent"].includes(parsed.filter) ? parsed.filter : "all",
+        filter: ["all", "pinned", "recent", "trash"].includes(parsed.filter) ? parsed.filter : "all",
         view: parsed.view === "canvas" ? "canvas" : "notes",
         collapsed: Array.isArray(parsed.collapsed) ? parsed.collapsed.filter((id) => typeof id === "string") : [],
         tagFilter: typeof parsed.tagFilter === "string" ? parsed.tagFilter : null,
@@ -385,15 +479,194 @@
     }
   }
 
-  function persistWorkspace() {
+  // M4 — storage layer. IndexedDB is the primary store; localStorage keeps a
+  // backup copy of the same JSON, so one corrupt value cannot wipe the
+  // workspace. When IndexedDB is unavailable (older browsers, and the
+  // headless smoke suite's fake DOM) localStorage is the only store and the
+  // app behaves exactly as before. Boot stays synchronous from localStorage;
+  // the IndexedDB copy is reconciled asynchronously afterwards (see
+  // reconcileIdbStore): migration seeds it on first run, and a missing
+  // localStorage copy is restored from it. Sync design note for Phase 1:
+  // each record carries `savedAt` (ISO) plus a monotonically useful
+  // `updatedAt` per note, and every note keeps a `versions` history — a
+  // change log can be built on top of these without changing the shape.
+
+  function formatBytes(bytes) {
+    if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+
+  function storageInfo() {
+    return {
+      backend: storageBackend,
+      bytes: storageBytes,
+      displayBytes: formatBytes(storageBytes),
+      notes: state.notes.length,
+      trash: state.trash.length
+    };
+  }
+
+  function updateStorageIndicator() {
+    if (!ui.storageNote) return;
+    ui.storageNote.textContent = `Saved on this device · ${formatBytes(storageBytes)} · ${storageBackend === "indexeddb" ? "IndexedDB" : "localStorage"}`;
+  }
+
+  function openIdb() {
+    if (idbOpenPromise) return idbOpenPromise;
+    idbOpenPromise = new Promise((resolve, reject) => {
+      if (typeof indexedDB === "undefined") {
+        reject(new Error("IndexedDB is not available."));
+        return;
+      }
+      const timeout = window.setTimeout(() => reject(new Error("IndexedDB open timed out.")), 3000);
+      let request;
+      try {
+        request = indexedDB.open(IDB_NAME, 1);
+      } catch (error) {
+        window.clearTimeout(timeout);
+        reject(error);
+        return;
+      }
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(IDB_STORE)) {
+          request.result.createObjectStore(IDB_STORE);
+        }
+      };
+      request.onsuccess = () => {
+        window.clearTimeout(timeout);
+        resolve(request.result);
+      };
+      request.onerror = () => {
+        window.clearTimeout(timeout);
+        reject(request.error ?? new Error("IndexedDB could not be opened."));
+      };
+      request.onblocked = () => {
+        window.clearTimeout(timeout);
+        reject(new Error("IndexedDB is blocked by another tab."));
+      };
+    }).catch((error) => {
+      idbOpenPromise = null;
+      throw error;
+    });
+    return idbOpenPromise;
+  }
+
+  function idbPutWorkspace(serialized, savedAt) {
+    return openIdb().then((db) => new Promise((resolve, reject) => {
+      const transaction = db.transaction(IDB_STORE, "readwrite");
+      const request = transaction.objectStore(IDB_STORE).put({ serialized, savedAt }, IDB_KEY);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error ?? new Error("IndexedDB write failed."));
+      transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed."));
+    }));
+  }
+
+  function idbGetWorkspace() {
+    return openIdb().then((db) => new Promise((resolve, reject) => {
+      const request = db.transaction(IDB_STORE, "readonly").objectStore(IDB_STORE).get(IDB_KEY);
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error ?? new Error("IndexedDB read failed."));
+    }));
+  }
+
+  async function reconcileIdbStore() {
+    if (typeof indexedDB === "undefined") return; // localStorage-only fallback
+    let record = null;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      record = await idbGetWorkspace();
+    } catch (error) {
+      console.error("Could not read the xPin IndexedDB store.", error);
+      return;
+    }
+    let saved = null;
+    try {
+      saved = localStorage.getItem(STORAGE_KEY);
+    } catch {
+      saved = null;
+    }
+    if (!record) {
+      // First run with IndexedDB: migrate the localStorage workspace in.
+      if (saved !== null) {
+        try {
+          await idbPutWorkspace(saved, state.savedAt);
+          storageBackend = "indexeddb";
+          updateStorageIndicator();
+        } catch (error) {
+          console.error("Could not migrate the xPin workspace to IndexedDB.", error);
+        }
+      }
+      return;
+    }
+    if (saved === null) {
+      // localStorage was lost but IndexedDB survived: restore, then reload so
+      // the synchronous boot path picks it up. Next boot the copies agree.
+      try {
+        localStorage.setItem(STORAGE_KEY, record.serialized);
+      } catch {
+        return; // cannot restore without a writable backup; stay on current state
+      }
+      window.location.reload();
+      return;
+    }
+    // Both copies exist: localStorage is authoritative on boot (an import may
+    // just have replaced it), so only bring IndexedDB up to date.
+    if (record.serialized !== saved) {
+      try {
+        await idbPutWorkspace(saved, state.savedAt);
+      } catch (error) {
+        console.error("Could not sync the xPin workspace to IndexedDB.", error);
+      }
+    }
+    storageBackend = "indexeddb";
+    updateStorageIndicator();
+  }
+
+  function offerSaveRecovery() {
+    showToast("Could not save on this device. Check browser storage settings.");
+    if (storageRecoveryOffered) return;
+    storageRecoveryOffered = true;
+    // M4 — export-on-quota-failure: offer a portable copy instead of a toast
+    // while in-memory edits keep diverging from disk.
+    if (window.confirm("xPin could not save your notes on this device — storage may be full. Download a Markdown backup of all notes now?")) {
+      exportMarkdownZip();
+    }
+  }
+
+  function persistWorkspace() {
+    state.savedAt = new Date().toISOString();
+    snapshotVersions();
+    let serialized;
+    try {
+      serialized = JSON.stringify(state);
+    } catch (error) {
+      console.error("Could not save the xPin workspace.", error);
+      setSaveState("error");
+      offerSaveRecovery();
+      return false;
+    }
+    storageBytes = serialized.length;
+    updateStorageIndicator();
+    // Primary store: IndexedDB. Async and best-effort — a failure here must
+    // never block the save, because the localStorage backup below still lands.
+    if (typeof indexedDB !== "undefined") {
+      idbPutWorkspace(serialized, state.savedAt).then(() => {
+        storageBackend = "indexeddb";
+        updateStorageIndicator();
+      }).catch((error) => {
+        console.error("Could not save the xPin workspace to IndexedDB.", error);
+      });
+    }
+    // Backup copy in localStorage (same JSON). One corrupt value cannot wipe
+    // everything, and boot can always read synchronously from here.
+    try {
+      localStorage.setItem(STORAGE_KEY, serialized);
+      storageRecoveryOffered = false;
       setSaveState("saved");
       return true;
     } catch (error) {
       console.error("Could not save the xPin workspace.", error);
       setSaveState("error");
-      showToast("Could not save on this device. Check browser storage settings.");
+      offerSaveRecovery();
       return false;
     }
   }
@@ -425,6 +698,124 @@
     ui.toast.classList.add("is-visible");
     window.clearTimeout(toastTimer);
     toastTimer = window.setTimeout(() => ui.toast.classList.remove("is-visible"), 3600);
+  }
+
+  // M2 — per-note version history. Before each persist, any note whose title
+  // or body changed since its last persisted snapshot gets that snapshot
+  // appended to note.versions (newest last, capped). Empty drafts never
+  // produce a version, so a brand-new note's first keystrokes are not saved
+  // as a blank "version".
+  function initVersionBaselines() {
+    versionBaselines.clear();
+    state.notes.forEach((note) => versionBaselines.set(note.id, {
+      title: note.title,
+      body: note.body,
+      updatedAt: note.updatedAt
+    }));
+  }
+
+  function snapshotVersions() {
+    for (const note of state.notes) {
+      const baseline = versionBaselines.get(note.id);
+      if (!baseline) {
+        versionBaselines.set(note.id, { title: note.title, body: note.body, updatedAt: note.updatedAt });
+        continue;
+      }
+      if (baseline.title === note.title && baseline.body === note.body) continue;
+      if (!baseline.title && !baseline.body) {
+        versionBaselines.set(note.id, { title: note.title, body: note.body, updatedAt: note.updatedAt });
+        continue;
+      }
+      note.versions = note.versions ?? [];
+      note.versions.push({ ...baseline });
+      while (note.versions.length > MAX_NOTE_VERSIONS) note.versions.shift();
+      versionBaselines.set(note.id, { title: note.title, body: note.body, updatedAt: note.updatedAt });
+    }
+  }
+
+  function restoreVersion(noteId, index) {
+    const note = state.notes.find((item) => item.id === noteId);
+    const version = note?.versions?.[index];
+    if (!note || !version) return false;
+    // The current text becomes a version first, so restoring is itself undoable.
+    note.versions.push({ title: note.title, body: note.body, updatedAt: note.updatedAt });
+    while (note.versions.length > MAX_NOTE_VERSIONS) note.versions.shift();
+    note.title = version.title;
+    note.body = version.body;
+    note.updatedAt = new Date().toISOString();
+    versionBaselines.set(note.id, { title: note.title, body: note.body, updatedAt: note.updatedAt });
+    renderEditor();
+    renderList();
+    persistWorkspace();
+    showToast("Earlier version restored.");
+    return true;
+  }
+
+  // M2 — undo for structural actions (note/folder delete, trash restore,
+  // permanent delete, empty trash). Snapshots are small (notes/folders/trash
+  // only) and capped; typing undo stays with the browser textarea.
+  function pushUndo(label) {
+    undoStack.push({
+      label,
+      notes: structuredClone(state.notes),
+      folders: structuredClone(state.folders),
+      trash: structuredClone(state.trash),
+      selectedNoteId
+    });
+    while (undoStack.length > MAX_UNDO_STEPS) undoStack.shift();
+  }
+
+  function undoLastAction() {
+    const entry = undoStack.pop();
+    if (!entry) {
+      showToast("Nothing to undo.");
+      return false;
+    }
+    state.notes = entry.notes;
+    state.folders = entry.folders;
+    state.trash = entry.trash;
+    selectedNoteId = state.notes.some((note) => note.id === entry.selectedNoteId)
+      ? entry.selectedNoteId
+      : state.notes[0]?.id ?? null;
+    initVersionBaselines();
+    render();
+    persistWorkspace();
+    showToast(`Undid: ${entry.label}`);
+    return true;
+  }
+
+  // M5 — note properties (frontmatter) API.
+  // Plugins write properties through notes:update with patch.metadata:
+  //   { status: "In progress", due: "2026-11-20", source: "https://…" }
+  // Keys must match METADATA_KEY_PATTERN; values are strings, numbers,
+  // booleans, null, or arrays of strings. A null value deletes the key.
+  // Invalid keys/values throw instead of being silently dropped, so an
+  // integration learns immediately that a write did not land.
+  function mergeNoteMetadata(current, patch) {
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new TypeError("Note properties must be an object.");
+    }
+    for (const key of Object.keys(patch)) {
+      if (!METADATA_KEY_PATTERN.test(key)) throw new TypeError(`Property name "${key}" is invalid.`);
+      const value = patch[key];
+      if (value !== null && typeof value !== "string" && typeof value !== "number" &&
+        typeof value !== "boolean" && !(Array.isArray(value) && value.every((entry) => typeof entry === "string"))) {
+        throw new TypeError(`Property "${key}" has an unsupported value.`);
+      }
+      if (typeof value === "number" && !Number.isFinite(value)) {
+        throw new TypeError(`Property "${key}" must be a finite number.`);
+      }
+    }
+    const next = sanitizeNoteMetadata({ ...(current ?? {}), ...patch });
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === null) delete next[key];
+    }
+    return next;
+  }
+
+  function setNoteMetadata(note, patch) {
+    note.metadata = mergeNoteMetadata(note.metadata, patch);
+    return note.metadata;
   }
 
   function makeId(prefix) {
@@ -462,6 +853,9 @@
   }
 
   function visibleNotes() {
+    if (state.filter === "trash") {
+      return [...state.trash].sort((a, b) => timestamp(b.deletedAt) - timestamp(a.deletedAt));
+    }
     let notes = state.notes;
     if (state.filter === "pinned") notes = notes.filter((note) => note.pinned);
     if (state.filter === "recent") {
@@ -515,7 +909,80 @@
     return row;
   }
 
+  function renderTrashRow(note) {
+    const row = document.createElement("div");
+    row.className = "note-row trash-row";
+    row.dataset.noteId = note.id;
+    const preview = note.body.trim().replace(/\s+/g, " ") || "A blank page, ready when you are.";
+    const titleLine = document.createElement("span");
+    titleLine.className = "note-row-titleline";
+    const title = document.createElement("span");
+    title.className = "note-row-title";
+    title.textContent = note.title.trim() || "Untitled note";
+    titleLine.append(title);
+    const previewEl = document.createElement("span");
+    previewEl.className = "note-preview";
+    previewEl.textContent = preview;
+    const time = document.createElement("span");
+    time.className = "note-row-time";
+    time.textContent = `Deleted ${formatRelative(note.deletedAt)}`;
+    const actions = document.createElement("div");
+    actions.className = "trash-actions";
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "trash-restore";
+    restore.textContent = "Restore";
+    restore.setAttribute("aria-label", `Restore ${note.title.trim() || "Untitled note"}`);
+    restore.addEventListener("click", () => restoreTrashNote(note.id));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "trash-delete";
+    remove.textContent = "Delete forever";
+    remove.setAttribute("aria-label", `Permanently delete ${note.title.trim() || "Untitled note"}`);
+    remove.addEventListener("click", () => permanentlyDeleteTrashNote(note.id));
+    actions.append(restore, remove);
+    row.append(titleLine, previewEl, time, actions);
+    return row;
+  }
+
+  function renderTrashList() {
+    const trashed = visibleNotes();
+    ui.noteList.replaceChildren();
+    if (trashed.length) {
+      const actions = document.createElement("div");
+      actions.className = "trash-toolbar";
+      const emptyButton = document.createElement("button");
+      emptyButton.type = "button";
+      emptyButton.className = "trash-empty";
+      emptyButton.textContent = "Empty Trash";
+      emptyButton.addEventListener("click", emptyTrash);
+      actions.append(emptyButton);
+      ui.noteList.append(actions);
+      trashed.forEach((note) => ui.noteList.append(renderTrashRow(note)));
+    }
+    ui.emptyState.hidden = trashed.length !== 0;
+    ui.noteList.hidden = trashed.length === 0;
+    ui.listCount.textContent = `${trashed.length} ${trashed.length === 1 ? "note" : "notes"} in Trash`;
+    if (!trashed.length) {
+      ui.emptyTitle.textContent = "Trash is empty";
+      ui.emptyDescription.textContent = "Deleted notes land here first, so nothing is lost by accident.";
+      ui.emptyCreate.hidden = true;
+    }
+    byId("all-count").textContent = String(state.notes.length);
+    byId("pinned-count").textContent = String(state.notes.filter((note) => note.pinned).length);
+    byId("trash-count").textContent = String(state.trash.length);
+    ui.listHeading.textContent = "TRASH";
+    if (!state.features.activeView) {
+      ui.currentView.textContent = "Trash";
+      ui.pageTitle.innerHTML = `Trash<span class="title-period">.</span>`;
+    }
+  }
+
   function renderList() {
+    if (state.filter === "trash") {
+      renderTrashList();
+      return;
+    }
     const notes = visibleNotes();
     const folders = [...state.folders].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
     ui.noteList.replaceChildren();
@@ -584,8 +1051,9 @@
 
     byId("all-count").textContent = String(state.notes.length);
     byId("pinned-count").textContent = String(state.notes.filter((note) => note.pinned).length);
-    const labels = { all: ["All notes", "ALL NOTES"], pinned: ["Pinned", "PINNED"], recent: ["Recent notes", "RECENT NOTES"] };
-    const [label, heading] = labels[state.filter];
+    byId("trash-count").textContent = String(state.trash.length);
+    const labels = { all: ["All notes", "ALL NOTES"], pinned: ["Pinned", "PINNED"], recent: ["Recent notes", "RECENT NOTES"], trash: ["Trash", "TRASH"] };
+    const [label, heading] = labels[state.filter] ?? labels.all;
     const viewLabel = state.tagFilter ? `Tagged ${state.tagFilter}` : label;
     const featureViewOpen = Boolean(state.features.activeView);
     if (!featureViewOpen) {
@@ -840,12 +1308,12 @@
     hideEdgeEditor();
     state.view = view === "canvas" ? "canvas" : "notes";
     const isCanvas = state.view === "canvas";
-    ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : "Recent notes");
+    ui.currentView.textContent = isCanvas ? "Canvas" : (state.tagFilter ? `Tagged ${state.tagFilter}` : state.filter === "all" ? "All notes" : state.filter === "pinned" ? "Pinned" : state.filter === "trash" ? "Trash" : "Recent notes");
     byId("notes-toolbar").hidden = isCanvas;
     byId("notes-layout").hidden = isCanvas;
     ui.canvasView.hidden = !isCanvas;
     byId("new-folder").hidden = isCanvas;
-    ui.pageTitle.innerHTML = `${isCanvas ? "Canvas" : (state.tagFilter ? `Tag ${escapeText(state.tagFilter)}` : state.filter === "all" ? "Your notes" : escapeText(state.filter === "pinned" ? "Pinned" : "Recent notes"))}<span class="title-period">.</span>`;
+    ui.pageTitle.innerHTML = `${isCanvas ? "Canvas" : (state.tagFilter ? `Tag ${escapeText(state.tagFilter)}` : state.filter === "all" ? "Your notes" : escapeText(state.filter === "pinned" ? "Pinned" : state.filter === "trash" ? "Trash" : "Recent notes"))}<span class="title-period">.</span>`;
     byId("notes-heading").querySelector(".page-subtitle").textContent = isCanvas
       ? "Arrange notes, fragments, and links into a visual map."
       : "A home for the thoughts worth keeping.";
@@ -1678,6 +2146,254 @@
     if (previewMode) renderMarkdownPreview(currentNote()?.body ?? "");
   }
 
+  // M6 — render Markdown to an HTML string through the same renderer the
+  // in-app preview uses, so exports look like the preview. The fake DOM in
+  // the smoke suite does not serialize innerHTML from built nodes, so this
+  // walks the rendered tree with a small allowlisted serializer instead.
+  const SERIALIZE_VOID_TAGS = new Set(["br", "hr", "img", "input"]);
+  const SERIALIZE_ATTRS = new Set(["class", "href", "src", "alt", "title", "type", "checked", "disabled", "start", "colspan", "rowspan"]);
+
+  function serializeNodeToHtml(node) {
+    if (!node) return "";
+    if (node.nodeType === 3) return escapeText(node.textContent ?? "");
+    if (node.nodeType !== 1) return "";
+    const tag = node.tagName.toLowerCase();
+    if (tag === "iframe" || tag === "script" || tag === "style") return "";
+    const attrs = [];
+    const seen = new Set();
+    const pushAttr = (name, value) => {
+      if (!SERIALIZE_ATTRS.has(name) || seen.has(name) || value === null || value === undefined) return;
+      seen.add(name);
+      attrs.push(` ${name}="${escapeText(String(value))}"`);
+    };
+    if (node.attributes) {
+      if (typeof node.attributes[Symbol.iterator] === "function") {
+        for (const attr of node.attributes) pushAttr(attr.name, attr.value);
+      } else {
+        for (const [name, value] of Object.entries(node.attributes)) pushAttr(name, value);
+      }
+    }
+    if (node.className) pushAttr("class", node.className);
+    if (node.checked) pushAttr("checked", "checked");
+    if (node.disabled) pushAttr("disabled", "disabled");
+    const children = [...(node.childNodes ?? [])].map(serializeNodeToHtml).join("");
+    if (SERIALIZE_VOID_TAGS.has(tag)) return `<${tag}${attrs.join("")}>`;
+    return `<${tag}${attrs.join("")}>${children}</${tag}>`;
+  }
+
+  function markdownToHtml(source) {
+    const container = document.createElement("div");
+    appendMarkdownBlocks(container, source ?? "");
+    return [...container.childNodes].map(serializeNodeToHtml).join("");
+  }
+
+  // M3 — Markdown export. Per-note .md with frontmatter, and a workspace
+  // .zip that preserves folder structure. The zip is a minimal stored
+  // (uncompressed) archive written by hand — no new dependency.
+  function slugifyFileName(value, fallback = "note") {
+    const slug = String(value ?? "").toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return slug || fallback;
+  }
+
+  function downloadFile(fileName, contents, type) {
+    const blob = contents instanceof Blob ? contents : new Blob([contents], { type });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function formatFrontmatterValue(value) {
+    if (value === null) return "null";
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    return JSON.stringify(String(value));
+  }
+
+  function noteToMarkdown(note) {
+    const lines = [];
+    const metadata = note.metadata ?? {};
+    const keys = Object.keys(metadata);
+    if (keys.length) {
+      lines.push("---");
+      keys.sort().forEach((key) => lines.push(`${key}: ${formatFrontmatterValue(metadata[key])}`));
+      lines.push("---", "");
+    }
+    const title = note.title.trim() || "Untitled note";
+    if (!note.body.startsWith(`# ${title}\n`) && note.body.trim() !== `# ${title}`) {
+      lines.push(`# ${title}`, "");
+    }
+    lines.push(note.body);
+    return lines.join("\n");
+  }
+
+  function exportNoteMarkdown(note) {
+    const target = note ?? currentNote();
+    if (!target) {
+      showToast("Open a note before exporting Markdown.");
+      return false;
+    }
+    downloadFile(`${slugifyFileName(target.title)}.md`, noteToMarkdown(target), "text/markdown;charset=utf-8");
+    showToast("Markdown file exported.");
+    return true;
+  }
+
+  const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+      let c = n;
+      for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i += 1) {
+      crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function buildZip(files) {
+    const encoder = new TextEncoder();
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+    const dosDate = (() => {
+      const now = new Date();
+      const time = ((now.getHours() & 0x1f) << 11) | ((now.getMinutes() & 0x3f) << 5) | ((now.getSeconds() >> 1) & 0x1f);
+      const date = (((now.getFullYear() - 1980) & 0x7f) << 9) | (((now.getMonth() + 1) & 0xf) << 5) | (now.getDate() & 0x1f);
+      return { time, date };
+    })();
+    for (const file of files) {
+      const name = encoder.encode(file.path);
+      const data = encoder.encode(file.content);
+      const crc = crc32(data);
+      const header = new DataView(new ArrayBuffer(30));
+      header.setUint32(0, 0x04034b50, true);
+      header.setUint16(4, 20, true);
+      header.setUint16(6, 0x0800, true); // UTF-8 filenames
+      header.setUint16(8, 0, true); // stored, no compression
+      header.setUint16(10, dosDate.time, true);
+      header.setUint16(12, dosDate.date, true);
+      header.setUint32(14, crc, true);
+      header.setUint32(18, data.length, true);
+      header.setUint32(22, data.length, true);
+      header.setUint16(26, name.length, true);
+      header.setUint16(28, 0, true);
+      localParts.push(new Uint8Array(header.buffer), name, data);
+      const central = new DataView(new ArrayBuffer(46));
+      central.setUint32(0, 0x02014b50, true);
+      central.setUint16(4, 20, true);
+      central.setUint16(6, 20, true);
+      central.setUint16(8, 0x0800, true);
+      central.setUint16(10, 0, true);
+      central.setUint16(12, dosDate.time, true);
+      central.setUint16(14, dosDate.date, true);
+      central.setUint32(16, crc, true);
+      central.setUint32(20, data.length, true);
+      central.setUint32(24, data.length, true);
+      central.setUint16(28, name.length, true);
+      central.setUint16(30, 0, true);
+      central.setUint16(32, 0, true);
+      central.setUint16(34, 0, true);
+      central.setUint16(36, 0, true);
+      central.setUint32(38, 0, true);
+      central.setUint32(42, offset, true);
+      centralParts.push(new Uint8Array(central.buffer), name);
+      offset += 30 + name.length + data.length;
+    }
+    const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, files.length, true);
+    end.setUint16(10, files.length, true);
+    end.setUint32(12, centralSize, true);
+    end.setUint32(16, offset, true);
+    const total = offset + centralSize + 22;
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const part of [...localParts, ...centralParts, new Uint8Array(end.buffer)]) {
+      out.set(part, at);
+      at += part.length;
+    }
+    return out;
+  }
+
+  function exportMarkdownZip() {
+    const used = new Set();
+    const uniquePath = (path) => {
+      let candidate = path;
+      let n = 2;
+      while (used.has(candidate)) {
+        candidate = path.replace(/\.md$/, `-${n}.md`);
+        n += 1;
+      }
+      used.add(candidate);
+      return candidate;
+    };
+    const folderName = (id) => state.folders.find((folder) => folder.id === id)?.name ?? "";
+    const files = [];
+    for (const note of state.notes) {
+      const folder = folderName(note.folderId);
+      files.push({
+        path: uniquePath(`${folder ? `${slugifyFileName(folder, "folder")}/` : ""}${slugifyFileName(note.title)}.md`),
+        content: noteToMarkdown(note)
+      });
+    }
+    for (const note of state.trash) {
+      files.push({
+        path: uniquePath(`Trash/${slugifyFileName(note.title)}.md`),
+        content: noteToMarkdown(note)
+      });
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadFile(`xpin-notes-${stamp}.zip`, buildZip(files), "application/zip");
+    showToast(`Exported ${files.length} ${files.length === 1 ? "note" : "notes"} as Markdown (.zip).`);
+    return files.length;
+  }
+
+  // M3 — frontmatter round-trip: .md imports that start with a --- block get
+  // their properties parsed into metadata (and a `title:` key becomes the
+  // note title) instead of being stored as literal body text.
+  function parseFrontmatter(text) {
+    const body = String(text ?? "");
+    if (!body.startsWith("---\n") && !body.startsWith("---\r\n")) return { metadata: {}, body };
+    const lines = body.split("\n");
+    let end = -1;
+    for (let i = 1; i < lines.length; i += 1) {
+      if (lines[i].trim() === "---") {
+        end = i;
+        break;
+      }
+    }
+    if (end < 0) return { metadata: {}, body };
+    const metadata = {};
+    for (const line of lines.slice(1, end)) {
+      const match = line.match(/^([A-Za-z][A-Za-z0-9 _-]{0,49}):\s*(.*)$/);
+      if (!match) continue;
+      const key = match[1];
+      let value = match[2].trim();
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed === "string" || typeof parsed === "number" || typeof parsed === "boolean" || parsed === null ||
+          (Array.isArray(parsed) && parsed.every((entry) => typeof entry === "string"))) {
+          value = parsed;
+        }
+      } catch {
+        value = value.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");
+      }
+      metadata[key] = value;
+    }
+    const rest = lines.slice(end + 1).join("\n").replace(/^\n/, "");
+    const title = typeof metadata.title === "string" && metadata.title.trim() ? metadata.title.trim() : null;
+    if (title !== null) delete metadata.title;
+    return { metadata: sanitizeNoteMetadata(metadata), body: rest, title };
+  }
+
   function renderEditor() {
     const note = currentNote();
     hideLinkSuggestions();
@@ -1695,6 +2411,7 @@
       ui.editorFolder.textContent = "NOTES";
       ui.editorDate.textContent = "NO NOTE SELECTED";
       ui.markdownPreview.hidden = true;
+      renderNoteProperties(null);
       return;
     }
 
@@ -1741,6 +2458,104 @@
         ui.noteParent.append(option);
       });
     ui.noteParent.value = note.parentNoteId ?? "";
+    renderNoteProperties(note);
+  }
+
+  // M5 — properties editor (frontmatter key/value rows) + M2 version history.
+  // `dailyDate` is internal and stays out of the editable list.
+  function renderNoteProperties(note) {
+    const container = ui.noteProperties;
+    if (!container) return;
+    container.replaceChildren();
+    if (!note) return;
+    const heading = document.createElement("div");
+    heading.className = "properties-heading";
+    heading.textContent = "PROPERTIES";
+    container.append(heading);
+    const entries = Object.entries(note.metadata ?? {}).filter(([key]) => key !== "dailyDate");
+    entries.forEach(([key, value]) => {
+      const row = document.createElement("div");
+      row.className = "property-row";
+      const keyLabel = document.createElement("span");
+      keyLabel.className = "property-key";
+      keyLabel.textContent = key;
+      const valueInput = document.createElement("input");
+      valueInput.type = "text";
+      valueInput.className = "property-value";
+      valueInput.value = typeof value === "string" ? value : JSON.stringify(value ?? "");
+      valueInput.setAttribute("aria-label", `Property ${key}`);
+      valueInput.addEventListener("change", () => {
+        setNoteMetadata(note, { [key]: valueInput.value });
+        scheduleSave();
+      });
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "property-remove";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", `Remove property ${key}`);
+      remove.addEventListener("click", () => {
+        setNoteMetadata(note, { [key]: null });
+        renderEditor();
+        scheduleSave();
+      });
+      row.append(keyLabel, valueInput, remove);
+      container.append(row);
+    });
+    const addRow = document.createElement("div");
+    addRow.className = "property-row property-add";
+    const keyInput = document.createElement("input");
+    keyInput.type = "text";
+    keyInput.className = "property-key-input";
+    keyInput.placeholder = "key";
+    keyInput.setAttribute("aria-label", "New property name");
+    const valueInput = document.createElement("input");
+    valueInput.type = "text";
+    valueInput.className = "property-value";
+    valueInput.placeholder = "value";
+    valueInput.setAttribute("aria-label", "New property value");
+    const addButton = document.createElement("button");
+    addButton.type = "button";
+    addButton.className = "property-add-button";
+    addButton.textContent = "Add";
+    addButton.addEventListener("click", () => {
+      const key = keyInput.value.trim();
+      if (!METADATA_KEY_PATTERN.test(key)) {
+        showToast("Property names start with a letter and use letters, digits, spaces, _ or -.");
+        return;
+      }
+      if (Object.hasOwn(note.metadata ?? {}, key)) {
+        showToast(`"${key}" already exists — edit its value instead.`);
+        return;
+      }
+      setNoteMetadata(note, { [key]: valueInput.value });
+      renderEditor();
+      scheduleSave();
+    });
+    addRow.append(keyInput, valueInput, addButton);
+    container.append(addRow);
+    if (note.versions?.length) {
+      const details = document.createElement("details");
+      details.className = "version-history";
+      const summary = document.createElement("summary");
+      summary.textContent = `Version history · ${note.versions.length}`;
+      details.append(summary);
+      [...note.versions].reverse().forEach((version, reverseIndex) => {
+        const index = note.versions.length - 1 - reverseIndex;
+        const row = document.createElement("div");
+        row.className = "version-row";
+        const label = document.createElement("span");
+        label.textContent = `${formatRelative(version.updatedAt)} · ${(version.title.trim() || "Untitled note").slice(0, 60)}`;
+        const restore = document.createElement("button");
+        restore.type = "button";
+        restore.className = "version-restore";
+        restore.textContent = "Restore";
+        restore.setAttribute("aria-label", `Restore version from ${formatRelative(version.updatedAt)}`);
+        restore.addEventListener("click", () => restoreVersion(note.id, index));
+        row.append(label, restore);
+        details.append(row);
+      });
+      container.append(details);
+    }
   }
 
   function escapeRegExp(value) {
@@ -2025,8 +2840,44 @@
     });
   }
 
+  // Core commands (M2/M3): undo, Trash, and Markdown export live in the
+  // palette alongside plugin commands so they are one keystroke away.
+  function coreCommands() {
+    return [
+      {
+        id: "undo-last-action",
+        name: "Undo last action",
+        description: "Undo the last note or folder change.",
+        run: () => undoLastAction()
+      },
+      {
+        id: "open-trash",
+        name: "Open Trash",
+        description: "See deleted notes, restore them, or delete them forever.",
+        run: () => {
+          setActiveFilter("trash");
+          switchView("notes");
+          render();
+        }
+      },
+      {
+        id: "export-note-markdown",
+        name: "Export current note as Markdown",
+        description: "Download this note as a .md file with its properties.",
+        run: () => exportNoteMarkdown()
+      },
+      {
+        id: "export-workspace-markdown",
+        name: "Export all notes as Markdown (.zip)",
+        description: "Download every note as .md files, folders preserved.",
+        run: () => exportMarkdownZip()
+      }
+    ];
+  }
+
   function availableCommands() {
     return [
+      ...coreCommands(),
       ...(pluginManager?.commands() ?? []),
       ...extensionCommands.values()
     ].sort((a, b) => a.name.localeCompare(b.name));
@@ -2090,7 +2941,7 @@
       if (typeof payload?.id !== "string") throw new TypeError("Plugin note update requires a note id.");
       const patch = payload?.patch;
       if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
-        throw new TypeError("Plugin note update requires a patch object with title and/or body.");
+        throw new TypeError("Plugin note update requires a patch object with title, body, and/or metadata.");
       }
       const changes = {};
       if (patch.title !== undefined) {
@@ -2104,6 +2955,17 @@
           throw new TypeError("Plugin note body must be text under 100 KB.");
         }
         changes.body = patch.body;
+      }
+      // M5 — plugins may write note properties (frontmatter) through
+      // patch.metadata; see mergeNoteMetadata for the key/value rules.
+      // A null value deletes that property.
+      if (patch.metadata !== undefined) {
+        const note = state.notes.find((item) => item.id === payload.id);
+        if (!note) throw new Error("The note no longer exists.");
+        const nextMetadata = mergeNoteMetadata(note.metadata, patch.metadata);
+        if (JSON.stringify(nextMetadata) !== JSON.stringify(note.metadata ?? {})) {
+          changes.metadata = nextMetadata;
+        }
       }
       if (!Object.keys(changes).length) throw new TypeError("Plugin note update changed nothing.");
       const note = state.notes.find((item) => item.id === payload.id);
@@ -3082,6 +3944,7 @@
     renderEditor();
     renderPluginPanels();
     renderEditorStatus();
+    updateStorageIndicator();
     if (state.view === "canvas") renderCanvas();
     featureSuite?.render();
     renderCoreToolsSections();
@@ -3142,7 +4005,7 @@
       throw new TypeError("New note metadata must be an object.");
     }
     const now = new Date().toISOString();
-    return { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: { ...metadata } };
+    return { id: makeId("note"), title, body, folderId, parentNoteId, pinned: false, createdAt: now, updatedAt: now, metadata: sanitizeNoteMetadata(metadata) };
   }
 
   function createNote({ title = "", body = "", folderId = null, parentNoteId = null, metadata = {} } = {}) {
@@ -3661,8 +4524,10 @@
         if (!text.trim()) {
           skipped += 1;
         } else {
-          const title = (file.name ?? "note").replace(/\.md$/i, "").trim().slice(0, 120) || "Untitled note";
-          const record = buildNoteRecord({ title, body: text.slice(0, 100_000) });
+          // M3 — frontmatter round-trip: properties parsed out of the --- block.
+          const { metadata, body, title: frontmatterTitle } = parseFrontmatter(text);
+          const title = (frontmatterTitle ?? (file.name ?? "note").replace(/\.md$/i, "").trim().slice(0, 120)) || "Untitled note";
+          const record = buildNoteRecord({ title, body: body.slice(0, 100_000), metadata });
           state.notes.push(record);
           pluginManager?.emit("note:created", { ...record });
           created += 1;
@@ -3715,6 +4580,7 @@
       ? `Delete "${folder.name}"? ${noteCount} ${noteCount === 1 ? "note will" : "notes will"} move to Uncategorized.`
       : `Delete the empty "${folder.name}" folder?`;
     if (!window.confirm(message)) return;
+    pushUndo(`Delete folder “${folder.name}”`);
     state.folders = state.folders.filter((item) => item.id !== folder.id);
     state.notes.forEach((note) => {
       if (note.folderId === folder.id) note.folderId = null;
@@ -3722,13 +4588,14 @@
     state.collapsed = state.collapsed.filter((id) => id !== folder.id);
     persistWorkspace();
     render();
-    showToast(noteCount ? `${noteCount} ${noteCount === 1 ? "note moved" : "notes moved"} to Uncategorized.` : "Folder deleted.");
+    showToast(noteCount ? `${noteCount} ${noteCount === 1 ? "note moved" : "notes moved"} to Uncategorized. Press Ctrl+Z to undo.` : "Folder deleted. Press Ctrl+Z to undo.");
   }
 
-  function deleteSelectedNote() {
-    const note = currentNote();
-    if (!note) return;
-    if (!window.confirm(`Delete “${note.title.trim() || "Untitled note"}”? This cannot be undone.`)) return;
+  // M2 — Trash. Deleting a note soft-deletes it: the record (with its
+  // versions and properties) moves to state.trash and can be restored, or
+  // permanently deleted. The old permanent-delete confirm is gone.
+  function moveNoteToTrash(note) {
+    pushUndo(`Delete “${note.title.trim() || "Untitled note"}”`);
     state.notes = state.notes.filter((item) => item.id !== note.id);
     state.notes.forEach((item) => {
       if (item.parentNoteId === note.id) item.parentNoteId = note.parentNoteId ?? null;
@@ -3747,11 +4614,63 @@
         }
       });
     });
+    state.trash.push({ ...note, deletedAt: new Date().toISOString() });
+    while (state.trash.length > MAX_TRASH_NOTES) state.trash.shift();
     selectedNoteId = visibleNotes()[0]?.id ?? null;
     pluginManager?.emit("note:deleted", { ...note });
     render();
     persistWorkspace();
-    showToast("Note deleted.");
+    showToast("Note moved to Trash. Press Ctrl+Z to undo.");
+  }
+
+  function deleteSelectedNote() {
+    const note = currentNote();
+    if (!note) return;
+    if (!window.confirm(`Move “${note.title.trim() || "Untitled note"}” to Trash? You can restore it later.`)) return;
+    moveNoteToTrash(note);
+  }
+
+  function restoreTrashNote(id) {
+    const index = state.trash.findIndex((item) => item.id === id);
+    if (index < 0) return false;
+    pushUndo("Restore from Trash");
+    const [note] = state.trash.splice(index, 1);
+    const { deletedAt: _deletedAt, ...restored } = note;
+    if (restored.folderId && !state.folders.some((folder) => folder.id === restored.folderId)) restored.folderId = null;
+    if (restored.parentNoteId && !state.notes.some((item) => item.id === restored.parentNoteId)) restored.parentNoteId = null;
+    state.notes.push(restored);
+    selectedNoteId = restored.id;
+    setActiveFilter("all");
+    render();
+    persistWorkspace();
+    showToast("Note restored.");
+    return true;
+  }
+
+  function permanentlyDeleteTrashNote(id) {
+    const note = state.trash.find((item) => item.id === id);
+    if (!note) return false;
+    if (!window.confirm(`Permanently delete “${note.title.trim() || "Untitled note"}”? This cannot be undone.`)) return false;
+    pushUndo("Permanently delete note");
+    state.trash = state.trash.filter((item) => item.id !== id);
+    render();
+    persistWorkspace();
+    showToast("Note permanently deleted.");
+    return true;
+  }
+
+  function emptyTrash() {
+    if (!state.trash.length) {
+      showToast("Trash is already empty.");
+      return false;
+    }
+    if (!window.confirm(`Permanently delete ${state.trash.length} ${state.trash.length === 1 ? "note" : "notes"} in Trash? This cannot be undone.`)) return false;
+    pushUndo("Empty Trash");
+    state.trash = [];
+    render();
+    persistWorkspace();
+    showToast("Trash emptied.");
+    return true;
   }
 
   function createPluginHost() {
@@ -4080,6 +4999,7 @@
     byId("insert-code-block").addEventListener("click", insertCodeBlock);
     ui.togglePreview.addEventListener("click", () => setPreviewMode(!previewMode));
     ui.noteTitle.addEventListener("input", () => updateSelectedNote({ title: ui.noteTitle.value }));
+    byId("export-note-markdown").addEventListener("click", () => exportNoteMarkdown());
     ui.noteBody.addEventListener("input", () => {
       updateSelectedNote({ body: ui.noteBody.value });
     });
@@ -4184,6 +5104,13 @@
         openQuickCaptureDialog();
         return;
       }
+      if (command && !event.shiftKey && event.key.toLocaleLowerCase() === "z" && !typing) {
+        // M2 — undo for structural actions. Typing in an input/textarea keeps
+        // the browser's own text undo; this only fires outside editable fields.
+        event.preventDefault();
+        undoLastAction();
+        return;
+      }
       if (command && event.key.toLocaleLowerCase() === "p") {
         event.preventDefault();
         openCommandPalette();
@@ -4252,6 +5179,10 @@
     render,
     extractTags,
     storageKey: STORAGE_KEY,
+    storageInfo,
+    renderMarkdown: markdownToHtml,
+    exportNoteMarkdown,
+    exportMarkdownZip,
     insertText(text) {
       if (!currentNote()) createNote();
       const start = ui.noteBody.selectionStart;
@@ -4277,6 +5208,7 @@
   setupEvents();
   render();
   switchView(state.view);
+  reconcileIdbStore(); // M4: migrate to / reconcile with IndexedDB (async, no-op without it)
   if (restoredFeatureView) featureSuite.open(restoredFeatureView);
   pluginManager.start().then(() => {
     state.plugins = pluginManager.serialize();

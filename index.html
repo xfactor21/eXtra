@@ -25,6 +25,7 @@
           <button class="nav-item is-active" data-filter="all" type="button" aria-label="All notes"><span class="nav-icon" aria-hidden="true">▤</span><span>All notes</span><span class="nav-count" id="all-count">0</span></button>
           <button class="nav-item" data-filter="pinned" type="button" aria-label="Pinned"><span class="nav-icon pin-nav-icon" aria-hidden="true">◆</span><span>Pinned</span><span class="nav-count" id="pinned-count">0</span></button>
           <button class="nav-item" data-filter="recent" type="button" aria-label="Recent notes"><span class="nav-icon" aria-hidden="true">◷</span><span>Recent notes</span></button>
+          <button class="nav-item" data-filter="trash" type="button" aria-label="Trash"><span class="nav-icon" aria-hidden="true">⌫</span><span>Trash</span><span class="nav-count" id="trash-count">0</span></button>
           <button class="nav-item" id="canvas-nav" data-view="canvas" type="button" aria-label="Canvas"><span class="nav-icon" aria-hidden="true">⌘</span><span>Canvas</span></button>
           <button class="nav-item" data-feature-view="database" type="button" aria-label="Databases"><span class="nav-icon" aria-hidden="true">▦</span><span>Databases</span></button>
           <button class="nav-item" data-feature-view="graph" type="button" aria-label="Graph"><span class="nav-icon" aria-hidden="true">◎</span><span>Graph</span></button>
@@ -65,6 +66,7 @@
               <div id="editor-fields" class="editor-fields">
                 <label class="sr-only" for="note-title">Note title</label><input id="note-title" class="note-title" type="text" placeholder="Untitled note" maxlength="120" spellcheck="false">
                 <div class="note-meta"><span class="meta-glyph" aria-hidden="true">◷</span><span id="note-meta-date">Created just now</span><span class="meta-divider">·</span><label for="note-folder">IN</label><select id="note-folder" aria-label="Move note to folder"></select><label for="note-parent">PARENT</label><select id="note-parent" aria-label="Set parent page"></select></div>
+                <div id="note-properties" class="note-properties"></div>
                 <div class="editor-rule"></div>
                 <div class="editor-page-tools">
                   <button class="editor-tool-button" id="create-child-page" type="button">＋ Sub-page</button>
@@ -77,6 +79,7 @@
                     </select>
                   </label>
                   <button class="editor-tool-button" id="insert-code-block" type="button">＋ Code block</button>
+                  <button class="editor-tool-button" id="export-note-markdown" type="button">Export .md</button>
                   <button class="editor-tool-button" id="toggle-preview" type="button" aria-pressed="false">Preview</button>
                 </div>
                 <label class="sr-only" for="note-body">Note content</label><textarea id="note-body" class="note-body" placeholder="Every good idea starts somewhere..."></textarea>

@@ -144,6 +144,31 @@ h1 { margin: 10px 0 5px; color: #eff8f8; font-family: var(--display); font-size:
 .note-title { width: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: #eff8f9; font-family: var(--display); font-size: clamp(24px,3vw,33px); font-weight: 700; letter-spacing: -1.2px; }
 .note-title::placeholder { color: #607880; }
 .note-meta { display: flex; align-items: center; gap: 7px; margin-top: 11px; color: #718990; font-family: var(--mono); font-size: 9px; }
+/* Phase 0 — note properties (M5), version history (M2), Trash (M2). */
+.note-properties { margin-top: 14px; padding-top: 12px; border-top: 1px solid #1b343d; }
+.properties-heading { margin-bottom: 8px; color: #637b83; font-family: var(--mono); font-size: 9px; letter-spacing: .12em; }
+.property-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.property-key { min-width: 90px; max-width: 160px; overflow: hidden; color: #afd0d4; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.property-value, .property-key-input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #294650; border-radius: 5px; background: #091b23; color: #c8dfe2; font-size: 11px; }
+.property-key-input { flex: 0 0 110px; }
+.property-remove { flex: 0 0 auto; padding: 2px 8px; border: 1px solid #4b3b40; border-radius: 4px; background: transparent; color: #d69a8f; cursor: pointer; font-size: 12px; }
+.property-remove:hover { border-color: #aa685d; color: #ffc0b5; }
+.property-add-button { flex: 0 0 auto; padding: 6px 10px; border: 1px solid #2e5059; border-radius: 5px; background: rgba(255,255,255,.025); color: #afd0d4; cursor: pointer; font-size: 11px; }
+.property-add-button:hover { border-color: var(--cyan); color: #e0fbfc; }
+.version-history { margin-top: 10px; color: #8da7ac; font-size: 11px; }
+.version-history summary { cursor: pointer; color: #afd0d4; }
+.version-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid #16282e; }
+.version-restore { flex: 0 0 auto; padding: 4px 9px; border: 1px solid #2e5059; border-radius: 4px; background: transparent; color: #afd0d4; cursor: pointer; font-size: 10px; }
+.version-restore:hover { border-color: var(--cyan); color: #e0fbfc; }
+.trash-row { cursor: default; }
+.trash-toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.trash-empty { padding: 6px 10px; border: 1px solid #4b3b40; border-radius: 5px; background: transparent; color: #d69a8f; cursor: pointer; font-size: 10px; }
+.trash-empty:hover { border-color: #aa685d; color: #ffc0b5; }
+.trash-actions { display: flex; gap: 6px; margin-top: 6px; }
+.trash-restore { padding: 4px 9px; border: 1px solid #2e5059; border-radius: 4px; background: rgba(84,220,232,.08); color: #afd0d4; cursor: pointer; font-size: 10px; }
+.trash-delete { padding: 4px 9px; border: 1px solid #4b3b40; border-radius: 4px; background: transparent; color: #d69a8f; cursor: pointer; font-size: 10px; }
+.trash-restore:hover { border-color: var(--cyan); color: #e0fbfc; }
+.trash-delete:hover { border-color: #aa685d; color: #ffc0b5; }
 .meta-glyph { color: #58cbd3; font-size: 13px; }
 .meta-divider { color: #405962; }
 .note-meta label { color: #58727a; font-size: 8px; }

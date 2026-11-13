@@ -823,6 +823,14 @@
       appearance.append(controls);
       wrap.append(appearance);
 
+      // M4 — storage usage: how much is stored, where, and that a backup copy exists.
+      const storage = el("section", "tools-section");
+      const info = typeof host.storageInfo === "function" ? host.storageInfo() : null;
+      storage.append(el("h2", "", "Storage"), el("p", "", info
+        ? `${info.notes} ${info.notes === 1 ? "note" : "notes"} · ${info.trash} in Trash · about ${info.displayBytes} stored in ${info.backend === "indexeddb" ? "IndexedDB" : "localStorage (IndexedDB is unavailable here)"}. A backup copy is kept in localStorage, and if saving ever fails xPin offers a Markdown backup download instead of losing edits.`
+        : "Storage details are unavailable."));
+      wrap.append(storage);
+
       const publishing = el("section", "tools-section");
       publishing.append(el("h2", "", "Static page export"), el("p", "", "Download the selected note as a standalone HTML file. Host it yourself to make it public; xPin does not upload it."));
       const publish = el("button", "feature-button feature-button-primary", "Export current page");
@@ -830,6 +838,21 @@
       publish.dataset.action = "publish";
       publishing.append(publish);
       wrap.append(publishing);
+
+      // M3 — Markdown export: portable .md files with frontmatter, folders
+      // preserved inside the .zip, Trash included under Trash/.
+      const markdown = el("section", "tools-section");
+      markdown.append(el("h2", "", "Markdown export"), el("p", "", "Download notes as plain .md files — properties included as frontmatter — so they open in any notes app."));
+      const markdownActions = el("div", "backup-actions");
+      const markdownNote = el("button", "feature-button", "Export current note (.md)");
+      markdownNote.type = "button";
+      markdownNote.dataset.action = "markdown-note";
+      const markdownZip = el("button", "feature-button feature-button-primary", "Export all notes (.zip)");
+      markdownZip.type = "button";
+      markdownZip.dataset.action = "markdown-zip";
+      markdownActions.append(markdownNote, markdownZip);
+      markdown.append(markdownActions);
+      wrap.append(markdown);
 
       const backup = el("section", "tools-section");
       backup.append(el("h2", "", "Encrypted workspace handoff"), el("p", "", "Export/import a passphrase-encrypted file. This is not live sync; keep your passphrase safe because it cannot be recovered."));
@@ -1076,8 +1099,13 @@
       if (!note) return host.notify("Open a note before exporting a page.");
       host.flushSave();
       const title = note.title.trim() || "Untitled note";
+      // M6 — render through the same Markdown renderer the in-app preview
+      // uses, instead of dumping raw Markdown into the page.
+      const rendered = typeof host.renderMarkdown === "function"
+        ? host.renderMarkdown(note.body)
+        : escapeHtml(note.body);
       const html = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="A page exported from xPin"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'"><title>${escapeHtml(title)}</title><style>body{max-width:760px;margin:12vh auto;padding:0 24px;background:#07151d;color:#e8f4f6;font:17px/1.8 system-ui,sans-serif}h1{font-size:clamp(2rem,7vw,3.8rem);letter-spacing:-.05em;line-height:1.05}article{white-space:pre-wrap;overflow-wrap:anywhere;color:#b8cbd0}footer{margin-top:4rem;color:#8299a1;font-size:.8rem}</style></head><body><main><h1>${escapeHtml(title)}</h1><article>${escapeHtml(note.body)}</article><footer>Static page export · xPin</footer></main></body></html>`;
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="A page exported from xPin"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'"><title>${escapeHtml(title)}</title><style>body{max-width:760px;margin:12vh auto;padding:0 24px;background:#07151d;color:#e8f4f6;font:17px/1.8 system-ui,sans-serif}h1{font-size:clamp(2rem,7vw,3.8rem);letter-spacing:-.05em;line-height:1.05}h2{font-size:1.5rem;margin-top:2.2em}h3{font-size:1.2rem;margin-top:1.8em}article{color:#b8cbd0}article p{margin:1em 0}article a{color:#54dce8}article ul,article ol{padding-left:1.4em}article li{margin:.35em 0}article blockquote{margin:1.2em 0;padding-left:1em;border-left:3px solid #54dce8;color:#8da7ac}article pre{background:#0a1f28;padding:14px;border-radius:8px;overflow:auto}article code{font:14px/1.6 ui-monospace,monospace}article pre code{background:none;padding:0}article table{border-collapse:collapse}article th,article td{padding:6px 12px;border:1px solid #294650;text-align:left}footer{margin-top:4rem;color:#8299a1;font-size:.8rem}</style></head><body><main><h1>${escapeHtml(title)}</h1><article>${rendered}</article><footer>Static page export · xPin</footer></main></body></html>`;
       safeDownload(`${title.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "xPin-page"}.html`, html, "text/html;charset=utf-8");
       host.notify("Static HTML page exported. Host the file yourself to publish it.");
     }
@@ -1248,6 +1276,8 @@
           else if (action === "run-query") runQuery();
           else if (action === "query-help") toggleQueryHelp();
           else if (action === "publish") exportPage();
+          else if (action === "markdown-note" && typeof host.exportNoteMarkdown === "function") host.exportNoteMarkdown();
+          else if (action === "markdown-zip" && typeof host.exportMarkdownZip === "function") host.exportMarkdownZip();
           else if (action === "backup-export") await exportBackup();
           else if (action === "backup-import") content.querySelector('[data-action="backup-file"]')?.click();
           else if (action === "new-synced-block") addSyncedBlock();
